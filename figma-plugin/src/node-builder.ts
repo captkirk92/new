@@ -34,7 +34,7 @@ export class SchemaValidationError extends Error {
   constructor(
     message: string,
     public readonly nodeId?: string,
-    public readonly fieldName?: string
+    public readonly fieldName?: string,
   ) {
     super(message);
     this.name = "SchemaValidationError";
@@ -42,6 +42,31 @@ export class SchemaValidationError extends Error {
 }
 
 type SceneNodeWithGeometry = SceneNode & GeometryMixin;
+
+// Type guards for safe property access on SceneNode variants
+function hasGeometryMixin(node: SceneNode): node is SceneNode & GeometryMixin {
+  return "fills" in node && "strokes" in node;
+}
+
+function hasBlendMixin(node: SceneNode): node is SceneNode & BlendMixin {
+  return "effects" in node && "opacity" in node;
+}
+
+function getNodeFills(node: SceneNode): readonly Paint[] | null {
+  if (!hasGeometryMixin(node)) return null;
+  const fills = node.fills;
+  return fills === figma.mixed ? null : fills;
+}
+
+function getNodeStrokes(node: SceneNode): readonly Paint[] | null {
+  if (!hasGeometryMixin(node)) return null;
+  return node.strokes;
+}
+
+function getNodeEffects(node: SceneNode): readonly Effect[] | null {
+  if (!hasBlendMixin(node)) return null;
+  return node.effects;
+}
 
 interface DiagnosticReport {
   nodeId: string;
@@ -133,7 +158,7 @@ class FigmaImportDiagnostics {
     nodeType: string,
     issue: string,
     expected?: any,
-    actual?: any
+    actual?: any,
   ) {
     const suggestedFix = this.getSuggestedFix(issue);
     const severity = this.inferSeverity(issue);
@@ -143,7 +168,7 @@ class FigmaImportDiagnostics {
     // NOTE: console.group/groupEnd are NOT available in Figma's plugin sandbox
     // Using console.log instead to avoid "console.group is not a function" errors
     console.log(
-      `${emoji} [FIGMA IMPORT] ${nodeType} "${nodeName}" | Issue: ${issue} | 🔧 Fix: ${suggestedFix}`
+      `${emoji} [FIGMA IMPORT] ${nodeType} "${nodeName}" | Issue: ${issue} | 🔧 Fix: ${suggestedFix}`,
     );
     if (expected) console.log("  Expected:", expected);
     if (actual) console.log("  Actual:", actual);
@@ -190,58 +215,58 @@ class FigmaImportDiagnostics {
     const lines: string[] = [];
     lines.push("");
     lines.push(
-      "╔══════════════════════════════════════════════════════════════════════════════╗"
+      "╔══════════════════════════════════════════════════════════════════════════════╗",
     );
     lines.push(
-      "║                        FIGMA IMPORT DIAGNOSTIC REPORT                        ║"
+      "║                        FIGMA IMPORT DIAGNOSTIC REPORT                        ║",
     );
     lines.push(
-      "╠══════════════════════════════════════════════════════════════════════════════╣"
+      "╠══════════════════════════════════════════════════════════════════════════════╣",
     );
     lines.push(`║ URL: ${this.importUrl.substring(0, 70).padEnd(70)} ║`);
     lines.push(`║ Duration: ${duration}s`.padEnd(79) + "║");
     lines.push(`║ Total Issues: ${summary.totalIssues}`.padEnd(79) + "║");
     lines.push(
-      "╠══════════════════════════════════════════════════════════════════════════════╣"
+      "╠══════════════════════════════════════════════════════════════════════════════╣",
     );
     lines.push(
-      "║ ISSUE BREAKDOWN                                                              ║"
+      "║ ISSUE BREAKDOWN                                                              ║",
     );
     lines.push(
-      "╠══════════════════════════════════════════════════════════════════════════════╣"
+      "╠══════════════════════════════════════════════════════════════════════════════╣",
     );
     lines.push(
-      `║   🎨 Missing Fills:   ${summary.missingFills}`.padEnd(79) + "║"
+      `║   🎨 Missing Fills:   ${summary.missingFills}`.padEnd(79) + "║",
     );
     lines.push(
-      `║   ✏️  Missing Strokes: ${summary.missingStrokes}`.padEnd(79) + "║"
+      `║   ✏️  Missing Strokes: ${summary.missingStrokes}`.padEnd(79) + "║",
     );
     lines.push(
-      `║   📝 Text Issues:     ${summary.missingText}`.padEnd(79) + "║"
+      `║   📝 Text Issues:     ${summary.missingText}`.padEnd(79) + "║",
     );
     lines.push(
-      `║   🖼️  Image Issues:    ${summary.missingImages}`.padEnd(79) + "║"
+      `║   🖼️  Image Issues:    ${summary.missingImages}`.padEnd(79) + "║",
     );
     lines.push(
-      `║   🔤 Font Failures:   ${summary.failedFontLoads}`.padEnd(79) + "║"
+      `║   🔤 Font Failures:   ${summary.failedFontLoads}`.padEnd(79) + "║",
     );
 
     // Group by severity
     const criticalIssues = this.reports.filter(
-      (r) => r.severity === "critical"
+      (r) => r.severity === "critical",
     );
     const errorIssues = this.reports.filter((r) => r.severity === "error");
     const warningIssues = this.reports.filter((r) => r.severity === "warning");
 
     if (criticalIssues.length > 0 || errorIssues.length > 0) {
       lines.push(
-        "╠══════════════════════════════════════════════════════════════════════════════╣"
+        "╠══════════════════════════════════════════════════════════════════════════════╣",
       );
       lines.push(
-        "║ TOP ISSUES TO FIX                                                            ║"
+        "║ TOP ISSUES TO FIX                                                            ║",
       );
       lines.push(
-        "╠══════════════════════════════════════════════════════════════════════════════╣"
+        "╠══════════════════════════════════════════════════════════════════════════════╣",
       );
 
       const topIssues = [...criticalIssues, ...errorIssues].slice(0, 5);
@@ -250,41 +275,41 @@ class FigmaImportDiagnostics {
         lines.push(
           `║ ${emoji} ${issue.nodeType} "${issue.nodeName.substring(
             0,
-            30
-          )}"`.padEnd(78) + "║"
+            30,
+          )}"`.padEnd(78) + "║",
         );
         lines.push(
-          `║    Issue: ${issue.issues[0].substring(0, 60)}`.padEnd(78) + "║"
+          `║    Issue: ${issue.issues[0].substring(0, 60)}`.padEnd(78) + "║",
         );
         lines.push(
-          `║    🔧 ${issue.suggestedFix.substring(0, 65)}`.padEnd(78) + "║"
+          `║    🔧 ${issue.suggestedFix.substring(0, 65)}`.padEnd(78) + "║",
         );
         lines.push("║".padEnd(79) + "║");
       }
     }
 
     lines.push(
-      "╠══════════════════════════════════════════════════════════════════════════════╣"
+      "╠══════════════════════════════════════════════════════════════════════════════╣",
     );
     if (criticalIssues.length > 0) {
       lines.push(
-        "║ 🚨 CRITICAL issues found - some elements may not render correctly.           ║"
+        "║ 🚨 CRITICAL issues found - some elements may not render correctly.           ║",
       );
     } else if (errorIssues.length > 0) {
       lines.push(
-        "║ ⚡ Some errors occurred but import completed. Review issues above.           ║"
+        "║ ⚡ Some errors occurred but import completed. Review issues above.           ║",
       );
     } else if (warningIssues.length > 0) {
       lines.push(
-        "║ ✨ Import completed with minor warnings. Quality should be good.             ║"
+        "║ ✨ Import completed with minor warnings. Quality should be good.             ║",
       );
     } else {
       lines.push(
-        "║ ✅ Import completed with no issues! Pixel-perfect result expected.           ║"
+        "║ ✅ Import completed with no issues! Pixel-perfect result expected.           ║",
       );
     }
     lines.push(
-      "╚══════════════════════════════════════════════════════════════════════════════╝"
+      "╚══════════════════════════════════════════════════════════════════════════════╝",
     );
 
     return lines.join("\n");
@@ -308,7 +333,7 @@ class FigmaImportDiagnostics {
         ...this.getSummary(),
       },
       null,
-      2
+      2,
     );
   }
 }
@@ -358,7 +383,7 @@ interface ValidatedNodeData {
 export class NodeBuilder {
   private imageFetchCache = new Map<string, Uint8Array>();
   private imagePaintCache = new Map<string, string>();
-  private assets: any;
+  public assets: any;
   private fontCache = new Map<string, { family: string; style: string }>();
   // PHASE 2: Enhanced caching
   private colorParseCache = new Map<string, RGBA | null>();
@@ -384,7 +409,7 @@ export class NodeBuilder {
     assets?: any,
     private designTokensManager?: DesignTokensManager,
     private schema?: any,
-    private diagnosticCollector?: any // Use shared DiagnosticCollector
+    private diagnosticCollector?: any, // Use shared DiagnosticCollector
   ) {
     this.assets = assets;
     // PIXEL-PERFECT: All geometry is captured in CSS pixels - no scaling needed
@@ -395,7 +420,7 @@ export class NodeBuilder {
     this.diagnostics = diagnosticCollector || new FigmaImportDiagnostics();
 
     console.log(
-      `[NODE_BUILDER] Initialized with pixel-perfect transform system (scaleFactor: ${this.scaleFactor})`
+      `[NODE_BUILDER] Initialized with pixel-perfect transform system (scaleFactor: ${this.scaleFactor})`,
     );
 
     // Initialize standard layout solver fallback
@@ -439,7 +464,7 @@ export class NodeBuilder {
           nodeId,
           nodeName: data.name,
           nodeType: data.type,
-        }
+        },
       );
       // Provide recovery layout
       data.layout = { width: 100, height: 100, x: 0, y: 0 };
@@ -477,7 +502,7 @@ export class NodeBuilder {
       validated.strokes = this.sanitizePaintArray(
         data.strokes,
         "strokes",
-        data.id
+        data.id,
       );
     }
 
@@ -514,19 +539,12 @@ export class NodeBuilder {
           }
         : null,
       absoluteTransform2x3:
-        "absoluteTransform" in node ? (node.absoluteTransform as any) : null,
-      fillsActual:
-        "fills" in node && Array.isArray((node as any).fills)
-          ? (node as any).fills.length
-          : 0,
-      strokesActual:
-        "strokes" in node && Array.isArray((node as any).strokes)
-          ? (node as any).strokes.length
-          : 0,
-      effectsActual:
-        "effects" in node && Array.isArray((node as any).effects)
-          ? (node as any).effects.length
-          : 0,
+        "absoluteTransform" in node
+          ? (node as SceneNode & { absoluteTransform: Transform }).absoluteTransform
+          : null,
+      fillsActual: getNodeFills(node)?.length ?? 0,
+      strokesActual: getNodeStrokes(node)?.length ?? 0,
+      effectsActual: getNodeEffects(node)?.length ?? 0,
       childIndexActual: node.parent ? node.parent.children.indexOf(node) : -1,
     };
 
@@ -554,7 +572,7 @@ export class NodeBuilder {
           code: "POSTBUILD_GEOMETRY_MISMATCH",
           severity: "WARN", // Escalates to ERROR in strict mode
           message: `Position mismatch: dx=${validation.deltas.positionDx?.toFixed(
-            2
+            2,
           )}, dy=${validation.deltas.positionDy?.toFixed(2)}`,
           evidence: {
             expected: validation.dom.layout,
@@ -572,8 +590,8 @@ export class NodeBuilder {
             `❌ [GEOMETRY] Major displacement for ${
               node.name
             }: dx=${validation.deltas.positionDx?.toFixed(
-              1
-            )}, dy=${validation.deltas.positionDy?.toFixed(1)}`
+              1,
+            )}, dy=${validation.deltas.positionDy?.toFixed(1)}`,
           );
 
           // UNIFIED DIAGNOSTICS: Record major position failure
@@ -584,9 +602,9 @@ export class NodeBuilder {
               validation.dom.layout,
               actualBounds,
               `Major displacement: dx=${validation.deltas.positionDx?.toFixed(
-                1
+                1,
               )}, dy=${validation.deltas.positionDy?.toFixed(1)}`,
-              "ERROR"
+              "ERROR",
             );
           }
         }
@@ -612,7 +630,7 @@ export class NodeBuilder {
             validation.figmaPlan.fillsExpected,
             0,
             "Node expects fills but has none (White Blank Frame)",
-            "ERROR"
+            "ERROR",
           );
         }
       }
@@ -630,7 +648,7 @@ export class NodeBuilder {
             "IMAGE_FILL",
             "SOLID_FILL",
             "Image asset missing - replaced with placeholder solid color",
-            "ERROR"
+            "ERROR",
           );
         }
       }
@@ -647,7 +665,7 @@ export class NodeBuilder {
   private sanitizePaintArray(
     paints: any[],
     type: "fills" | "strokes",
-    nodeId: string
+    nodeId: string,
   ): ValidatedPaint[] {
     if (!Array.isArray(paints)) return [];
 
@@ -663,8 +681,8 @@ export class NodeBuilder {
         if (!validation.isValid) {
           console.warn(
             `⚠️ [PAINT VALIDATION] ${nodeId} ${type}[${index}]: ${validation.errors.join(
-              ", "
-            )}`
+              ", ",
+            )}`,
           );
           diagnostics.logIssue(
             nodeId,
@@ -672,7 +690,7 @@ export class NodeBuilder {
             "PAINT_VALIDATION",
             `Invalid ${type}[${index}]: ${validation.errors.join(", ")}`,
             paint,
-            validation.fallback
+            validation.fallback,
           );
 
           // Use validated fallback or return null to filter out
@@ -690,7 +708,7 @@ export class NodeBuilder {
    */
   private validatePaintObject(
     paint: any,
-    context: { nodeId: string; index: number; type: string }
+    context: { nodeId: string; index: number; type: string },
   ): {
     isValid: boolean;
     errors: string[];
@@ -779,7 +797,7 @@ export class NodeBuilder {
    */
   private createSanitizedPaint(
     paint: any,
-    type: ValidatedPaint["type"]
+    type: ValidatedPaint["type"],
   ): ValidatedPaint {
     const sanitized: ValidatedPaint = { type };
 
@@ -809,7 +827,7 @@ export class NodeBuilder {
     if (sanitized.opacity !== undefined) {
       sanitized.opacity = Math.max(
         0,
-        Math.min(1, Number(sanitized.opacity) || 0)
+        Math.min(1, Number(sanitized.opacity) || 0),
       );
     }
 
@@ -830,7 +848,7 @@ export class NodeBuilder {
    */
   private createFallbackPaint(
     type: string,
-    originalPaint: any
+    originalPaint: any,
   ): ValidatedPaint {
     switch (type) {
       case "IMAGE":
@@ -926,7 +944,7 @@ export class NodeBuilder {
     value: any,
     defaultValue: number,
     min?: number,
-    max?: number
+    max?: number,
   ): number {
     if (typeof value !== "number" || !isFinite(value)) {
       return defaultValue;
@@ -944,7 +962,7 @@ export class NodeBuilder {
   private validateDimensions(
     width: number,
     height: number,
-    nodeId: string
+    nodeId: string,
   ): { width: number; height: number } {
     // Handle zero or negative dimensions
     const minDimension = 0.01; // Minimum visible size in Figma
@@ -954,14 +972,14 @@ export class NodeBuilder {
 
     if (width <= 0) {
       console.log(
-        `📏 Node ${nodeId} has zero/negative width (${width}), setting to ${minDimension}`
+        `📏 Node ${nodeId} has zero/negative width (${width}), setting to ${minDimension}`,
       );
       validWidth = minDimension;
     }
 
     if (height <= 0) {
       console.log(
-        `📏 Node ${nodeId} has zero/negative height (${height}), setting to ${minDimension}`
+        `📏 Node ${nodeId} has zero/negative height (${height}), setting to ${minDimension}`,
       );
       validHeight = minDimension;
     }
@@ -1021,7 +1039,7 @@ export class NodeBuilder {
     const tolerance = 0.01;
 
     for (const [tokenId, token] of Object.entries(
-      (this.designTokensManager as any).tokensRegistry.variables
+      (this.designTokensManager as any).tokensRegistry.variables,
     )) {
       const typedToken = token as any;
       if (typedToken.type === "COLOR" && typedToken.resolvedValue) {
@@ -1041,7 +1059,7 @@ export class NodeBuilder {
 
   async loadFontWithFallbacks(
     requestedFamily: string,
-    requestedStyle: string
+    requestedStyle: string,
   ): Promise<{ family: string; style: string } | null> {
     const cacheKey = `${requestedFamily}:${requestedStyle}`;
     if (this.fontCache.has(cacheKey)) {
@@ -1202,7 +1220,7 @@ export class NodeBuilder {
           ...baselineCandidates,
           ...weightStyleVariants,
           ...nonItalicWeightVariants,
-        ])
+        ]),
       );
 
       for (const style of stylesToTry) {
@@ -1211,7 +1229,7 @@ export class NodeBuilder {
           const result = { family: fontFamily, style };
           this.fontCache.set(cacheKey, result);
           console.log(
-            `✅ Loaded font: ${fontFamily} ${style} (requested: ${cleanFamily} ${requestedStyle})`
+            `✅ Loaded font: ${fontFamily} ${style} (requested: ${cleanFamily} ${requestedStyle})`,
           );
           return result;
         } catch {
@@ -1225,13 +1243,13 @@ export class NodeBuilder {
       const result = { family: "Inter", style: "Regular" };
       this.fontCache.set(cacheKey, result);
       console.warn(
-        `❌ Using last resort font Inter Regular for: ${cleanFamily} ${requestedStyle}`
+        `❌ Using last resort font Inter Regular for: ${cleanFamily} ${requestedStyle}`,
       );
       return result;
     } catch (error) {
       console.error(
         `❌ Critical: Cannot load Inter Regular. Trying system fallback.`,
-        error
+        error,
       );
       const systemFonts = [
         { family: "Arial", style: "Regular" },
@@ -1251,7 +1269,7 @@ export class NodeBuilder {
       }
 
       console.error(
-        `❌ Critical: No fonts available - will create rectangle placeholders`
+        `❌ Critical: No fonts available - will create rectangle placeholders`,
       );
       return null;
     }
@@ -1266,14 +1284,14 @@ export class NodeBuilder {
       console.log(
         `🔍 [SVG-DEBUG] Processing SVG/VECTOR node: ${
           nodeData.name || nodeData.id
-        }`
+        }`,
       );
       console.log(`   - ID: ${nodeData.id}`);
       console.log(`   - Children: ${childCount}`);
       console.log(
         `   - svgContent length: ${
           nodeData.svgContent ? nodeData.svgContent.length : 0
-        }`
+        }`,
       );
       console.log(`   - vectorData: ${!!nodeData.vectorData}`);
       console.log(`   - imageHash: ${nodeData.imageHash}`);
@@ -1288,7 +1306,7 @@ export class NodeBuilder {
 
       if (nodeData.componentSignature) {
         const registered = this.componentManager.getComponentBySignature(
-          nodeData.componentSignature
+          nodeData.componentSignature,
         );
         if (registered && nodeData.type !== "COMPONENT") {
           const instance = registered.createInstance();
@@ -1337,14 +1355,14 @@ export class NodeBuilder {
         if (nodeData.componentSignature) {
           this.componentManager.registerSignature(
             nodeData.componentSignature,
-            component
+            component,
           );
         }
       } else if (nodeData.componentSignature) {
         this.safeSetPluginData(
           node,
           "componentSignature",
-          nodeData.componentSignature
+          nodeData.componentSignature,
         );
       }
 
@@ -1357,13 +1375,13 @@ export class NodeBuilder {
     } catch (e) {
       console.error(
         `❌ [NODE_BUILDER] createNode failed for ${nodeData.type} ${nodeData.id}:`,
-        e
+        e,
       );
       // FAILURE RECOVERY: Return a red fallback frame so the user sees *something*
       console.warn(`⚠️ [RECOVERY] Creating fallback node for ${nodeData.id}`);
       return this.createFallbackNode(
         nodeData,
-        e instanceof Error ? e.message : String(e)
+        e instanceof Error ? e.message : String(e),
       );
     }
   }
@@ -1374,7 +1392,7 @@ export class NodeBuilder {
    */
   private async createFallbackNode(
     data: any,
-    errorMsg: string
+    errorMsg: string,
   ): Promise<FrameNode> {
     const frame = figma.createFrame();
     frame.name = `⚠️ ERROR: ${data.name || "Unknown"} (${data.type})`;
@@ -1410,11 +1428,11 @@ export class NodeBuilder {
     frame.name = data.name || "Frame";
     const frameWidth = Math.max(
       this.roundForPixelPerfection(data.layout?.width || 1),
-      0.01
+      0.01,
     );
     const frameHeight = Math.max(
       this.roundForPixelPerfection(data.layout?.height || 1),
-      0.01
+      0.01,
     );
     frame.resize(frameWidth, frameHeight);
     frame.fills = []; // Start transparent
@@ -1427,7 +1445,7 @@ export class NodeBuilder {
     rect.name = data.name || "Rectangle";
     rect.resize(
       Math.max(this.roundForPixelPerfection(data.layout?.width || 1), 0.01),
-      Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01)
+      Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01),
     );
     rect.fills = []; // Start transparent
     rect.strokes = [];
@@ -1453,7 +1471,7 @@ export class NodeBuilder {
     frame.name = `${data.name || "Embed"} (${data.embed?.type || "embed"})`;
     frame.resize(
       Math.max(data.layout?.width || 160, 40),
-      Math.max(data.layout?.height || 90, 40)
+      Math.max(data.layout?.height || 90, 40),
     );
     frame.layoutMode = "VERTICAL";
     frame.primaryAxisAlignItems = "CENTER";
@@ -1512,7 +1530,7 @@ export class NodeBuilder {
         htmlTag: data.htmlTag,
         id: data.id,
         sourceUrl: data.embed?.src,
-      })
+      }),
     );
 
     return frame;
@@ -1597,7 +1615,7 @@ export class NodeBuilder {
             "TEXT",
             `Strict clone: font unavailable (${originalFontFamily} ${finalFontStyle})`,
             { family: originalFontFamily, style: finalFontStyle },
-            { screenshotAssetId: data.screenshotAssetId || null }
+            { screenshotAssetId: data.screenshotAssetId || null },
           );
 
           // Prefer capture-time pixel fallback (element screenshot) if provided.
@@ -1618,20 +1636,20 @@ export class NodeBuilder {
             try {
               const bytes = await this.base64ToImageBytes(
                 base64Candidate,
-                false
+                false,
               );
               const image = figma.createImage(bytes);
               const targetWidth = Math.max(
                 this.roundForPixelPerfection(
-                  data.layout?.width || data.absoluteLayout?.width || 100
+                  data.layout?.width || data.absoluteLayout?.width || 100,
                 ),
-                0.01
+                0.01,
               );
               const targetHeight = Math.max(
                 this.roundForPixelPerfection(
-                  data.layout?.height || data.absoluteLayout?.height || 20
+                  data.layout?.height || data.absoluteLayout?.height || 20,
                 ),
-                0.01
+                0.01,
               );
 
               const imageFrame = figma.createFrame();
@@ -1645,17 +1663,17 @@ export class NodeBuilder {
               this.safeSetPluginData(
                 imageFrame,
                 "rasterizeReason",
-                "FONT_UNAVAILABLE"
+                "FONT_UNAVAILABLE",
               );
               this.safeSetPluginData(
                 imageFrame,
                 "originalFontFamily",
-                originalFontFamily
+                originalFontFamily,
               );
               this.safeSetPluginData(
                 imageFrame,
                 "originalFontStyle",
-                finalFontStyle
+                finalFontStyle,
               );
               this.safeSetPluginData(imageFrame, "originalText", characters);
 
@@ -1663,14 +1681,14 @@ export class NodeBuilder {
             } catch (rasterErr) {
               console.error(
                 "❌ [STRICT CLONE] Failed to build raster fallback from screenshotAssetId",
-                rasterErr
+                rasterErr,
               );
             }
           }
 
           // No pixel fallback available: visible placeholder (strict clone cannot guarantee fidelity).
           console.error(
-            `❌ [STRICT CLONE] Missing font and no screenshot fallback for ${originalFontFamily} ${finalFontStyle}`
+            `❌ [STRICT CLONE] Missing font and no screenshot fallback for ${originalFontFamily} ${finalFontStyle}`,
           );
           const placeholder = figma.createRectangle();
           placeholder.name = `${
@@ -1679,12 +1697,12 @@ export class NodeBuilder {
           placeholder.resize(
             Math.max(
               this.roundForPixelPerfection(data.layout?.width || 100),
-              0.01
+              0.01,
             ),
             Math.max(
               this.roundForPixelPerfection(data.layout?.height || 20),
-              0.01
-            )
+              0.01,
+            ),
           );
           placeholder.fills = [
             { type: "SOLID", color: { r: 1, g: 0.85, b: 0.85 } },
@@ -1696,7 +1714,7 @@ export class NodeBuilder {
           this.safeSetPluginData(
             placeholder,
             "strictCloneMissingFont",
-            `${originalFontFamily} ${finalFontStyle}`
+            `${originalFontFamily} ${finalFontStyle}`,
           );
           return placeholder as any;
         }
@@ -1705,7 +1723,7 @@ export class NodeBuilder {
         for (const stackFont of fontFamilyStack) {
           fontLoadResult = await this.loadFontWithFallbacks(
             stackFont,
-            finalFontStyle
+            finalFontStyle,
           );
           if (fontLoadResult) {
             fontFamily = fontLoadResult.family;
@@ -1717,7 +1735,7 @@ export class NodeBuilder {
         if (!fontLoadResult) {
           fontLoadResult = await this.loadFontWithFallbacks(
             fontFamily,
-            finalFontStyle
+            finalFontStyle,
           );
         }
 
@@ -1728,22 +1746,22 @@ export class NodeBuilder {
             "TEXT",
             `Font loading failed completely for ${originalFontFamily}`,
             { family: originalFontFamily, style: finalFontStyle },
-            { error: "All fallbacks failed" }
+            { error: "All fallbacks failed" },
           );
           console.error(
-            `❌ Font loading failed completely for ${originalFontFamily}. Creating rectangle placeholder.`
+            `❌ Font loading failed completely for ${originalFontFamily}. Creating rectangle placeholder.`,
           );
           const placeholder = figma.createRectangle();
           placeholder.name = `${data.name || "Text"} (font failed)`;
           placeholder.resize(
             Math.max(
               this.roundForPixelPerfection(data.layout?.width || 100),
-              0.01
+              0.01,
             ),
             Math.max(
               this.roundForPixelPerfection(data.layout?.height || 20),
-              0.01
-            )
+              0.01,
+            ),
           );
           placeholder.fills = [
             { type: "SOLID", color: { r: 0.9, g: 0.9, b: 0.9 } },
@@ -1779,27 +1797,30 @@ export class NodeBuilder {
 
           console.log(
             `📝 Font fallback with metrics: ${originalFontFamily} → ${fontFamily} (ratio: ${fontMetricsRatio.toFixed(
-              3
-            )}, originalHeight: ${originalHeight.toFixed(2)}px)`
+              3,
+            )}, originalHeight: ${originalHeight.toFixed(2)}px)`,
           );
         } else {
           // Fallback to static ratio map
           fontMetricsRatio = this.getFontMetricsRatio(
             fontFamily,
-            originalFontFamily
+            originalFontFamily,
           );
           console.log(
             `📝 Font fallback: ${originalFontFamily} → ${fontFamily} (ratio: ${fontMetricsRatio.toFixed(
-              3
-            )})`
+              3,
+            )})`,
           );
         }
       }
 
       text.fontName = { family: fontFamily, style: finalFontStyle };
 
-      const adjustedFontSize = data.textStyle.fontSize * fontMetricsRatio;
-      text.fontSize = adjustedFontSize;
+      // CRITICAL FIX: Validate fontSize to prevent NaN/Infinity/zero errors
+      const rawFontSize = data.textStyle.fontSize * fontMetricsRatio;
+      const adjustedFontSize =
+        Number.isFinite(rawFontSize) && rawFontSize > 0 ? rawFontSize : 12;
+      text.fontSize = Math.max(1, adjustedFontSize);
       // ENHANCED: Improved text alignment handling
       // Map CSS text-align to Figma textAlignHorizontal
       const textAlign = data.textStyle.textAlignHorizontal || "LEFT";
@@ -1807,10 +1828,10 @@ export class NodeBuilder {
         textAlign === "CENTER"
           ? "CENTER"
           : textAlign === "RIGHT"
-          ? "RIGHT"
-          : textAlign === "JUSTIFY"
-          ? "JUSTIFIED"
-          : "LEFT";
+            ? "RIGHT"
+            : textAlign === "JUSTIFY"
+              ? "JUSTIFIED"
+              : "LEFT";
 
       // ENHANCED: Better vertical alignment based on CSS vertical-align and line-height
       // Default to TOP for most cases, but can be adjusted based on CSS
@@ -1819,8 +1840,8 @@ export class NodeBuilder {
         verticalAlign === "CENTER"
           ? "CENTER"
           : verticalAlign === "BOTTOM"
-          ? "BOTTOM"
-          : "TOP";
+            ? "BOTTOM"
+            : "TOP";
 
       const spacingScale =
         fontFamily !== originalFontFamily ? fontMetricsRatio : 1.0;
@@ -1916,14 +1937,14 @@ export class NodeBuilder {
         this.safeSetPluginData(
           text,
           "paragraphSpacing",
-          String(data.textStyle.paragraphSpacing)
+          String(data.textStyle.paragraphSpacing),
         );
       }
       if (data.textStyle.paragraphIndent !== undefined) {
         this.safeSetPluginData(
           text,
           "paragraphIndent",
-          String(data.textStyle.paragraphIndent)
+          String(data.textStyle.paragraphIndent),
         );
       }
       if (data.textStyle.whiteSpace) {
@@ -1957,7 +1978,7 @@ export class NodeBuilder {
           // Default to HEIGHT for most text to prevent collapse
           text.textAutoResize = "HEIGHT";
           console.log(
-            `📝 [TEXT] ${data.name}: Changed textAutoResize from NONE to HEIGHT to prevent collapse`
+            `📝 [TEXT] ${data.name}: Changed textAutoResize from NONE to HEIGHT to prevent collapse`,
           );
         }
       }
@@ -1968,7 +1989,7 @@ export class NodeBuilder {
         this.safeSetPluginData(
           text,
           "textOverflow",
-          data.textStyle.textOverflow
+          data.textStyle.textOverflow,
         );
         if (data.textStyle.textOverflow === "ellipsis") {
           text.textTruncation = "ENDING";
@@ -1980,7 +2001,7 @@ export class NodeBuilder {
         this.safeSetPluginData(
           text,
           "listStyleType",
-          data.textStyle.listStyleType
+          data.textStyle.listStyleType,
         );
       }
 
@@ -2020,7 +2041,7 @@ export class NodeBuilder {
       console.log(
         `✅ [AI] Using OCR alternative text for ${
           data.name
-        }: "${data.ocrAlternative.substring(0, 50)}"`
+        }: "${data.ocrAlternative.substring(0, 50)}"`,
       );
       text.characters = data.ocrAlternative;
       this.safeSetPluginData(text, "usedOCRAlternative", "true");
@@ -2097,7 +2118,7 @@ export class NodeBuilder {
       if (targetWidth < 1) targetWidth = minSize;
       if (targetHeight < 1) targetHeight = minSize;
       console.warn(
-        `⚠️ [TEXT] ${data.name} had invalid dimensions, using minimum size: ${targetWidth}x${targetHeight}`
+        `⚠️ [TEXT] ${data.name} had invalid dimensions, using minimum size: ${targetWidth}x${targetHeight}`,
       );
     }
 
@@ -2113,12 +2134,12 @@ export class NodeBuilder {
       this.safeSetPluginData(
         text,
         "writingMode",
-        writingMode || "horizontal-tb"
+        writingMode || "horizontal-tb",
       );
       // Don't swap - let Figma handle vertical text natively if supported
       // But ensure text is visible
       console.log(
-        `📝 [TEXT] ${data.name} has vertical writing mode or rotation, preserving dimensions`
+        `📝 [TEXT] ${data.name} has vertical writing mode or rotation, preserving dimensions`,
       );
     }
     // removed agent log block
@@ -2140,7 +2161,7 @@ export class NodeBuilder {
       if (text.width < 1 || text.height < 1) {
         text.resize(
           Math.max(text.width || finalWidth, 1),
-          Math.max(text.height || finalHeight, 1)
+          Math.max(text.height || finalHeight, 1),
         );
       }
     } else {
@@ -2162,12 +2183,12 @@ export class NodeBuilder {
     // AI Enhancement: Log typography normalization
     if (data.normalizedToTypeScale && data.originalFontSize) {
       console.log(
-        `✅ [AI] Using normalized font size: ${data.textStyle.fontSize}px (original: ${data.originalFontSize}px) for ${data.name}`
+        `✅ [AI] Using normalized font size: ${data.textStyle.fontSize}px (original: ${data.originalFontSize}px) for ${data.name}`,
       );
       this.safeSetPluginData(
         text,
         "originalFontSize",
-        String(data.originalFontSize)
+        String(data.originalFontSize),
       );
       this.safeSetPluginData(text, "normalizedToTypeScale", "true");
     }
@@ -2189,21 +2210,21 @@ export class NodeBuilder {
         "TEXT",
         "Text node created with empty characters",
         { characters: "non-empty string" },
-        { characters: characters }
+        { characters: characters },
       );
     }
 
     console.log(
       `📝 Created text node: "${characters.substring(0, 50)}${
         characters.length > 50 ? "..." : ""
-      }"`
+      }"`,
     );
     return text;
   }
 
   private async applyInlineTextSegments(
     textNode: TextNode,
-    segments: any[]
+    segments: any[],
   ): Promise<void> {
     let currentIndex = 0;
 
@@ -2241,7 +2262,7 @@ export class NodeBuilder {
         } catch (e) {
           console.warn(
             `Failed to apply inline font style: ${fontFamily} ${style}`,
-            e
+            e,
           );
         }
 
@@ -2260,15 +2281,21 @@ export class NodeBuilder {
           textNode.setRangeTextDecoration(
             start,
             end,
-            segment.style.textDecoration
+            segment.style.textDecoration,
           );
         }
 
         if (
           segment.style.fontSize &&
+          Number.isFinite(segment.style.fontSize) &&
+          segment.style.fontSize > 0 &&
           segment.style.fontSize !== textNode.fontSize
         ) {
-          textNode.setRangeFontSize(start, end, segment.style.fontSize);
+          textNode.setRangeFontSize(
+            start,
+            end,
+            Math.max(1, segment.style.fontSize),
+          );
         }
       }
 
@@ -2283,7 +2310,7 @@ export class NodeBuilder {
       frame.name = data.name || "Video";
       frame.resize(
         Math.max(this.roundForPixelPerfection(data.layout?.width || 1), 0.01),
-        Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01)
+        Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01),
       );
       frame.fills = [];
 
@@ -2314,9 +2341,14 @@ export class NodeBuilder {
           await figma.loadFontAsync({ family: "Inter", style: "Regular" });
           const ocrTextNode = figma.createText();
           ocrTextNode.characters = data.ocrText.substring(0, 200); // Limit length
-          ocrTextNode.fontSize =
+          // CRITICAL FIX: Validate fontSize with minimum of 8px
+          const ocrRawSize =
             Math.min(data.layout?.width || 100, data.layout?.height || 100) *
             0.05;
+          ocrTextNode.fontSize = Math.max(
+            8,
+            Number.isFinite(ocrRawSize) ? ocrRawSize : 12,
+          );
           ocrTextNode.fills = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }];
           ocrTextNode.x = 10;
           ocrTextNode.y = 10;
@@ -2326,13 +2358,13 @@ export class NodeBuilder {
           this.safeSetPluginData(
             ocrTextNode,
             "ocrConfidence",
-            String(data.ocrConfidence)
+            String(data.ocrConfidence),
           );
           console.log(
             `✅ [AI] Added OCR text overlay to image: "${data.ocrText.substring(
               0,
-              50
-            )}"`
+              50,
+            )}"`,
           );
         } catch (ocrError) {
           console.warn("⚠️ [AI] Failed to create OCR text overlay:", ocrError);
@@ -2358,7 +2390,7 @@ export class NodeBuilder {
     rect.name = data.name || "Image";
     rect.resize(
       Math.max(this.roundForPixelPerfection(data.layout?.width || 1), 0.01),
-      Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01)
+      Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01),
     );
 
     // 🔥 CRITICAL: schema uses imageHash – prefer that, but still support imageAssetId.
@@ -2392,7 +2424,7 @@ export class NodeBuilder {
 
     if (!hash && Array.isArray(data.fills)) {
       const imageFill = data.fills.find(
-        (f: any) => f && f.type === "IMAGE" && typeof f.imageHash === "string"
+        (f: any) => f && f.type === "IMAGE" && typeof f.imageHash === "string",
       );
       if (imageFill) {
         hash = imageFill.imageHash;
@@ -2432,12 +2464,12 @@ export class NodeBuilder {
         if (data.imageFit === "none" && intrinsicW > 0 && intrinsicH > 0) {
           rect.resize(
             Math.max(this.roundForPixelPerfection(intrinsicW), 0.01),
-            Math.max(this.roundForPixelPerfection(intrinsicH), 0.01)
+            Math.max(this.roundForPixelPerfection(intrinsicH), 0.01),
           );
           console.log(
             `✅ [PIXEL-PERFECT] Resized ${
               data.name || "Image"
-            } to intrinsic size ${intrinsicW}x${intrinsicH} (object-fit: none)`
+            } to intrinsic size ${intrinsicW}x${intrinsicH} (object-fit: none)`,
           );
         }
 
@@ -2446,7 +2478,7 @@ export class NodeBuilder {
             data.imageFit
           }' → scaleMode '${scaleMode}' for ${
             data.name || "Image"
-          } (intrinsic: ${intrinsicW}x${intrinsicH}, display: ${displayW}x${displayH})`
+          } (intrinsic: ${intrinsicW}x${intrinsicH}, display: ${displayW}x${displayH})`,
         );
       }
 
@@ -2485,16 +2517,16 @@ export class NodeBuilder {
       if (imagePaint.type === "IMAGE") {
         rect.fills = [imagePaint];
         console.log(
-          `✅ Image paint applied to ${data.name || "Image"} with hash ${hash}`
+          `✅ Image paint applied to ${data.name || "Image"} with hash ${hash}`,
         );
       } else {
         console.error(
-          `❌ Failed to resolve image for hash ${hash} - got ${imagePaint.type} fallback instead of IMAGE paint`
+          `❌ Failed to resolve image for hash ${hash} - got ${imagePaint.type} fallback instead of IMAGE paint`,
         );
         console.error(
           `  Available asset keys: ${Object.keys(this.assets?.images || {})
             .slice(0, 5)
-            .join(", ")}`
+            .join(", ")}`,
         );
 
         // CRITICAL FIX: Try to fetch from URL if available (for Etsy lazy-loaded images)
@@ -2502,7 +2534,7 @@ export class NodeBuilder {
         let imageUrl: string | undefined = undefined;
         if (data.fills && data.fills.length > 0) {
           const imageFill = data.fills.find(
-            (f: any) => f && f.type === "IMAGE"
+            (f: any) => f && f.type === "IMAGE",
           );
           if (imageFill && imageFill.url) {
             imageUrl = imageFill.url;
@@ -2523,14 +2555,14 @@ export class NodeBuilder {
         if (imageUrl && imageUrl !== hash) {
           try {
             console.log(
-              `🔄 [LAST RESORT] Attempting to fetch image from URL: ${imageUrl}`
+              `🔄 [LAST RESORT] Attempting to fetch image from URL: ${imageUrl}`,
             );
             // Use fetchImage which automatically routes external URLs to proxy
             const bytes = await this.fetchImage(imageUrl);
             const contentType = "image/png";
             const transcodedBytes = await this.transcodeIfUnsupportedRaster(
               bytes,
-              contentType
+              contentType,
             );
             const figmaImage = figma.createImage(transcodedBytes);
             const finalImagePaint: ImagePaint = {
@@ -2541,7 +2573,7 @@ export class NodeBuilder {
             };
             rect.fills = [finalImagePaint];
             console.log(
-              `✅ [LAST RESORT] Successfully fetched and applied image from URL`
+              `✅ [LAST RESORT] Successfully fetched and applied image from URL`,
             );
           } catch (urlError) {
             console.warn(`  ❌ URL fetch failed:`, urlError);
@@ -2574,7 +2606,7 @@ export class NodeBuilder {
               (imagePaint as any).type === "IMAGE"
                 ? "url fetch succeeded"
                 : "placeholder created",
-          }
+          },
         );
       }
     }
@@ -2587,7 +2619,7 @@ export class NodeBuilder {
         frame.name = data.name || "Image";
         frame.resize(
           this.roundForPixelPerfection(rect.width),
-          this.roundForPixelPerfection(rect.height)
+          this.roundForPixelPerfection(rect.height),
         );
         frame.fills = rect.fills;
         frame.x = rect.x;
@@ -2608,13 +2640,13 @@ export class NodeBuilder {
         this.safeSetPluginData(
           ocrTextNode,
           "ocrConfidence",
-          String(data.ocrConfidence)
+          String(data.ocrConfidence),
         );
         console.log(
           `✅ [AI] Added OCR text overlay to image: "${data.ocrText.substring(
             0,
-            50
-          )}"`
+            50,
+          )}"`,
         );
         return frame;
       } catch (ocrError) {
@@ -2629,17 +2661,17 @@ export class NodeBuilder {
   // NEW: Create a visible placeholder for failed images
   private async createImagePlaceholder(
     data: any,
-    hash: string | undefined
+    hash: string | undefined,
   ): Promise<FrameNode> {
     const frame = figma.createFrame();
     frame.name = `[MISSING] ${data.name || "Image"}`;
     const width = Math.max(
       this.roundForPixelPerfection(data.layout?.width || 1),
-      1
+      1,
     );
     const height = Math.max(
       this.roundForPixelPerfection(data.layout?.height || 1),
-      1
+      1,
     );
     frame.resize(width, height);
 
@@ -2737,7 +2769,7 @@ export class NodeBuilder {
       } catch (error) {
         console.warn(
           "Failed to create vector from SVG, falling back to rectangle.",
-          error
+          error,
         );
       }
     }
@@ -2759,7 +2791,7 @@ export class NodeBuilder {
       } catch (error) {
         console.warn(
           "Failed to create vector from svgCode on asset, continuing as raster",
-          error
+          error,
         );
       }
     }
@@ -2785,7 +2817,7 @@ export class NodeBuilder {
     component.name = data.name || "Component";
     component.resize(
       Math.max(this.roundForPixelPerfection(data.layout?.width || 1), 0.01),
-      Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01)
+      Math.max(this.roundForPixelPerfection(data.layout?.height || 1), 0.01),
     );
     component.fills = []; // Start transparent
     return component;
@@ -2815,7 +2847,7 @@ export class NodeBuilder {
   private async afterCreate(
     node: SceneNode,
     data: any,
-    meta: { reuseComponent: boolean }
+    meta: { reuseComponent: boolean },
   ): Promise<void> {
     // Helper to safely execute operations with isolated error handling
     const safeExec = async (opName: string, op: () => void | Promise<void>) => {
@@ -2854,7 +2886,7 @@ export class NodeBuilder {
         // These indicate upstream extraction/serialization failure
         if (validationErr instanceof SchemaValidationError) {
           console.error(
-            `❌ [SCHEMA] Node "${data.name}" missing field: ${validationErr.fieldName}`
+            `❌ [SCHEMA] Node "${data.name}" missing field: ${validationErr.fieldName}`,
           );
           throw validationErr; // Re-throw to fail node creation
         }
@@ -2863,7 +2895,7 @@ export class NodeBuilder {
         // (This allows minor paint/style issues to not block entire node)
         console.warn(
           `⚠️ [VALIDATION] Non-critical validation issue for ${data.name}, using raw data:`,
-          validationErr
+          validationErr,
         );
         validatedData = data;
       }
@@ -2938,7 +2970,7 @@ export class NodeBuilder {
         typeof this.applyDesignTokens === "function"
       ) {
         await safeExec("applyDesignTokens", () =>
-          this.applyDesignTokens(node, data.designTokens)
+          this.applyDesignTokens(node, data.designTokens),
         );
       }
     } catch (e) {
@@ -2957,11 +2989,11 @@ export class NodeBuilder {
           stack: errorStack,
           nodeType: node.type,
           dataType: data?.type,
-        }
+        },
       );
       // GRACEFUL FAILURE: Don't throw for other errors - log error and continue
       console.warn(
-        `⚠️ [GRACEFUL] Continuing import despite afterCreate failure for ${node.name}`
+        `⚠️ [GRACEFUL] Continuing import despite afterCreate failure for ${node.name}`,
       );
     }
   }
@@ -3000,7 +3032,7 @@ export class NodeBuilder {
     if (maxWidth <= 0) return;
 
     const activeSides = [top, right, bottom, left].filter(
-      (s) => s.width > 0.001
+      (s) => s.width > 0.001,
     );
     const pickColor =
       activeSides.find((s) => s.color)?.color ||
@@ -3024,7 +3056,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "cssBorderSides",
-        JSON.stringify({ top, right, bottom, left })
+        JSON.stringify({ top, right, bottom, left }),
       );
       this.safeSetPluginData(node, "cssBorderColorMismatch", "true");
     }
@@ -3091,7 +3123,7 @@ export class NodeBuilder {
           const boundFill = figma.variables.setBoundVariableForPaint(
             newFills[0],
             "color",
-            variable
+            variable,
           );
           newFills[0] = boundFill;
           (node as GeometryMixin).fills = newFills;
@@ -3108,7 +3140,7 @@ export class NodeBuilder {
           const boundStroke = figma.variables.setBoundVariableForPaint(
             newStrokes[0],
             "color",
-            variable
+            variable,
           );
           newStrokes[0] = boundStroke;
           (node as GeometryMixin).strokes = newStrokes;
@@ -3170,7 +3202,7 @@ export class NodeBuilder {
     node: SceneNode,
     data: any,
     elementWidth: number,
-    elementHeight: number
+    elementHeight: number,
   ): void {
     // Check if node has absoluteTransform data from new schema
     const absoluteTransform = data.absoluteTransform;
@@ -3180,7 +3212,7 @@ export class NodeBuilder {
     }
 
     console.log(
-      `🎯 [PIXEL-PERFECT TRANSFORMS] Applying matrix transform for ${data.tagName}`
+      `🎯 [PIXEL-PERFECT TRANSFORMS] Applying matrix transform for ${data.tagName}`,
     );
 
     const { matrix, origin } = absoluteTransform;
@@ -3189,12 +3221,12 @@ export class NodeBuilder {
     // CRITICAL SAFETY: Validate matrix values to prevent engine crashes
     if (
       ![a, b, c, d, tx, ty].every(
-        (v) => typeof v === "number" && Number.isFinite(v)
+        (v) => typeof v === "number" && Number.isFinite(v),
       )
     ) {
       console.warn(
         `⚠️ [TRANSFORM] Skipping invalid matrix for ${data.tagName}:`,
-        matrix
+        matrix,
       );
       return;
     }
@@ -3220,7 +3252,7 @@ export class NodeBuilder {
         this.safeSetPluginData(
           node,
           "originalLocalSize",
-          JSON.stringify(data.localSize)
+          JSON.stringify(data.localSize),
         );
       }
 
@@ -3231,8 +3263,8 @@ export class NodeBuilder {
 
       console.log(
         `  📊 Transform details: matrix=${matrix}, origin=${JSON.stringify(
-          origin
-        )}, localSize=${JSON.stringify(data.localSize)}`
+          origin,
+        )}, localSize=${JSON.stringify(data.localSize)}`,
       );
     } catch (error) {
       console.warn(`  ⚠️ Failed to apply transform matrix:`, error);
@@ -3241,7 +3273,7 @@ export class NodeBuilder {
     }
 
     console.log(
-      `✅ [PIXEL-PERFECT TRANSFORMS] Matrix transform applied to ${data.tagName} (${node.type})`
+      `✅ [PIXEL-PERFECT TRANSFORMS] Matrix transform applied to ${data.tagName} (${node.type})`,
     );
   }
 
@@ -3251,7 +3283,7 @@ export class NodeBuilder {
   private applyTransformFallback(
     node: SceneNode,
     matrix: number[],
-    localSize?: { width: number; height: number }
+    localSize?: { width: number; height: number },
   ): void {
     const [a, b, c, d, tx, ty] = matrix;
 
@@ -3260,7 +3292,7 @@ export class NodeBuilder {
     if (rotation !== 0 && "rotation" in node) {
       node.rotation = rotation;
       console.log(
-        `  🔄 Fallback: Applied rotation: ${(rotation * 180) / Math.PI}°`
+        `  🔄 Fallback: Applied rotation: ${(rotation * 180) / Math.PI}°`,
       );
     }
 
@@ -3272,7 +3304,7 @@ export class NodeBuilder {
       const scaledHeight = localSize.height * scaleY;
       (node as LayoutMixin).resize(
         Math.max(scaledWidth, 1),
-        Math.max(scaledHeight, 1)
+        Math.max(scaledHeight, 1),
       );
       console.log(`  📏 Fallback: Applied scale: ${scaleX}x${scaleY}`);
     }
@@ -3310,12 +3342,12 @@ export class NodeBuilder {
           original: zIndex,
           normalized: normalizedZIndex,
           stackingContext: data.absoluteLayout?._stackingContext || false,
-        })
+        }),
       );
 
       // Log for debugging stacking issues
       console.log(
-        `🔄 [STACKING] Applied z-index ${zIndex} (normalized: ${normalizedZIndex}) to ${data.name}`
+        `🔄 [STACKING] Applied z-index ${zIndex} (normalized: ${normalizedZIndex}) to ${data.name}`,
       );
     }
 
@@ -3329,7 +3361,7 @@ export class NodeBuilder {
           position,
           zIndex: zIndex || 0,
           stackingContext: true,
-        })
+        }),
       );
     }
   }
@@ -3354,7 +3386,7 @@ export class NodeBuilder {
     data: any,
     bounds: { left: number; top: number },
     elementWidth: number,
-    elementHeight: number
+    elementHeight: number,
   ): boolean {
     const transformData =
       data.transform ||
@@ -3406,7 +3438,7 @@ export class NodeBuilder {
     const origin = parseTransformOrigin(
       originString,
       elementWidth,
-      elementHeight
+      elementHeight,
     );
     const ox = origin.x * elementWidth;
     const oy = origin.y * elementHeight;
@@ -3452,12 +3484,12 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "cssTransformMatrix",
-        JSON.stringify(matrix)
+        JSON.stringify(matrix),
       );
       this.safeSetPluginData(
         node,
         "cssTransformOrigin",
-        JSON.stringify(origin)
+        JSON.stringify(origin),
       );
       return true;
     } catch (error) {
@@ -3482,7 +3514,7 @@ export class NodeBuilder {
             intellErr instanceof Error ? intellErr.message : String(intellErr);
           // Only log errors
           console.error(
-            `❌ [applyPositioning] analyzeLayoutIntelligence failed for ${data.name}: ${errMsg}`
+            `❌ [applyPositioning] analyzeLayoutIntelligence failed for ${data.name}: ${errMsg}`,
           );
           // Create minimal fallback
           layoutIntelligence = {
@@ -3500,7 +3532,7 @@ export class NodeBuilder {
           const errMsg =
             profErr instanceof Error ? profErr.message : String(profErr);
           console.error(
-            `❌ [applyPositioning] applyProfessionalPositioning failed for ${data.name}: ${errMsg}`
+            `❌ [applyPositioning] applyProfessionalPositioning failed for ${data.name}: ${errMsg}`,
           );
         }
 
@@ -3540,7 +3572,7 @@ export class NodeBuilder {
                     y: coordResult.y,
                     width: coordResult.width,
                     height: coordResult.height,
-                  }
+                  },
                 );
               });
             }
@@ -3564,7 +3596,7 @@ export class NodeBuilder {
               y: data.layout.y,
               roundedX: x,
               roundedY: y,
-            })
+            }),
           );
         }
 
@@ -3586,7 +3618,7 @@ export class NodeBuilder {
         if ("resize" in node) {
           (node as LayoutMixin).resize(
             Math.max(untransformedWidth, 1),
-            Math.max(untransformedHeight, 1)
+            Math.max(untransformedHeight, 1),
           );
         }
 
@@ -3601,7 +3633,7 @@ export class NodeBuilder {
               data,
               { left: x, top: y },
               untransformedWidth,
-              untransformedHeight
+              untransformedHeight,
             );
             if (appliedMatrix) {
               // Matrix already encodes translation; avoid double positioning/resizing.
@@ -3610,7 +3642,7 @@ export class NodeBuilder {
           } catch (matrixErr) {
             console.error(
               `❌ [applyPositioning] tryApplyCssMatrixTransform failed for ${data.name}`,
-              matrixErr
+              matrixErr,
             );
           }
         }
@@ -3646,7 +3678,7 @@ export class NodeBuilder {
               // No scale applied, use original dimensions
               (node as LayoutMixin).resize(
                 Math.max(width, 1),
-                Math.max(height, 1)
+                Math.max(height, 1),
               );
             } else {
               // Scale was applied, dimensions should already be correct
@@ -3654,7 +3686,7 @@ export class NodeBuilder {
               if (currentWidth < 1 || currentHeight < 1) {
                 (node as LayoutMixin).resize(
                   Math.max(currentWidth, 1),
-                  Math.max(currentHeight, 1)
+                  Math.max(currentHeight, 1),
                 );
               }
             }
@@ -3689,7 +3721,7 @@ export class NodeBuilder {
           this.safeSetPluginData(
             node,
             "potentialAutoLayout",
-            JSON.stringify(data.autoLayout || {})
+            JSON.stringify(data.autoLayout || {}),
           );
         } else {
           // Use absolute positioning for precise pixel placement
@@ -3702,7 +3734,7 @@ export class NodeBuilder {
         this.safeSetPluginData(
           node,
           "cssLayoutContext",
-          JSON.stringify(data.layoutContext)
+          JSON.stringify(data.layoutContext),
         );
 
         if (
@@ -3712,7 +3744,7 @@ export class NodeBuilder {
           this.safeSetPluginData(
             node,
             "cssTransform",
-            data.layoutContext.transform
+            data.layoutContext.transform,
           );
         }
 
@@ -3720,7 +3752,7 @@ export class NodeBuilder {
           this.safeSetPluginData(
             node,
             "cssPosition",
-            data.layoutContext.position
+            data.layoutContext.position,
           );
         }
 
@@ -3728,7 +3760,7 @@ export class NodeBuilder {
           this.safeSetPluginData(
             node,
             "flexAnalysis",
-            JSON.stringify((data.autoLayout as any).flexAnalysis)
+            JSON.stringify((data.autoLayout as any).flexAnalysis),
           );
         }
       }
@@ -3745,7 +3777,7 @@ export class NodeBuilder {
         this.safeSetPluginData(
           node,
           "cssLayoutGrow",
-          data.autoLayout.layoutGrow.toString()
+          data.autoLayout.layoutGrow.toString(),
         );
       }
       if ("layoutAlign" in node && data.autoLayout?.layoutAlign) {
@@ -3757,7 +3789,7 @@ export class NodeBuilder {
         this.safeSetPluginData(
           node,
           "cssLayoutAlign",
-          data.autoLayout.layoutAlign
+          data.autoLayout.layoutAlign,
         );
       }
 
@@ -3767,7 +3799,7 @@ export class NodeBuilder {
         } catch (respErr) {
           console.error(
             `❌ [applyPositioning] applyResponsiveConstraints failed for ${data.name}`,
-            respErr
+            respErr,
           );
         }
       }
@@ -3779,7 +3811,7 @@ export class NodeBuilder {
         `❌ [applyPositioning] OUTER CATCH for ${
           data?.name || "unknown"
         }: ${errMsg}`,
-        outerErr
+        outerErr,
       );
       // Don't rethrow - let safeExec handle the error logging
       throw outerErr;
@@ -3802,7 +3834,7 @@ export class NodeBuilder {
         } catch (error) {
           console.warn(
             `Cannot set minWidth on node "${frameNode.name}":`,
-            error
+            error,
           );
         }
       }
@@ -3817,7 +3849,7 @@ export class NodeBuilder {
         } catch (error) {
           console.warn(
             `Cannot set maxWidth on node "${frameNode.name}":`,
-            error
+            error,
           );
         }
       }
@@ -3832,7 +3864,7 @@ export class NodeBuilder {
         } catch (error) {
           console.warn(
             `Cannot set minHeight on node "${frameNode.name}":`,
-            error
+            error,
           );
         }
       }
@@ -3847,7 +3879,7 @@ export class NodeBuilder {
         } catch (error) {
           console.warn(
             `Cannot set maxHeight on node "${frameNode.name}":`,
-            error
+            error,
           );
         }
       }
@@ -3875,11 +3907,11 @@ export class NodeBuilder {
           `❌ [AUTO_LAYOUT] Skipping Auto Layout for ${
             node.name
           }: Failed validation (${layout.validation.maxChildDeltaPx.toFixed(
-            2
-          )}px > ${layout.validation.tolerancePx}px tolerance)`
+            2,
+          )}px > ${layout.validation.tolerancePx}px tolerance)`,
         );
         console.log(
-          `   Rejection reasons: ${layout.validation.reasons.join(", ")}`
+          `   Rejection reasons: ${layout.validation.reasons.join(", ")}`,
         );
 
         // Keep absolute positioning
@@ -3891,7 +3923,7 @@ export class NodeBuilder {
             reasons: layout.validation.reasons,
             maxChildDeltaPx: layout.validation.maxChildDeltaPx,
             tolerancePx: layout.validation.tolerancePx,
-          })
+          }),
         );
         return;
       }
@@ -3903,7 +3935,7 @@ export class NodeBuilder {
         typeof layout.itemSpacing !== "number"
       ) {
         console.warn(
-          `⚠️ [AUTO_LAYOUT] Invalid layout schema for ${node.name}, falling back to absolute`
+          `⚠️ [AUTO_LAYOUT] Invalid layout schema for ${node.name}, falling back to absolute`,
         );
         node.layoutMode = "NONE";
         return;
@@ -3914,10 +3946,10 @@ export class NodeBuilder {
 
       // Map schema alignItems/justifyContent to Figma properties
       node.primaryAxisAlignItems = this.mapSchemaAlignmentToPrimary(
-        layout.justifyContent
+        layout.justifyContent,
       );
       node.counterAxisAlignItems = this.mapSchemaAlignmentToCounter(
-        layout.alignItems
+        layout.alignItems,
       );
       node.itemSpacing = layout.itemSpacing;
 
@@ -3947,7 +3979,7 @@ export class NodeBuilder {
       if (layout.strokesIncludedInLayout !== undefined) {
         node.strokesIncludedInLayout = layout.strokesIncludedInLayout;
         console.log(
-          `📍 [PROFESSIONAL LAYOUT] Applied strokesIncludedInLayout: ${layout.strokesIncludedInLayout}`
+          `📍 [PROFESSIONAL LAYOUT] Applied strokesIncludedInLayout: ${layout.strokesIncludedInLayout}`,
         );
       } else if (
         typeof node.strokeWeight === "number" &&
@@ -3956,7 +3988,7 @@ export class NodeBuilder {
         // Auto-detect: include strokes if element has visible borders
         node.strokesIncludedInLayout = true;
         console.log(
-          `📍 [PROFESSIONAL LAYOUT] Auto-detected strokesIncludedInLayout: true (stroke weight: ${node.strokeWeight})`
+          `📍 [PROFESSIONAL LAYOUT] Auto-detected strokesIncludedInLayout: true (stroke weight: ${node.strokeWeight})`,
         );
       } else {
         node.strokesIncludedInLayout = false;
@@ -3972,18 +4004,18 @@ export class NodeBuilder {
           avgChildDeltaPx: layout.validation?.avgChildDeltaPx || 0,
           tolerancePx: layout.validation?.tolerancePx || 1.0,
           evidence: layout.evidence,
-        })
+        }),
       );
 
       console.log(
         `✅ [AUTO_LAYOUT] Applied validated Auto Layout to ${node.name}: ${
           layout.mode
-        } (delta: ${(layout.validation?.maxChildDeltaPx || 0).toFixed(2)}px)`
+        } (delta: ${(layout.validation?.maxChildDeltaPx || 0).toFixed(2)}px)`,
       );
     } catch (error) {
       console.warn(
         `❌ [AUTO_LAYOUT] Failed to apply Auto Layout to ${node.name}:`,
-        error
+        error,
       );
       node.layoutMode = "NONE";
     }
@@ -3993,7 +4025,7 @@ export class NodeBuilder {
    * Map schema alignment format to Figma primary axis alignment values
    */
   private mapSchemaAlignmentToPrimary(
-    alignment: "MIN" | "CENTER" | "MAX" | "BASELINE" | "SPACE_BETWEEN"
+    alignment: "MIN" | "CENTER" | "MAX" | "BASELINE" | "SPACE_BETWEEN",
   ): "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" {
     switch (alignment) {
       case "MIN":
@@ -4007,7 +4039,7 @@ export class NodeBuilder {
       case "BASELINE":
         // Primary axis doesn't support baseline, fallback to MIN
         console.warn(
-          "[AUTO_LAYOUT] Baseline alignment not supported on primary axis, using MIN"
+          "[AUTO_LAYOUT] Baseline alignment not supported on primary axis, using MIN",
         );
         return "MIN";
       default:
@@ -4019,7 +4051,7 @@ export class NodeBuilder {
    * Map schema alignment format to Figma counter axis alignment values
    */
   private mapSchemaAlignmentToCounter(
-    alignment: "MIN" | "CENTER" | "MAX" | "BASELINE" | "SPACE_BETWEEN"
+    alignment: "MIN" | "CENTER" | "MAX" | "BASELINE" | "SPACE_BETWEEN",
   ): "MIN" | "CENTER" | "MAX" | "BASELINE" {
     switch (alignment) {
       case "MIN":
@@ -4033,7 +4065,7 @@ export class NodeBuilder {
       case "SPACE_BETWEEN":
         // Counter axis doesn't support space-between, fallback to MIN
         console.warn(
-          "[AUTO_LAYOUT] Space-between alignment not supported on counter axis, using MIN"
+          "[AUTO_LAYOUT] Space-between alignment not supported on counter axis, using MIN",
         );
         return "MIN";
       default:
@@ -4076,7 +4108,7 @@ export class NodeBuilder {
         data.svgContent.trim().length > 0;
       if (preserveSvgFills) {
         console.log(
-          `  🧩 [SVG] Preserving fills from svgContent for ${data.name}, skipping fill/background processing`
+          `  🧩 [SVG] Preserving fills from svgContent for ${data.name}, skipping fill/background processing`,
         );
       } else {
         const paints: Paint[] = [];
@@ -4141,7 +4173,7 @@ export class NodeBuilder {
               hasStyleBackgroundColor,
               computedBg: data.computedStyle?.backgroundColor,
               styleBg: data.style?.backgroundColor,
-            }
+            },
           );
           (node as SceneNodeWithGeometry).fills = [];
           // Skip to the rest of the function (strokes, effects, etc.) - don't process fills
@@ -4149,7 +4181,7 @@ export class NodeBuilder {
           // ENHANCED: Log why we're processing fills (especially important for body/html elements)
           if (isHeaderOrNav) {
             console.log(
-              `  🎨 [HEADER/NAV] Processing fills for ${data.name} (tag: ${data.htmlTag})`
+              `  🎨 [HEADER/NAV] Processing fills for ${data.name} (tag: ${data.htmlTag})`,
             );
           } else if (isBodyOrHtml) {
             console.log(
@@ -4165,7 +4197,7 @@ export class NodeBuilder {
                 reason: !schemaExplicitlyNoFills
                   ? "schema has fills"
                   : "has other fill sources",
-              }
+              },
             );
           }
           // Process fills normally - even for body/html if schema has fills
@@ -4173,16 +4205,16 @@ export class NodeBuilder {
           let earlyFallbackColor: RGBA | null = null;
           if (data.computedStyle?.backgroundColor) {
             earlyFallbackColor = this.parseColorString(
-              data.computedStyle.backgroundColor
+              data.computedStyle.backgroundColor,
             );
             if (earlyFallbackColor && earlyFallbackColor.a > 0) {
               console.log(
                 `  🎨 [EARLY FALLBACK] Found computed backgroundColor for ${data.name}:`,
-                earlyFallbackColor
+                earlyFallbackColor,
               );
             } else if (earlyFallbackColor && earlyFallbackColor.a === 0) {
               console.log(
-                `  🎨 [EARLY FALLBACK] Computed backgroundColor is transparent for ${data.name}, will try other sources`
+                `  🎨 [EARLY FALLBACK] Computed backgroundColor is transparent for ${data.name}, will try other sources`,
               );
               earlyFallbackColor = null; // Reset to try other sources
             }
@@ -4228,10 +4260,10 @@ export class NodeBuilder {
             // Process fills even if inherited - visual fidelity requires all paints
             console.log(
               `  ✅ Processing ${data.fills.length} fills for ${data.name} ` +
-                `(inherited: ${fillsAreInherited}, computedBg: ${computedBgStr})`
+                `(inherited: ${fillsAreInherited}, computedBg: ${computedBgStr})`,
             );
             console.log(
-              `  ✅ Processing ${data.fills.length} fills for ${data.name}`
+              `  ✅ Processing ${data.fills.length} fills for ${data.name}`,
             );
             const fillPaints = await this.convertFillsAsync(data.fills);
 
@@ -4253,7 +4285,7 @@ export class NodeBuilder {
                   opacity: p.opacity,
                   visible: p.visible,
                 })),
-              }
+              },
             );
 
             // BUGFIX: Only filter IMAGE fills if we actually have background layers AND they contain images.
@@ -4264,13 +4296,13 @@ export class NodeBuilder {
                 (bg: any) =>
                   bg?.type === "IMAGE" ||
                   bg?.fill?.type === "IMAGE" ||
-                  bg?.imageHash
+                  bg?.imageHash,
               );
 
             // If we have detailed image backgrounds, prefer those over generic IMAGE fills in `fills`.
             // Otherwise, keep all fills (including IMAGE fills).
             const filteredFills = fillPaints.filter(
-              (p) => !hasImageBackgrounds || p.type !== "IMAGE"
+              (p) => !hasImageBackgrounds || p.type !== "IMAGE",
             );
             paints.push(...filteredFills);
 
@@ -4278,7 +4310,7 @@ export class NodeBuilder {
             // try fallback immediately (don't wait for all other checks to fail)
             if (fillPaints.length === 0 && data.fills.length > 0) {
               console.warn(
-                `  ⚠️ [FILL] ${data.fills.length} fills in schema but convertFillsAsync returned 0 paints for ${data.name}`
+                `  ⚠️ [FILL] ${data.fills.length} fills in schema but convertFillsAsync returned 0 paints for ${data.name}`,
               );
 
               // CRITICAL FIX: Try to manually convert fills if async conversion failed
@@ -4309,19 +4341,19 @@ export class NodeBuilder {
                         fill.opacity !== undefined
                           ? fill.opacity
                           : color.a !== undefined
-                          ? color.a
-                          : 1;
+                            ? color.a
+                            : 1;
                       paints.push(
                         figma.util.solidPaint(
                           { r: color.r, g: color.g, b: color.b },
                           {
                             opacity: opacity,
                             visible: fill.visible !== false,
-                          }
-                        )
+                          },
+                        ),
                       );
                       console.log(
-                        `  ✅ [FILL FIX] Manually converted SOLID fill for ${data.name}`
+                        `  ✅ [FILL FIX] Manually converted SOLID fill for ${data.name}`,
                       );
                       continue;
                     }
@@ -4338,7 +4370,7 @@ export class NodeBuilder {
                     data.computedStyle?.backgroundColor
                   ) {
                     fallbackColor = this.parseColorString(
-                      data.computedStyle.backgroundColor
+                      data.computedStyle.backgroundColor,
                     );
                   }
 
@@ -4371,44 +4403,44 @@ export class NodeBuilder {
                           opacity:
                             fallbackColor.a !== undefined ? fallbackColor.a : 1,
                           visible: true,
-                        }
-                      )
+                        },
+                      ),
                     );
                     console.log(
                       `  🎨 [FILL FIX] Using backgroundColor fallback for ${data.name}:`,
-                      { color: fallbackColor }
+                      { color: fallbackColor },
                     );
                     continue;
                   }
                 } catch (fillErr) {
                   console.warn(
                     `  ⚠️ [FILL] Error processing fill ${fill.type}:`,
-                    fillErr
+                    fillErr,
                   );
                 }
               }
 
               if (paints.length === 0) {
                 console.warn(
-                  `  ⚠️ [FILL] No fallback color found for ${data.name} after convertFillsAsync failed`
+                  `  ⚠️ [FILL] No fallback color found for ${data.name} after convertFillsAsync failed`,
                 );
               }
             } // End if fillPaints.length === 0 fallback check
           } else if (data.fills?.length === 0) {
             // PIXEL-PERFECT FIX: Synthesize fills from computedStyle when schema has empty array
             console.log(
-              `  🔧 [SYNTHESIS] Empty fills array for ${data.name}, attempting synthesis`
+              `  🔧 [SYNTHESIS] Empty fills array for ${data.name}, attempting synthesis`,
             );
 
             // Try computedStyle.backgroundColor first (most reliable)
             if (data.computedStyle?.backgroundColor) {
               const color = this.parseColorString(
-                data.computedStyle.backgroundColor
+                data.computedStyle.backgroundColor,
               );
               if (color && color.a > 0.01) {
                 console.log(
                   `  ✓ [SYNTHESIS] Created fill from computedStyle for ${data.name}:`,
-                  color
+                  color,
                 );
                 paints.push({
                   type: "SOLID",
@@ -4425,7 +4457,7 @@ export class NodeBuilder {
               if (color && color.a > 0.01) {
                 console.log(
                   `  ✓ [SYNTHESIS] Created fill from style.backgroundColor for ${data.name}:`,
-                  color
+                  color,
                 );
                 paints.push({
                   type: "SOLID",
@@ -4444,11 +4476,11 @@ export class NodeBuilder {
 
           if (hasDetailedBackgrounds && !shouldSkipBackgrounds) {
             console.log(
-              `  ✅ Processing ${data.backgrounds.length} detailed background layers`
+              `  ✅ Processing ${data.backgrounds.length} detailed background layers`,
             );
             const bgPaints = await this.convertBackgroundLayersAsync(
               data.backgrounds,
-              data.layout
+              data.layout,
             );
             paints.push(...bgPaints);
           } else if (
@@ -4457,7 +4489,7 @@ export class NodeBuilder {
             fillsAreInherited
           ) {
             console.log(
-              `  ⚪ [FILL] Skipping ${data.backgrounds.length} inherited background layers for ${data.name} (computed background is transparent)`
+              `  ⚪ [FILL] Skipping ${data.backgrounds.length} inherited background layers for ${data.name} (computed background is transparent)`,
             );
           }
 
@@ -4485,7 +4517,7 @@ export class NodeBuilder {
           ) {
             console.log(
               `  🎨 [EARLY FALLBACK DIRECT] Applying computed backgroundColor immediately for ${data.name}:`,
-              earlyFallbackColor
+              earlyFallbackColor,
             );
             paints.push(
               figma.util.solidPaint(
@@ -4497,8 +4529,8 @@ export class NodeBuilder {
                 {
                   opacity: earlyFallbackColor.a,
                   visible: true,
-                }
-              )
+                },
+              ),
             );
           }
 
@@ -4526,21 +4558,21 @@ export class NodeBuilder {
                 !shouldSkipInheritedFallback
               ) {
                 console.log(
-                  `  🔗 [INHERITANCE] Node ${data.name} has inherited background color`
+                  `  🔗 [INHERITANCE] Node ${data.name} has inherited background color`,
                 );
                 // For inherited colors, the effective color should already be in fills array
                 // But if not, check colorInheritance data
                 if (data.colorInheritance.effectiveColor) {
                   parsedColor = this.parseColorString(
-                    data.colorInheritance.effectiveColor
+                    data.colorInheritance.effectiveColor,
                   );
                   console.log(
-                    `  ✅ [INHERITANCE] Using effective inherited color: ${data.colorInheritance.effectiveColor}`
+                    `  ✅ [INHERITANCE] Using effective inherited color: ${data.colorInheritance.effectiveColor}`,
                   );
                 }
               } else if (shouldSkipInheritedFallback) {
                 console.log(
-                  `  ⚪ [FILL] Skipping inherited color fallback for ${data.name} (computed background is transparent)`
+                  `  ⚪ [FILL] Skipping inherited color fallback for ${data.name} (computed background is transparent)`,
                 );
               }
 
@@ -4565,7 +4597,7 @@ export class NodeBuilder {
 
               if (hasStroke) {
                 console.log(
-                  `  🛑 [FILL] Skipping placeholder-derived fill for border-only node ${data.name}`
+                  `  🛑 [FILL] Skipping placeholder-derived fill for border-only node ${data.name}`,
                 );
               } else {
                 // NEW: Try schema-based parent color detection before using placeholder
@@ -4584,11 +4616,11 @@ export class NodeBuilder {
                   parsedColor = inheritedColor;
                   console.log(
                     `  🔗 [SCHEMA-INHERITANCE] Using parent color for ${data.name}:`,
-                    inheritedColor
+                    inheritedColor,
                   );
                 } else if (shouldSkipParentColor) {
                   console.log(
-                    `  ⚪ [FILL] Skipping parent color fallback for ${data.name} (computed background is transparent)`
+                    `  ⚪ [FILL] Skipping parent color fallback for ${data.name} (computed background is transparent)`,
                   );
                 } else {
                   const placeholderColor = this.getPlaceholderColor(data);
@@ -4601,7 +4633,7 @@ export class NodeBuilder {
                   if (!isDefaultGrey) {
                     parsedColor = placeholderColor;
                     console.log(
-                      `  🎨 Using placeholder color for ${data.name} (extracted from CSS variables/data)`
+                      `  🎨 Using placeholder color for ${data.name} (extracted from CSS variables/data)`,
                     );
                   }
                 }
@@ -4615,12 +4647,12 @@ export class NodeBuilder {
                   source: data.style?.backgroundColor
                     ? "style.backgroundColor"
                     : data.backgroundColor
-                    ? "backgroundColor"
-                    : data.fillColor
-                    ? "fillColor"
-                    : "placeholder/getPlaceholderColor",
+                      ? "backgroundColor"
+                      : data.fillColor
+                        ? "fillColor"
+                        : "placeholder/getPlaceholderColor",
                   color: parsedColor,
-                }
+                },
               );
               paints.push(
                 figma.util.solidPaint(
@@ -4628,8 +4660,8 @@ export class NodeBuilder {
                   {
                     opacity: parsedColor.a !== undefined ? parsedColor.a : 1,
                     visible: true,
-                  }
-                )
+                  },
+                ),
               );
             } else {
               // PIXEL-PERFECT FIX: Add visible placeholder when fill is expected but missing
@@ -4673,7 +4705,7 @@ export class NodeBuilder {
                       hasInheritanceFlags: !!data.inheritanceFlags,
                       originalBackground:
                         data.colorInheritance?.originalBackground,
-                    }
+                    },
                   );
                   paints.push(
                     figma.util.solidPaint(
@@ -4681,13 +4713,13 @@ export class NodeBuilder {
                       {
                         opacity: 0.3,
                         visible: true,
-                      }
-                    )
+                      },
+                    ),
                   );
                 } else {
                   // Production mode: log once but don't affect visuals
                   console.log(
-                    `  ⚪ [FILL] No fill found for ${data.name} - element stays transparent`
+                    `  ⚪ [FILL] No fill found for ${data.name} - element stays transparent`,
                   );
                 }
               } else {
@@ -4699,7 +4731,7 @@ export class NodeBuilder {
                     isLikelyContainer,
                     hasExplicitTransparent,
                     htmlTag: data.htmlTag,
-                  }
+                  },
                 );
               }
             }
@@ -4747,7 +4779,7 @@ export class NodeBuilder {
                   blendMode: data.backgroundBlendMode,
                 }));
                 console.log(
-                  `  🎨 Applied backgroundBlendMode ${data.backgroundBlendMode} to ${validPaints.length} fills`
+                  `  🎨 Applied backgroundBlendMode ${data.backgroundBlendMode} to ${validPaints.length} fills`,
                 );
               }
 
@@ -4761,7 +4793,7 @@ export class NodeBuilder {
                   color:
                     p.type === "SOLID" ? (p as SolidPaint).color : undefined,
                   opacity: p.opacity,
-                }))
+                })),
               );
 
               // CRITICAL DEBUG: Verify fills were actually set
@@ -4772,7 +4804,7 @@ export class NodeBuilder {
                   (Array.isArray(verifyFills) && verifyFills.length === 0))
               ) {
                 console.error(
-                  `  ❌ [CRITICAL] Fills were set but node.fills is now empty for ${data.name}! Attempting recovery...`
+                  `  ❌ [CRITICAL] Fills were set but node.fills is now empty for ${data.name}! Attempting recovery...`,
                 );
                 // Recovery: Try setting again
                 try {
@@ -4780,11 +4812,11 @@ export class NodeBuilder {
                   const recheck = (node as SceneNodeWithGeometry).fills;
                   if (Array.isArray(recheck) && recheck.length > 0) {
                     console.log(
-                      `  ✅ [RECOVERY] Successfully recovered fills for ${data.name}`
+                      `  ✅ [RECOVERY] Successfully recovered fills for ${data.name}`,
                     );
                   } else {
                     console.error(
-                      `  ❌ [RECOVERY FAILED] Could not set fills for ${data.name}`
+                      `  ❌ [RECOVERY FAILED] Could not set fills for ${data.name}`,
                     );
                   }
                 } catch (recoveryErr) {
@@ -4793,7 +4825,7 @@ export class NodeBuilder {
               }
             } else {
               console.warn(
-                `  ⚠️ [FILL] All ${orderedPaints.length} paints were invalid for ${data.name}, no fills applied`
+                `  ⚠️ [FILL] All ${orderedPaints.length} paints were invalid for ${data.name}, no fills applied`,
               );
             }
           } else {
@@ -4812,11 +4844,11 @@ export class NodeBuilder {
                   hasImageHash: !!data.imageHash,
                   backgroundColor:
                     data.style?.backgroundColor || data.backgroundColor,
-                }
+                },
               );
             } else {
               console.log(
-                `  ⚪ No fills/backgrounds produced for ${data.name}, setting transparent`
+                `  ⚪ No fills/backgrounds produced for ${data.name}, setting transparent`,
               );
             }
             // Don't wipe an already-resolved image fill if the schema didn't emit paints here.
@@ -4833,7 +4865,7 @@ export class NodeBuilder {
                   data.fills.some((f: any) => f?.type === "IMAGE")))
             ) {
               console.warn(
-                `  ⚠️ [FILL] Preserving existing IMAGE fill(s) for ${data.name} despite empty paint result`
+                `  ⚠️ [FILL] Preserving existing IMAGE fill(s) for ${data.name} despite empty paint result`,
               );
             } else {
               (node as SceneNodeWithGeometry).fills = [];
@@ -4848,7 +4880,7 @@ export class NodeBuilder {
       if (data.mixBlendMode !== "NORMAL") {
         (node as any).blendMode = data.mixBlendMode;
         console.log(
-          `  🎨 Applied mixBlendMode ${data.mixBlendMode} to ${data.name}`
+          `  🎨 Applied mixBlendMode ${data.mixBlendMode} to ${data.name}`,
         );
       }
     }
@@ -4856,7 +4888,7 @@ export class NodeBuilder {
     // ENHANCED: Handle clip-path (basic support/logging)
     if (data.clipPath) {
       console.log(
-        `  ✂️ [CLIP-PATH] Node ${data.name} has clip-path: ${data.clipPath.type}('${data.clipPath.value}') - logging strictly`
+        `  ✂️ [CLIP-PATH] Node ${data.name} has clip-path: ${data.clipPath.type}('${data.clipPath.value}') - logging strictly`,
       );
       this.safeSetPluginData(node, "clipPath", JSON.stringify(data.clipPath));
     }
@@ -4880,7 +4912,7 @@ export class NodeBuilder {
           {
             opacity:
               placeholderColor.a !== undefined ? placeholderColor.a : 0.6,
-          }
+          },
         ),
       ];
     } else if (
@@ -4893,14 +4925,14 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "placeholderColor",
-        JSON.stringify(placeholderColor)
+        JSON.stringify(placeholderColor),
       );
     }
 
     if (data.strokes && "strokes" in node) {
       console.log(`  ✏️ Applying strokes to ${data.name}`);
       (node as SceneNodeWithGeometry).strokes = await this.convertStrokesAsync(
-        data.strokes
+        data.strokes,
       );
     }
 
@@ -4952,7 +4984,7 @@ export class NodeBuilder {
     if (data.cornerRadius && "cornerRadius" in node) {
       console.log(
         `  🔲 Applying corner radius to ${data.name}:`,
-        data.cornerRadius
+        data.cornerRadius,
       );
       this.applyCornerRadius(node as any, data.cornerRadius);
     }
@@ -4961,12 +4993,15 @@ export class NodeBuilder {
       "effects" in node ? [...((node as BlendMixin).effects || [])] : [];
     if (data.effects?.length && "effects" in node) {
       console.log(
-        `  ✨ Applying ${data.effects.length} effects to ${data.name}`
+        `  ✨ Applying ${data.effects.length} effects to ${data.name}`,
       );
       const convertedEffects = this.convertEffects(data.effects);
       console.log(
         `  ✨ Converted effects:`,
-        convertedEffects.map((e: any) => ({ type: e.type, visible: e.visible }))
+        convertedEffects.map((e: any) => ({
+          type: e.type,
+          visible: e.visible,
+        })),
       );
       existingEffects.push(...convertedEffects);
     }
@@ -4974,7 +5009,7 @@ export class NodeBuilder {
     if (existingEffects.length && "effects" in node) {
       (node as BlendMixin).effects = existingEffects;
       console.log(
-        `  ✅ Applied ${existingEffects.length} total effects to ${data.name}`
+        `  ✅ Applied ${existingEffects.length} total effects to ${data.name}`,
       );
     }
 
@@ -5038,7 +5073,7 @@ export class NodeBuilder {
             current: `${node.width.toFixed(1)}x${node.height.toFixed(1)}`,
             visual: `${visualW}x${visualH}`,
             transform: data.layoutContext?.transform,
-          }
+          },
         );
         node.resize(visualW, visualH);
 
@@ -5046,7 +5081,7 @@ export class NodeBuilder {
         this.safeSetPluginData(
           node,
           "boxSizingCorrection",
-          "transformed source"
+          "transformed source",
         );
       }
     }
@@ -5068,7 +5103,7 @@ export class NodeBuilder {
           {
             current: `${node.width.toFixed(1)}x${node.height.toFixed(1)}`,
             target: `${visualW}x${visualH}`,
-          }
+          },
         );
         node.resize(visualW, visualH);
       }
@@ -5113,7 +5148,7 @@ export class NodeBuilder {
         ...grid,
         conversionApplied: true,
         timestamp: Date.now(),
-      })
+      }),
     );
 
     this.safeSetPluginData(
@@ -5129,7 +5164,7 @@ export class NodeBuilder {
         alignItems: grid.alignItems,
         justifyContent: grid.justifyContent,
         alignContent: grid.alignContent,
-      })
+      }),
     );
 
     if (data.gridChild) {
@@ -5147,7 +5182,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "gridAnnotations",
-        JSON.stringify(grid.figmaAnnotations)
+        JSON.stringify(grid.figmaAnnotations),
       );
     }
   }
@@ -5155,7 +5190,7 @@ export class NodeBuilder {
   private applyGridLayoutConversion(
     node: FrameNode,
     gridData: any,
-    elementData: any
+    elementData: any,
   ) {
     switch (gridData.conversionStrategy) {
       case "nested-auto-layout":
@@ -5206,11 +5241,11 @@ export class NodeBuilder {
         columnSizes: gridData.computedColumnSizes,
         rowGap: gridData.rowGap,
         columnGap: gridData.columnGap,
-      })
+      }),
     );
 
     console.log(
-      `✅ Applied nested Auto Layout to grid: ${gridData.computedColumnSizes.length}x${gridData.computedRowSizes.length}`
+      `✅ Applied nested Auto Layout to grid: ${gridData.computedColumnSizes.length}x${gridData.computedRowSizes.length}`,
     );
   }
 
@@ -5228,7 +5263,7 @@ export class NodeBuilder {
         computedColumnSizes: gridData.computedColumnSizes,
         computedRowSizes: gridData.computedRowSizes,
         positioning: "manual",
-      })
+      }),
     );
 
     console.log(`⚠️ Applied absolute positioning to complex grid`);
@@ -5244,7 +5279,7 @@ export class NodeBuilder {
         strategy: "hybrid",
         complexItems: gridData.templateAreas || [],
         fallbackToAbsolute: true,
-      })
+      }),
     );
 
     console.log(`🔀 Applied hybrid layout conversion to grid`);
@@ -5262,12 +5297,12 @@ export class NodeBuilder {
     node.counterAxisAlignItems = "MIN";
 
     console.log(
-      `📐 Applied basic Auto Layout to grid (${gridData.computedColumnSizes.length}x${gridData.computedRowSizes.length})`
+      `📐 Applied basic Auto Layout to grid (${gridData.computedColumnSizes.length}x${gridData.computedRowSizes.length})`,
     );
   }
 
   private mapGridAlignment(
-    value?: string
+    value?: string,
   ): "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" {
     switch (value) {
       case "start":
@@ -5322,8 +5357,8 @@ export class NodeBuilder {
       data._cumulativeOpacity !== undefined
         ? data._cumulativeOpacity
         : data.opacity !== undefined
-        ? data.opacity
-        : 1;
+          ? data.opacity
+          : 1;
 
     if (opacity !== 1 && "opacity" in node) {
       (node as any).opacity = Math.max(0, Math.min(1, opacity));
@@ -5402,7 +5437,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "cssBackdropFilters",
-        JSON.stringify(data.backdropFilters)
+        JSON.stringify(data.backdropFilters),
       );
     }
   }
@@ -5410,7 +5445,7 @@ export class NodeBuilder {
   private applyMetadata(
     node: SceneNode,
     data: any,
-    meta: { reuseComponent: boolean }
+    meta: { reuseComponent: boolean },
   ) {
     this.applyConstraints(node, data);
 
@@ -5423,12 +5458,12 @@ export class NodeBuilder {
       } catch (error) {
         console.warn(
           `Cannot set layoutGrow on node "${node.name}" in metadata:`,
-          error
+          error,
         );
         this.safeSetPluginData(
           node,
           "cssLayoutGrow",
-          data.autoLayout.layoutGrow.toString()
+          data.autoLayout.layoutGrow.toString(),
         );
       }
     }
@@ -5438,12 +5473,12 @@ export class NodeBuilder {
       } catch (error) {
         console.warn(
           `Cannot set layoutAlign on node "${node.name}" in metadata:`,
-          error
+          error,
         );
         this.safeSetPluginData(
           node,
           "cssLayoutAlign",
-          data.autoLayout.layoutAlign
+          data.autoLayout.layoutAlign,
         );
       }
     }
@@ -5455,7 +5490,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "cssClasses",
-        JSON.stringify(data.cssClasses)
+        JSON.stringify(data.cssClasses),
       );
     }
 
@@ -5463,7 +5498,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "dataAttributes",
-        JSON.stringify(data.dataAttributes)
+        JSON.stringify(data.dataAttributes),
       );
     }
 
@@ -5471,7 +5506,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "cssCustomProperties",
-        JSON.stringify(data.cssCustomProperties)
+        JSON.stringify(data.cssCustomProperties),
       );
     }
 
@@ -5479,7 +5514,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "cssClipPath",
-        JSON.stringify(data.clipPath)
+        JSON.stringify(data.clipPath),
       );
     }
 
@@ -5499,7 +5534,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "absoluteLayout",
-        JSON.stringify(data.absoluteLayout)
+        JSON.stringify(data.absoluteLayout),
       );
     }
 
@@ -5507,7 +5542,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "scrollData",
-        JSON.stringify(data.scrollData)
+        JSON.stringify(data.scrollData),
       );
     }
 
@@ -5523,7 +5558,7 @@ export class NodeBuilder {
       this.safeSetPluginData(
         node,
         "computedStyles",
-        JSON.stringify(data.computedStyles)
+        JSON.stringify(data.computedStyles),
       );
     }
   }
@@ -5540,7 +5575,7 @@ export class NodeBuilder {
 
   private async convertBackgroundLayersAsync(
     backgrounds: any[],
-    nodeLayout?: { width: number; height: number }
+    nodeLayout?: { width: number; height: number },
   ): Promise<Paint[]> {
     const paints: Paint[] = [];
 
@@ -5548,7 +5583,7 @@ export class NodeBuilder {
     console.log(
       `🔍 convertBackgroundLayersAsync called with ${
         backgrounds?.length || 0
-      } backgrounds`
+      } backgrounds`,
     );
     backgrounds?.forEach((layer, i) => {
       const fill = layer?.fill || layer;
@@ -5569,7 +5604,7 @@ export class NodeBuilder {
       if (fill.type === "SOLID" && fill.color) {
         const { r, g, b } = fill.color;
         const opacity =
-          fill.opacity !== undefined ? fill.opacity : fill.color.a ?? 1;
+          fill.opacity !== undefined ? fill.opacity : (fill.color.a ?? 1);
         if (opacity <= 0) {
           continue;
         }
@@ -5585,8 +5620,8 @@ export class NodeBuilder {
             {
               opacity,
               visible: fill.visible !== false,
-            }
-          )
+            },
+          ),
         );
         continue;
       }
@@ -5596,7 +5631,7 @@ export class NodeBuilder {
         fill.gradientStops
       ) {
         console.log(
-          `  🌈 Converting ${fill.type} gradient with ${fill.gradientStops.length} stops`
+          `  🌈 Converting ${fill.type} gradient with ${fill.gradientStops.length} stops`,
         );
         paints.push({
           type: fill.type,
@@ -5618,7 +5653,7 @@ export class NodeBuilder {
 
       if (fill.type === "IMAGE") {
         paints.push(
-          await this.resolveImagePaintWithBackground(fill, layer, nodeLayout)
+          await this.resolveImagePaintWithBackground(fill, layer, nodeLayout),
         );
         continue;
       }
@@ -5638,7 +5673,7 @@ export class NodeBuilder {
 
   private async convertFillsAsync(
     fills: any[],
-    context?: { tokenId?: string; property?: string }
+    context?: { tokenId?: string; property?: string },
   ): Promise<Paint[]> {
     const paints: Paint[] = [];
 
@@ -5649,7 +5684,7 @@ export class NodeBuilder {
       if (this.options?.enableDebugMode) {
         console.log(
           `🎨 [FILL DEBUG] Processing fill:`,
-          JSON.stringify(fill, null, 2)
+          JSON.stringify(fill, null, 2),
         );
       }
 
@@ -5668,7 +5703,7 @@ export class NodeBuilder {
         const g = sanitizeColorComponent(fill.color.g);
         const b = sanitizeColorComponent(fill.color.b);
         const opacity = sanitizeOpacity(
-          fill.opacity !== undefined ? fill.opacity : fill.color.a ?? 1
+          fill.opacity !== undefined ? fill.opacity : (fill.color.a ?? 1),
         );
 
         // CRITICAL: Check for NaN/invalid color components to prevent silent failures
@@ -5700,7 +5735,7 @@ export class NodeBuilder {
                 color: { r, g, b },
                 fillOpacity: fill.opacity,
                 colorA: fill.color.a,
-              }
+              },
             );
           }
           continue;
@@ -5764,7 +5799,7 @@ export class NodeBuilder {
           paints.push(imagePaint);
         } else {
           console.error(
-            `❌ IMAGE fill failed to resolve - got ${imagePaint.type} fallback instead of IMAGE paint for hash ${fill.imageHash}`
+            `❌ IMAGE fill failed to resolve - got ${imagePaint.type} fallback instead of IMAGE paint for hash ${fill.imageHash}`,
           );
           // Still add the fallback so the node has some fill, but log the error
           paints.push(imagePaint);
@@ -5778,7 +5813,7 @@ export class NodeBuilder {
               availableKeys: Object.keys(this.assets?.images || {}).length,
               paintType: imagePaint.type,
             },
-            { result: "fallback applied" }
+            { result: "fallback applied" },
           );
         }
         continue;
@@ -5790,7 +5825,7 @@ export class NodeBuilder {
           paints.push(svgPaint);
         } else {
           console.error(
-            `❌ SVG fill failed to resolve for svgRef ${fill.svgRef}`
+            `❌ SVG fill failed to resolve for svgRef ${fill.svgRef}`,
           );
         }
         continue;
@@ -5803,11 +5838,13 @@ export class NodeBuilder {
     if (fills.length > 0 && paints.length === 0) {
       const validFills = fills.filter(
         (f) =>
-          f && f.visible !== false && (f.opacity === undefined || f.opacity > 0)
+          f &&
+          f.visible !== false &&
+          (f.opacity === undefined || f.opacity > 0),
       );
       if (validFills.length > 0) {
         console.warn(
-          `⚠️ [FIGMA IMPORT] ${fills.length} fills processed but 0 resulted in paints.`
+          `⚠️ [FIGMA IMPORT] ${fills.length} fills processed but 0 resulted in paints.`,
         );
         diagnostics.logIssue(
           context?.tokenId || "unknown",
@@ -5815,7 +5852,7 @@ export class NodeBuilder {
           "FILLS",
           `${fills.length} fills processed but 0 resulted in paints`,
           { validFillsCount: validFills.length },
-          { paintsCount: 0 }
+          { paintsCount: 0 },
         );
       }
     }
@@ -5829,7 +5866,7 @@ export class NodeBuilder {
   private async resolveImagePaintWithBackground(
     fill: any,
     layer: any,
-    nodeLayout?: { width: number; height: number }
+    nodeLayout?: { width: number; height: number },
   ): Promise<Paint> {
     const hash = fill.imageHash;
 
@@ -5847,7 +5884,7 @@ export class NodeBuilder {
     if (!hash) {
       console.error(
         `❌ resolveImagePaintWithBackground: No imageHash in fill:`,
-        fill
+        fill,
       );
       return figma.util.solidPaint({ r: 0.9, g: 0.9, b: 0.9 });
     }
@@ -5877,7 +5914,7 @@ export class NodeBuilder {
                 const bytes = await this.fetchImage(assetUrl);
                 const transcoded = await this.transcodeIfUnsupportedRaster(
                   bytes,
-                  "image/png"
+                  "image/png",
                 );
                 image = figma.createImage(transcoded);
               } catch (e) {
@@ -5888,7 +5925,7 @@ export class NodeBuilder {
         } catch (e) {
           console.warn(
             `  ⚠️ Failed to create image from asset ${hash} for background`,
-            e
+            e,
           );
         }
       }
@@ -5904,8 +5941,8 @@ export class NodeBuilder {
           console.log(
             `  🔍 [BG] Hash is URL, fetching directly: ${hash.substring(
               0,
-              50
-            )}...`
+              50,
+            )}...`,
           );
           try {
             let bytes: Uint8Array;
@@ -5925,7 +5962,7 @@ export class NodeBuilder {
             }
             const transcoded = await this.transcodeIfUnsupportedRaster(
               bytes,
-              "image/png"
+              "image/png",
             );
             image = figma.createImage(transcoded);
           } catch (e) {
@@ -5940,7 +5977,7 @@ export class NodeBuilder {
             const bytes = await this.fetchImage(fill.url);
             const transcoded = await this.transcodeIfUnsupportedRaster(
               bytes,
-              "image/png"
+              "image/png",
             );
             image = figma.createImage(transcoded);
           } catch (e) {
@@ -5953,7 +5990,7 @@ export class NodeBuilder {
         this.imagePaintCache.set(hash, image.hash);
         imageHash = image.hash;
         console.log(
-          `✅ [BG] Successfully resolved background image: ${imageHash}`
+          `✅ [BG] Successfully resolved background image: ${imageHash}`,
         );
       } else {
         console.error(`❌ [BG] Failed to resolve background image for ${hash}`);
@@ -5971,7 +6008,7 @@ export class NodeBuilder {
       layer.position,
       layer.size,
       nodeLayout,
-      this.assets.images[hash]
+      this.assets.images[hash],
     );
 
     const paint: ImagePaint = {
@@ -5997,7 +6034,7 @@ export class NodeBuilder {
     if (!hash) {
       console.error(
         "❌ resolveImagePaint: No imageHash provided in fill:",
-        fill
+        fill,
       );
       return {
         type: "SOLID",
@@ -6060,7 +6097,7 @@ export class NodeBuilder {
     // 1. Try to find in assets
     if (this.assets?.images?.[hash]) {
       console.log(
-        `  📁 Found asset for hash ${hash}, attempting to create image`
+        `  📁 Found asset for hash ${hash}, attempting to create image`,
       );
       try {
         const asset = this.assets.images[hash];
@@ -6072,15 +6109,15 @@ export class NodeBuilder {
         console.log(
           `  📊 Asset details: hasBase64=${hasBase64}, url=${
             assetUrl ? assetUrl.substring(0, 60) + "..." : "none"
-          }`
+          }`,
         );
 
         if (!hasBase64 && assetUrl) {
           console.warn(
             `  ⚠️ Asset exists but has no base64 data - will try URL fallback: ${assetUrl.substring(
               0,
-              80
-            )}...`
+              80,
+            )}...`,
           );
         }
 
@@ -6089,15 +6126,15 @@ export class NodeBuilder {
           console.log(`  ✅ Successfully created image from asset`);
         } else {
           console.warn(
-            `  ⚠️ Asset exists but createFigmaImageFromAsset returned null`
+            `  ⚠️ Asset exists but createFigmaImageFromAsset returned null`,
           );
           // Asset exists but image creation failed - try URL fallback immediately
           if (assetUrl && assetUrl !== hash && !assetUrl.startsWith("data:")) {
             console.log(
               `  🔄 [IMMEDIATE FALLBACK] Trying asset URL: ${assetUrl.substring(
                 0,
-                80
-              )}...`
+                80,
+              )}...`,
             );
             try {
               // Use fetchImage which automatically routes external URLs to proxy
@@ -6105,11 +6142,11 @@ export class NodeBuilder {
               const contentType = "image/png";
               const transcodedBytes = await this.transcodeIfUnsupportedRaster(
                 bytes,
-                contentType
+                contentType,
               );
               image = figma.createImage(transcodedBytes);
               console.log(
-                `  ✅ Successfully fetched and created image from asset URL`
+                `  ✅ Successfully fetched and created image from asset URL`,
               );
             } catch (urlError) {
               const errorMsg =
@@ -6119,7 +6156,7 @@ export class NodeBuilder {
             }
           } else {
             console.warn(
-              `  ⚠️ Asset has no valid URL for fallback (url=${assetUrl})`
+              `  ⚠️ Asset has no valid URL for fallback (url=${assetUrl})`,
             );
             failureReason = "Asset has no valid URL";
           }
@@ -6128,13 +6165,13 @@ export class NodeBuilder {
         const errorMsg = e instanceof Error ? e.message : String(e);
         console.warn(
           `  ⚠️ Failed to create image from asset ${hash}:`,
-          errorMsg
+          errorMsg,
         );
         failureReason = `Asset creation error: ${errorMsg}`;
       }
     } else {
       console.warn(
-        `  ⚠️ No asset found for hash ${hash}, trying URL extraction`
+        `  ⚠️ No asset found for hash ${hash}, trying URL extraction`,
       );
 
       // CRITICAL FIX: If hash not found, try to extract URL from fill or hash itself
@@ -6147,7 +6184,7 @@ export class NodeBuilder {
           const bytes = await this.fetchImage(hash);
           const transcodedBytes = await this.transcodeIfUnsupportedRaster(
             bytes,
-            "image/png"
+            "image/png",
           );
           image = figma.createImage(transcodedBytes);
           console.log(`  ✅ Successfully fetched image from hash URL`);
@@ -6164,13 +6201,13 @@ export class NodeBuilder {
         (fillUrl.startsWith("http") || fillUrl.startsWith("data:"))
       ) {
         console.log(
-          `  🔍 Fill has URL, attempting fetch: ${fillUrl.substring(0, 60)}...`
+          `  🔍 Fill has URL, attempting fetch: ${fillUrl.substring(0, 60)}...`,
         );
         try {
           const bytes = await this.fetchImage(fillUrl);
           const transcodedBytes = await this.transcodeIfUnsupportedRaster(
             bytes,
-            "image/png"
+            "image/png",
           );
           image = figma.createImage(transcodedBytes);
           console.log(`  ✅ Successfully fetched image from fill URL`);
@@ -6191,7 +6228,7 @@ export class NodeBuilder {
 
         if (hashPattern !== assetPattern) {
           console.warn(
-            `  ⚠️ [HASH MISMATCH] Hash format mismatch: requested=${hashPattern}, assets=${assetPattern}`
+            `  ⚠️ [HASH MISMATCH] Hash format mismatch: requested=${hashPattern}, assets=${assetPattern}`,
           );
         }
       }
@@ -6225,7 +6262,7 @@ export class NodeBuilder {
             // Check if this key was preloaded
             if (this.imagePaintCache.has(key)) {
               console.log(
-                `  ✅ Found preloaded image for case-insensitive match`
+                `  ✅ Found preloaded image for case-insensitive match`,
               );
               const cachedFigmaHash = this.imagePaintCache.get(key)!;
               this.imagePaintCache.set(hash, cachedFigmaHash);
@@ -6234,7 +6271,7 @@ export class NodeBuilder {
             try {
               image = await this.createFigmaImageFromAsset(value, key);
               console.log(
-                `  ✅ Successfully created image from case-insensitive match`
+                `  ✅ Successfully created image from case-insensitive match`,
               );
               break;
             } catch (e) {
@@ -6249,7 +6286,7 @@ export class NodeBuilder {
     if (!image && fill.url && fill.url !== hash) {
       try {
         console.log(
-          `🌐 [FIGMA] Attempting to fetch image from fill.url: ${fill.url}`
+          `🌐 [FIGMA] Attempting to fetch image from fill.url: ${fill.url}`,
         );
 
         // Use fetchImage which automatically routes external URLs to proxy
@@ -6257,7 +6294,7 @@ export class NodeBuilder {
         const contentType = "image/png"; // Proxy returns base64, assume PNG for transcoding
         const transcodedBytes = await this.transcodeIfUnsupportedRaster(
           bytes,
-          contentType
+          contentType,
         );
         image = figma.createImage(transcodedBytes);
         console.log(`  ✅ Successfully created image from fill.url`);
@@ -6280,7 +6317,7 @@ export class NodeBuilder {
           const contentType = "image/png";
           const transcodedBytes = await this.transcodeIfUnsupportedRaster(
             bytes,
-            contentType
+            contentType,
           );
           image = figma.createImage(transcodedBytes);
           console.log(`  ✅ Successfully fetched image from asset URL`);
@@ -6296,8 +6333,8 @@ export class NodeBuilder {
         console.log(
           `🌐 [FIGMA] Attempting to fetch image from hash URL: ${hash.substring(
             0,
-            80
-          )}...`
+            80,
+          )}...`,
         );
 
         let bytes: Uint8Array;
@@ -6325,7 +6362,7 @@ export class NodeBuilder {
 
         const transcodedBytes = await this.transcodeIfUnsupportedRaster(
           bytes,
-          contentType
+          contentType,
         );
         image = figma.createImage(transcodedBytes);
         console.log(`  ✅ Successfully fetched image from hash URL`);
@@ -6342,7 +6379,7 @@ export class NodeBuilder {
         const allKeys = Object.keys(this.assets.images);
         const hashSuffix = hash.slice(-8);
         const candidates = allKeys.filter(
-          (key) => key.endsWith(hashSuffix) || hash.endsWith(key.slice(-8))
+          (key) => key.endsWith(hashSuffix) || hash.endsWith(key.slice(-8)),
         );
 
         // Deterministic guard: only accept fuzzy matching when there is exactly one candidate.
@@ -6361,7 +6398,7 @@ export class NodeBuilder {
             image = await this.createFigmaImageFromAsset(asset, key);
             if (image) {
               console.log(
-                `  ✅ Found image via fuzzy match (unique candidate)`
+                `  ✅ Found image via fuzzy match (unique candidate)`,
               );
               this.imagePaintCache.set(hash, image.hash);
               this.imagePaintCache.set(key, image.hash);
@@ -6371,20 +6408,20 @@ export class NodeBuilder {
           }
         } else if (candidates.length > 1) {
           console.warn(
-            `  ⚠️ Ambiguous fuzzy image hash match for ${hash} (${candidates.length} candidates) - skipping fuzzy mapping to avoid wrong images`
+            `  ⚠️ Ambiguous fuzzy image hash match for ${hash} (${candidates.length} candidates) - skipping fuzzy mapping to avoid wrong images`,
           );
         }
       }
 
       if (!image) {
         console.error(
-          `❌ resolveImagePaint: Image hash "${hash}" not found in assets and fetch failed`
+          `❌ resolveImagePaint: Image hash "${hash}" not found in assets and fetch failed`,
         );
         console.error(
           `  📊 Available asset keys (${
             Object.keys(this.assets?.images || {}).length
           } total):`,
-          Object.keys(this.assets?.images || {}).slice(0, 10)
+          Object.keys(this.assets?.images || {}).slice(0, 10),
         );
         diagnostics.logIssue(
           "unknown",
@@ -6396,7 +6433,7 @@ export class NodeBuilder {
             url: hash.startsWith("http") ? hash : undefined,
             availableKeys: Object.keys(this.assets?.images || {}).length,
           },
-          { result: "fallback to solid" }
+          { result: "fallback to solid" },
         );
         // Return a more visible placeholder so missing images are obvious
         return {
@@ -6454,13 +6491,13 @@ export class NodeBuilder {
     const svgAsset = this.assets?.svgs?.[svgRef];
     if (!svgAsset) {
       console.error(
-        `❌ resolveSVGPaint: SVG asset not found for svgRef: ${svgRef}`
+        `❌ resolveSVGPaint: SVG asset not found for svgRef: ${svgRef}`,
       );
       console.error(
         `  📊 Available SVG keys (${
           Object.keys(this.assets?.svgs || {}).length
         } total):`,
-        Object.keys(this.assets?.svgs || {}).slice(0, 10)
+        Object.keys(this.assets?.svgs || {}).slice(0, 10),
       );
       return null;
     }
@@ -6471,7 +6508,7 @@ export class NodeBuilder {
 
       if (!vectorNode) {
         console.error(
-          `❌ resolveSVGPaint: Failed to create vector node from SVG: ${svgRef}`
+          `❌ resolveSVGPaint: Failed to create vector node from SVG: ${svgRef}`,
         );
         return null;
       }
@@ -6501,14 +6538,14 @@ export class NodeBuilder {
     } catch (error) {
       console.error(
         `❌ resolveSVGPaint: Error creating vector from SVG:`,
-        error
+        error,
       );
       return null;
     }
   }
 
   private mapObjectFitToScaleMode(
-    objectFit: string
+    objectFit: string,
   ): "FILL" | "FIT" | "CROP" | "TILE" {
     // IMPORTANT: cover → FILL (not CROP) because CROP requires explicit imageTransform
     // FILL with proper aspect ratio preservation is the correct Figma equivalent of CSS cover
@@ -6717,7 +6754,7 @@ export class NodeBuilder {
             reason,
             childCount: node.children.length,
             imageHash: imageHash.substring(0, 16) + "...",
-          }
+          },
         );
       } else if ("fills" in node) {
         // For leaf nodes (no children), directly replace fills
@@ -6728,11 +6765,11 @@ export class NodeBuilder {
           {
             reason,
             imageHash: imageHash.substring(0, 16) + "...",
-          }
+          },
         );
       } else {
         console.warn(
-          `[PHASE 5] Node type ${node.type} does not support fills - cannot apply rasterization`
+          `[PHASE 5] Node type ${node.type} does not support fills - cannot apply rasterization`,
         );
       }
     } catch (err) {
@@ -6742,7 +6779,7 @@ export class NodeBuilder {
 
   private getFontMetricsRatio(
     actualFont: string,
-    originalFont: string
+    originalFont: string,
   ): number {
     const fontMetricsMap = new Map<string, number>([
       ["Inter:Arial", 0.98],
@@ -6768,7 +6805,7 @@ export class NodeBuilder {
   }
 
   private parseObjectPositionToTransform(
-    objectPosition: string
+    objectPosition: string,
   ): [[number, number, number], [number, number, number]] {
     const parts = objectPosition.trim().split(/\s+/);
     let xOffset = 0;
@@ -6808,7 +6845,7 @@ export class NodeBuilder {
       return {
         type: "SOLID",
         color: { r, g, b },
-        opacity: stroke.opacity !== undefined ? stroke.opacity : color.a ?? 1,
+        opacity: stroke.opacity !== undefined ? stroke.opacity : (color.a ?? 1),
         visible: stroke.visible !== false,
       };
     }) as SolidPaint[];
@@ -6861,7 +6898,7 @@ export class NodeBuilder {
   }
 
   private getScaleModeFromRepeat(
-    repeat?: string
+    repeat?: string,
   ): "FILL" | "FIT" | "CROP" | "TILE" {
     if (!repeat) return "FILL";
 
@@ -6882,7 +6919,7 @@ export class NodeBuilder {
     position?: { x: string; y: string },
     size?: { width: string; height: string },
     nodeLayout?: { width: number; height: number },
-    imageAsset?: { width: number; height: number }
+    imageAsset?: { width: number; height: number },
   ): [[number, number, number], [number, number, number]] | undefined {
     if (!position && !size) return undefined;
 
@@ -6897,14 +6934,14 @@ export class NodeBuilder {
       if (sizeWidth === "cover") {
         const scaleRatio = Math.max(
           nodeLayout.width / imageAsset.width,
-          nodeLayout.height / imageAsset.height
+          nodeLayout.height / imageAsset.height,
         );
         scaleX = scaleRatio;
         scaleY = scaleRatio;
       } else if (sizeWidth === "contain") {
         const scaleRatio = Math.min(
           nodeLayout.width / imageAsset.width,
-          nodeLayout.height / imageAsset.height
+          nodeLayout.height / imageAsset.height,
         );
         scaleX = scaleRatio;
         scaleY = scaleRatio;
@@ -6912,12 +6949,12 @@ export class NodeBuilder {
         scaleX = this.parseSizeValue(
           sizeWidth,
           nodeLayout.width,
-          imageAsset.width
+          imageAsset.width,
         );
         scaleY = this.parseSizeValue(
           sizeHeight || sizeWidth,
           nodeLayout.height,
-          imageAsset.height
+          imageAsset.height,
         );
       }
     }
@@ -6931,12 +6968,12 @@ export class NodeBuilder {
       translateX = this.parsePositionValue(
         posX,
         nodeLayout.width,
-        scaledImageWidth
+        scaledImageWidth,
       );
       translateY = this.parsePositionValue(
         posY,
         nodeLayout.height,
-        scaledImageHeight
+        scaledImageHeight,
       );
 
       if (imageAsset.width > 0) {
@@ -6956,7 +6993,7 @@ export class NodeBuilder {
   private parseSizeValue(
     value: string,
     containerSize: number,
-    imageSize: number
+    imageSize: number,
   ): number {
     const trimmed = value.trim().toLowerCase();
 
@@ -6985,7 +7022,7 @@ export class NodeBuilder {
   private parsePositionValue(
     value: string,
     containerSize: number,
-    imageSize: number
+    imageSize: number,
   ): number {
     const trimmed = value.trim().toLowerCase();
 
@@ -7062,7 +7099,7 @@ export class NodeBuilder {
               // Convert base64 to Uint8Array
               const bytes = this.base64ToUint8Array(base64);
               console.log(
-                `  ✅ [PROXY] Successfully fetched image via ${base} (${bytes.length} bytes)`
+                `  ✅ [PROXY] Successfully fetched image via ${base} (${bytes.length} bytes)`,
               );
               this.imageFetchCache.set(url, bytes);
               return bytes;
@@ -7072,7 +7109,7 @@ export class NodeBuilder {
           } else {
             console.warn(
               `  ⚠️ [PROXY] Server returned error:`,
-              data.error || "Unknown error"
+              data.error || "Unknown error",
             );
           }
         } else {
@@ -7089,15 +7126,15 @@ export class NodeBuilder {
 
     // PIXEL-PERFECT FIX: Add diagnostic message when all proxies fail
     console.error(
-      `❌ [PROXY FAILED] All handoff server proxies failed for image fetch.`
+      `❌ [PROXY FAILED] All handoff server proxies failed for image fetch.`,
     );
     console.error(`   Attempted servers:`, handoffBases);
     console.error(`   DIAGNOSIS:`);
     console.error(
-      `     1. Ensure handoff server is running: node handoff-server.cjs`
+      `     1. Ensure handoff server is running: node handoff-server.cjs`,
     );
     console.error(
-      `     2. Check server is accessible: curl http://localhost:4411/api/health`
+      `     2. Check server is accessible: curl http://localhost:4411/api/health`,
     );
     console.error(`     3. Check firewall/network settings`);
     console.error(`     4. Check server logs for proxy errors`);
@@ -7124,8 +7161,8 @@ export class NodeBuilder {
       console.log(
         `  🔄 [PROXY] External URL detected, using proxy: ${url.substring(
           0,
-          60
-        )}...`
+          60,
+        )}...`,
       );
       return this.fetchImageViaProxy(url);
     }
@@ -7165,9 +7202,11 @@ export class NodeBuilder {
       console.warn(
         `  ⚠️ Direct fetch failed for ${url.substring(
           0,
-          60
+          60,
         )}..., trying proxy:`,
-        directError instanceof Error ? directError.message : String(directError)
+        directError instanceof Error
+          ? directError.message
+          : String(directError),
       );
       return this.fetchImageViaProxy(url);
     }
@@ -7226,7 +7265,7 @@ export class NodeBuilder {
 
   private async transcodeIfUnsupportedRaster(
     bytes: Uint8Array,
-    mimeHint?: string
+    mimeHint?: string,
   ): Promise<Uint8Array> {
     const hint = (mimeHint || "").toLowerCase();
     if (this.isAvifBytes(bytes) || hint.includes("avif")) {
@@ -7265,7 +7304,7 @@ export class NodeBuilder {
         Object.values(data.cssVariables).find(
           (v: any) =>
             typeof v === "string" &&
-            (v.includes("rgb") || v.includes("#") || v.includes("hsl"))
+            (v.includes("rgb") || v.includes("#") || v.includes("hsl")),
         ));
 
     if (bg && typeof bg === "string") {
@@ -7277,10 +7316,10 @@ export class NodeBuilder {
             source: data.style?.backgroundColor
               ? "style"
               : data.backgroundColor
-              ? "direct"
-              : "cssVariable",
+                ? "direct"
+                : "cssVariable",
             color: bg,
-          }
+          },
         );
         return parsedColor;
       }
@@ -7330,11 +7369,11 @@ export class NodeBuilder {
         // If DOM extraction already marked this as inherited, try to extract the effective color
         if (nodeData.colorInheritance.effectiveColor) {
           const color = this.parseColorString(
-            nodeData.colorInheritance.effectiveColor
+            nodeData.colorInheritance.effectiveColor,
           );
           if (color && color.a > 0.05) {
             console.log(
-              `  🔗 [BASIC-INHERITANCE] Using effective inherited color for ${nodeData.name}: ${nodeData.colorInheritance.effectiveColor}`
+              `  🔗 [BASIC-INHERITANCE] Using effective inherited color for ${nodeData.name}: ${nodeData.colorInheritance.effectiveColor}`,
             );
             return color;
           }
@@ -7348,7 +7387,7 @@ export class NodeBuilder {
         // For text elements, try to find a reasonable parent background
         if (
           ["span", "p", "h1", "h2", "h3", "h4", "h5", "h6", "li"].includes(
-            tagName
+            tagName,
           )
         ) {
           // Use a light background as fallback for text elements without explicit colors
@@ -7510,7 +7549,7 @@ export class NodeBuilder {
     const normalizedWidth = Math.max(this.roundForPixelPerfection(width), 0.01);
     const normalizedHeight = Math.max(
       this.roundForPixelPerfection(height),
-      0.01
+      0.01,
     );
 
     return {
@@ -7579,7 +7618,7 @@ export class NodeBuilder {
     // Handle rgb/rgba - more flexible regex to handle spaces and decimals
     const rgbMatch =
       /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i.exec(
-        trimmed
+        trimmed,
       );
     if (rgbMatch) {
       const r = Math.min(255, parseFloat(rgbMatch[1])) / 255;
@@ -7599,7 +7638,7 @@ export class NodeBuilder {
     // Handle modern CSS rgb()/rgba() syntax: rgb(0 0 0 / 0.5)
     const spaceRgbMatch =
       /^rgba?\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+%?))?\s*\)$/i.exec(
-        trimmed
+        trimmed,
       );
     if (spaceRgbMatch) {
       const r = Math.min(255, parseFloat(spaceRgbMatch[1])) / 255;
@@ -7623,7 +7662,7 @@ export class NodeBuilder {
     // In that case, we return undefined and let the fallback logic handle it.
     if (/^(oklch|oklab|lch|lab|color-mix)\(/i.test(trimmed)) {
       console.warn(
-        `⚠️ [parseColorString] Received modern color format in plugin context: ${trimmed}. This should have been converted by the extension.`
+        `⚠️ [parseColorString] Received modern color format in plugin context: ${trimmed}. This should have been converted by the extension.`,
       );
       return undefined;
     }
@@ -7631,7 +7670,7 @@ export class NodeBuilder {
     // Handle hsl/hsla (convert to rgb)
     const hslMatch =
       /^hsla?\(\s*(\d+)\s*,\s*(\d+)%\s*,\s*(\d+)%(?:\s*,\s*(\d*\.?\d+))?\s*\)$/i.exec(
-        trimmed
+        trimmed,
       );
     if (hslMatch) {
       const h = parseInt(hslMatch[1], 10) / 360;
@@ -7710,7 +7749,7 @@ export class NodeBuilder {
 
   private async createFigmaImageFromAsset(
     asset: any,
-    hash: string
+    hash: string,
   ): Promise<Image | null> {
     let base64Candidate: string | undefined =
       asset?.data || asset?.base64 || asset?.screenshot;
@@ -7750,7 +7789,7 @@ export class NodeBuilder {
           } catch (decodeError) {
             console.warn(
               "SVG base64 decode failed, will try fetch",
-              decodeError
+              decodeError,
             );
           }
         }
@@ -7768,7 +7807,7 @@ export class NodeBuilder {
           // Inline external <use> references so sprite-based icons render
           const inlinedMarkup = await this.inlineSvgUsesInPlugin(
             svgMarkup,
-            url
+            url,
           );
           const vectorRoot = figma.createNodeFromSvg(inlinedMarkup);
           // Resize to expected dimensions if provided
@@ -7787,7 +7826,7 @@ export class NodeBuilder {
       } catch (svgError) {
         console.warn(
           `❌ SVG rasterization failed for ${hash}, falling back to standard flow`,
-          svgError
+          svgError,
         );
       }
     }
@@ -7817,13 +7856,13 @@ export class NodeBuilder {
         if (imageBytes?.length) {
           imageBytes = await this.transcodeIfUnsupportedRaster(
             imageBytes,
-            mimeHint
+            mimeHint,
           );
         }
       } catch (error) {
         console.warn(
           `❌ base64 decode failed for ${hash}, will retry/transcode if possible`,
-          error
+          error,
         );
       }
     }
@@ -7832,13 +7871,13 @@ export class NodeBuilder {
       try {
         triedUrl = true;
         console.log(
-          `  🔄 [FIGMA] Asset has URL fallback, trying fetch: ${url}`
+          `  🔄 [FIGMA] Asset has URL fallback, trying fetch: ${url}`,
         );
         imageBytes = await this.fetchImage(url);
         if (imageBytes?.length) {
           imageBytes = await this.transcodeIfUnsupportedRaster(
             imageBytes,
-            mimeHint
+            mimeHint,
           );
         }
         console.log(`  ✅ Fetched bytes from URL: ${imageBytes.length}`);
@@ -7866,7 +7905,7 @@ export class NodeBuilder {
     } catch (error: any) {
       const message = error?.message || String(error);
       console.warn(
-        `❌ createImage failed for ${hash}: ${message} (bytes=${imageBytes.length})`
+        `❌ createImage failed for ${hash}: ${message} (bytes=${imageBytes.length})`,
       );
 
       // If we haven't tried URL fallback yet, do so now (CDNs often serve a more compatible format).
@@ -7876,7 +7915,7 @@ export class NodeBuilder {
           const fetched = await this.fetchImage(url);
           const supported = await this.transcodeIfUnsupportedRaster(
             fetched,
-            mimeHint
+            mimeHint,
           );
           const image = figma.createImage(supported);
           console.log(`✅ createImage succeeded via URL fallback for ${hash}`);
@@ -7884,7 +7923,7 @@ export class NodeBuilder {
         } catch (urlFallbackError) {
           console.warn(
             `❌ URL fallback also failed for ${hash}`,
-            urlFallbackError
+            urlFallbackError,
           );
         }
       }
@@ -7910,7 +7949,7 @@ export class NodeBuilder {
         } catch (fallbackError) {
           console.warn(
             `❌ createImage still failed after transcode for ${hash}`,
-            fallbackError
+            fallbackError,
           );
         }
       }
@@ -7924,7 +7963,7 @@ export class NodeBuilder {
 
   private async transcodeWebpWithRetry(
     base64: string,
-    retries: number = 2
+    retries: number = 2,
   ): Promise<Uint8Array> {
     let lastError: any;
     for (let attempt = 0; attempt < retries; attempt++) {
@@ -7937,7 +7976,7 @@ export class NodeBuilder {
       } catch (error) {
         lastError = error;
         await new Promise((resolve) =>
-          setTimeout(resolve, 200 * (attempt + 1))
+          setTimeout(resolve, 200 * (attempt + 1)),
         );
       }
     }
@@ -7991,7 +8030,7 @@ export class NodeBuilder {
   private isSvgPayload(
     normalizedBase64: string,
     rawPayload?: string,
-    mimeTypeHint?: string
+    mimeTypeHint?: string,
   ): boolean {
     if (mimeTypeHint && mimeTypeHint.toLowerCase().includes("svg")) {
       return true;
@@ -8026,12 +8065,12 @@ export class NodeBuilder {
       typeof asset?.data === "string"
         ? asset.data
         : typeof asset?.base64 === "string"
-        ? asset.base64
-        : typeof asset?.screenshot === "string"
-        ? asset.screenshot
-        : typeof asset?.url === "string" && asset.url.startsWith("data:")
-        ? asset.url
-        : undefined;
+          ? asset.base64
+          : typeof asset?.screenshot === "string"
+            ? asset.screenshot
+            : typeof asset?.url === "string" && asset.url.startsWith("data:")
+              ? asset.url
+              : undefined;
 
     if (!rawSource) return null;
 
@@ -8055,7 +8094,7 @@ export class NodeBuilder {
     const looksLikeSvg = this.isSvgPayload(
       this.normalizeBase64Payload(combinedPayload),
       combinedPayload,
-      mime
+      mime,
     );
     if (!looksLikeSvg) {
       return null;
@@ -8079,7 +8118,7 @@ export class NodeBuilder {
 
   private createVectorFromSvgMarkup(
     svgString: string,
-    data: any
+    data: any,
   ): SceneNode | null {
     // CRITICAL SAFETY CHECK: Skip massive SVGs to prevent WASM memory crashes
     // Figma's createNodeFromSvg engine crashes with "memory access out of bounds" on huge strings
@@ -8090,7 +8129,7 @@ export class NodeBuilder {
           svgString.length / 1024
         ).toFixed(1)} KB) for ${
           data.name || "Vector"
-        }. Will fallback to raster image.`
+        }. Will fallback to raster image.`,
       );
       return null;
     }
@@ -8105,16 +8144,16 @@ export class NodeBuilder {
         // Try to get color from fills
         if (data?.fills && Array.isArray(data.fills) && data.fills.length > 0) {
           const fill = data.fills.find(
-            (f: any) => f.type === "SOLID" && f.visible !== false
+            (f: any) => f.type === "SOLID" && f.visible !== false,
           );
           if (fill && fill.color) {
             const { r, g, b, a } = fill.color;
             // Use rgba for full fidelity including alpha
             replacementColor = `rgba(${Math.round(r * 255)}, ${Math.round(
-              g * 255
+              g * 255,
             )}, ${Math.round(b * 255)}, ${a !== undefined ? a : 1})`;
             console.log(
-              `🎨 [SVG] Replaced currentColor with ${replacementColor} for ${data.name}`
+              `🎨 [SVG] Replaced currentColor with ${replacementColor} for ${data.name}`,
             );
           }
         } else if (data?.style?.color) {
@@ -8134,7 +8173,7 @@ export class NodeBuilder {
       if (replaced > 0 || unresolved > 0) {
         console.log(
           `  🧩 [SVG] Resolved CSS var() in ${data?.name || "Vector"}:`,
-          { replaced, unresolved }
+          { replaced, unresolved },
         );
       }
 
@@ -8263,7 +8302,7 @@ export class NodeBuilder {
 
   private async base64ToImageBytes(
     base64: string,
-    forceWebp = false
+    forceWebp = false,
   ): Promise<Uint8Array> {
     const parts = this.extractDataUrlParts(base64);
     const payload = parts.payload;
@@ -8306,10 +8345,10 @@ export class NodeBuilder {
       if (this.isSvgPayload(clean, decodedPayload, mimeTypeHint)) {
         if (!allowSvg) {
           console.warn(
-            "⚠️ Detected SVG content in image asset. Figma createImage does not support SVGs."
+            "⚠️ Detected SVG content in image asset. Figma createImage does not support SVGs.",
           );
           throw new Error(
-            "SVG content detected - cannot create raster image from SVG data"
+            "SVG content detected - cannot create raster image from SVG data",
           );
         }
         if (!isBase64 && decodedPayload.trim().startsWith("<")) {
@@ -8378,7 +8417,7 @@ export class NodeBuilder {
    */
   private async inlineSvgUsesInPlugin(
     svgMarkup: string,
-    baseUrl?: string
+    baseUrl?: string,
   ): Promise<string> {
     try {
       // Figma plugin main thread does not reliably provide DOMParser; when missing,
@@ -8439,7 +8478,7 @@ export class NodeBuilder {
         ) {
           svg.setAttribute(
             "viewBox",
-            symbolClone.getAttribute("viewBox") || ""
+            symbolClone.getAttribute("viewBox") || "",
           );
         }
         while (symbolClone.firstChild) {
@@ -8458,7 +8497,7 @@ export class NodeBuilder {
     } catch (error) {
       console.warn(
         "inlineSvgUsesInPlugin failed, returning original SVG",
-        error
+        error,
       );
       return svgMarkup;
     }
@@ -8485,7 +8524,7 @@ export class NodeBuilder {
 
   private base64ToString(
     base64: string,
-    options?: { allowSvg?: boolean }
+    options?: { allowSvg?: boolean },
   ): string {
     const normalized = base64.includes(",") ? base64.split(",")[1] : base64;
     const clean = normalized.replace(/\s/g, "");
@@ -8512,7 +8551,7 @@ export class NodeBuilder {
     node: SceneNode,
     transform: any,
     transformOrigin?: { x: number; y: number; z?: number },
-    layout?: { width: number; height: number; x: number; y: number }
+    layout?: { width: number; height: number; x: number; y: number },
   ): void {
     if (!transform?.matrix || !layout) {
       return;
@@ -8529,11 +8568,11 @@ export class NodeBuilder {
       if (transformOrigin) {
         const originX = this.calculateTransformOriginOffset(
           transformOrigin.x,
-          layout.width
+          layout.width,
         );
         const originY = this.calculateTransformOriginOffset(
           transformOrigin.y,
-          layout.height
+          layout.height,
         );
 
         const offsetTx = tx + originX * (1 - a) - originY * c;
@@ -8555,7 +8594,7 @@ export class NodeBuilder {
         if ("visible" in node) {
           (node as any).visible = false;
           console.log(
-            `🙈 [TRANSFORM] Hiding off-screen element "${node.name}" at (${finalX}, ${finalY})`
+            `🙈 [TRANSFORM] Hiding off-screen element "${node.name}" at (${finalX}, ${finalY})`,
           );
         }
       }
@@ -8582,7 +8621,7 @@ export class NodeBuilder {
               scaleY,
               originalWidth: layout.width,
               originalHeight: layout.height,
-            })
+            }),
           );
         }
       }
@@ -8600,7 +8639,7 @@ export class NodeBuilder {
               rotate: transform.rotate,
               skew: transform.skew,
             },
-          })
+          }),
         );
       }
     } else if (matrix.length === 16) {
@@ -8618,18 +8657,18 @@ export class NodeBuilder {
           matrix,
           translate: { x: tx, y: ty, z: tz },
           originalPosition: { x: layout.x, y: layout.y },
-        })
+        }),
       );
 
       console.warn(
-        `3D transform applied to "${node.name}" - limited Figma support, stored for reference`
+        `3D transform applied to "${node.name}" - limited Figma support, stored for reference`,
       );
     }
   }
 
   private calculateTransformOriginOffset(
     value: number,
-    dimension: number
+    dimension: number,
   ): number {
     if (value >= 0 && value <= 100) {
       return (value / 100) * dimension - dimension / 2;
@@ -8668,7 +8707,7 @@ export class NodeBuilder {
 
   private async bindVariablesToNode(
     node: GeometryMixin & SceneNode,
-    data: any
+    data: any,
   ): Promise<void> {
     if (!this.designTokensManager) return;
 
@@ -8678,7 +8717,7 @@ export class NodeBuilder {
         const fill = fills[i];
         if (fill.type === "SOLID" && "color" in fill) {
           const matchingVariable = this.findMatchingColorVariable(
-            fill.color as RGB
+            fill.color as RGB,
           );
           if (matchingVariable) {
             try {
@@ -8686,13 +8725,13 @@ export class NodeBuilder {
                 figma.variables.createVariableAlias(matchingVariable);
               node.fills = [{ ...fill, color: alias as any }];
               console.log(
-                `🔗 Bound fill on ${node.name} to variable ${matchingVariable.name}`
+                `🔗 Bound fill on ${node.name} to variable ${matchingVariable.name}`,
               );
               break;
             } catch (error) {
               console.warn(
                 `Failed to bind fill variable on ${node.name}:`,
-                error
+                error,
               );
             }
           }
@@ -8710,7 +8749,7 @@ export class NodeBuilder {
         const stroke = strokes[i];
         if (stroke.type === "SOLID" && "color" in stroke) {
           const matchingVariable = this.findMatchingColorVariable(
-            stroke.color as RGB
+            stroke.color as RGB,
           );
           if (matchingVariable) {
             try {
@@ -8718,13 +8757,13 @@ export class NodeBuilder {
                 figma.variables.createVariableAlias(matchingVariable);
               node.strokes = [{ ...stroke, color: alias as any }];
               console.log(
-                `🔗 Bound stroke on ${node.name} to variable ${matchingVariable.name}`
+                `🔗 Bound stroke on ${node.name} to variable ${matchingVariable.name}`,
               );
               break;
             } catch (error) {
               console.warn(
                 `Failed to bind stroke variable on ${node.name}:`,
-                error
+                error,
               );
             }
           }
@@ -8743,7 +8782,7 @@ export class NodeBuilder {
     for (const variable of allVariables) {
       if (variable.resolvedType === "COLOR") {
         const collection = figma.variables.getVariableCollectionById(
-          variable.variableCollectionId
+          variable.variableCollectionId,
         );
         if (collection && collection.modes.length > 0) {
           const defaultMode = collection.modes[0];
@@ -8780,7 +8819,7 @@ export class NodeBuilder {
   private applyProfessionalPositioning(
     node: SceneNode,
     data: any,
-    layoutIntelligence: any
+    layoutIntelligence: any,
   ): void {
     const { hybridStrategy, confidenceScore } = layoutIntelligence;
 
@@ -8789,7 +8828,7 @@ export class NodeBuilder {
       const optimizedConstraints =
         this.professionalLayoutSolver.calculateOptimalConstraints(
           data,
-          {} // parent data - would need to be passed from context
+          {}, // parent data - would need to be passed from context
         );
 
       (node as ConstraintMixin).constraints = {
@@ -8798,7 +8837,7 @@ export class NodeBuilder {
       };
 
       console.log(
-        `🎯 [PROFESSIONAL POSITIONING] Applied intelligent constraints: ${optimizedConstraints.horizontal}/${optimizedConstraints.vertical}`
+        `🎯 [PROFESSIONAL POSITIONING] Applied intelligent constraints: ${optimizedConstraints.horizontal}/${optimizedConstraints.vertical}`,
       );
     }
 
@@ -8815,11 +8854,11 @@ export class NodeBuilder {
       if (canUseAbsolute) {
         (node as any).layoutPositioning = data.layoutPositioning;
         console.log(
-          `📍 [PROFESSIONAL POSITIONING] Applied layoutPositioning: ${data.layoutPositioning}`
+          `📍 [PROFESSIONAL POSITIONING] Applied layoutPositioning: ${data.layoutPositioning}`,
         );
       } else {
         console.warn(
-          `⚠️ [PROFESSIONAL POSITIONING] Skipping layoutPositioning=${data.layoutPositioning} - parent layoutMode is NONE`
+          `⚠️ [PROFESSIONAL POSITIONING] Skipping layoutPositioning=${data.layoutPositioning} - parent layoutMode is NONE`,
         );
         // Don't set layoutPositioning - leave it as default to prevent Figma API error
       }
@@ -8843,7 +8882,7 @@ export class NodeBuilder {
     node: SceneNode,
     data: any,
     x: number,
-    y: number
+    y: number,
   ): void {
     // Check if we have CSS transform data that needs professional handling
     if (data.cssTransform && data.cssTransform !== "none") {
@@ -8855,26 +8894,26 @@ export class NodeBuilder {
           const transformMatrix = this.createProfessionalTransformMatrix(
             parsedTransform,
             x,
-            y
+            y,
           );
 
           if ("relativeTransform" in node) {
             (node as SceneNode).relativeTransform = transformMatrix;
             console.log(
-              `🔄 [PROFESSIONAL TRANSFORM] Applied relativeTransform matrix`
+              `🔄 [PROFESSIONAL TRANSFORM] Applied relativeTransform matrix`,
             );
             return; // Skip regular positioning since transform handles it
             // Mark as professionally transformed to prevent double application
             this.safeSetPluginData(
               node,
               "professionalTransformApplied",
-              "true"
+              "true",
             );
           }
         }
       } catch (error) {
         console.warn(
-          `⚠️ [PROFESSIONAL TRANSFORM] Failed to parse transform: ${error}`
+          `⚠️ [PROFESSIONAL TRANSFORM] Failed to parse transform: ${error}`,
         );
       }
     }
@@ -8897,7 +8936,7 @@ export class NodeBuilder {
   private createProfessionalTransformMatrix(
     parsedTransform: ParsedTransform,
     x: number,
-    y: number
+    y: number,
   ): Transform {
     // CORRECTED: Start with scale matrix per Figma API
     const scaleX =
@@ -8995,7 +9034,7 @@ export class NodeBuilder {
         console.log(
           `🏆 [LAYOUT VALIDATION] High confidence layout detected (${(
             layoutIntelligence.confidenceScore * 100
-          ).toFixed(1)}%) - applying professional corrections`
+          ).toFixed(1)}%) - applying professional corrections`,
         );
 
         // Auto-correct positioning strategy based on analysis
@@ -9006,7 +9045,7 @@ export class NodeBuilder {
           const optimalConstraints =
             this.professionalLayoutSolver.calculateOptimalConstraints(
               correctedData,
-              {} // Parent context would be ideal here
+              {}, // Parent context would be ideal here
             );
 
           correctedData.constraints = optimalConstraints;
@@ -9038,7 +9077,7 @@ export class NodeBuilder {
             layoutIntelligence.confidenceScore * 100
           ).toFixed(1)}%) - using fallback strategy: ${
             layoutIntelligence.fallbackStrategy.mode
-          }`
+          }`,
         );
 
         // Apply fallback strategy
@@ -9059,25 +9098,25 @@ export class NodeBuilder {
       if (correctedData.layout.x !== undefined) {
         correctedData.layout.x =
           this.professionalLayoutSolver.handleSubPixelPrecision(
-            correctedData.layout.x
+            correctedData.layout.x,
           );
       }
       if (correctedData.layout.y !== undefined) {
         correctedData.layout.y =
           this.professionalLayoutSolver.handleSubPixelPrecision(
-            correctedData.layout.y
+            correctedData.layout.y,
           );
       }
       if (correctedData.layout.width !== undefined) {
         correctedData.layout.width =
           this.professionalLayoutSolver.handleSubPixelPrecision(
-            correctedData.layout.width
+            correctedData.layout.width,
           );
       }
       if (correctedData.layout.height !== undefined) {
         correctedData.layout.height =
           this.professionalLayoutSolver.handleSubPixelPrecision(
-            correctedData.layout.height
+            correctedData.layout.height,
           );
       }
     }
@@ -9090,12 +9129,12 @@ export class NodeBuilder {
           // Store enhanced transform data for professional processing
           correctedData._professionalTransform = parsedTransform;
           console.log(
-            `🔄 [LAYOUT VALIDATION] Enhanced transform data available`
+            `🔄 [LAYOUT VALIDATION] Enhanced transform data available`,
           );
         }
       } catch (error) {
         console.warn(
-          `⚠️ [LAYOUT VALIDATION] Transform validation failed: ${error}`
+          `⚠️ [LAYOUT VALIDATION] Transform validation failed: ${error}`,
         );
         delete correctedData.cssTransform; // Remove invalid transform
       }

@@ -223,7 +223,9 @@ export class SceneGraphExporter {
         if (nodeFills !== figma.mixed) {
           fills = nodeFills;
         }
-      } catch (e) {}
+      } catch (e) {
+        console.debug(`[SceneGraph] Failed to read fills from ${node.name}: ${e}`);
+      }
     }
 
     // Get strokes
@@ -231,7 +233,9 @@ export class SceneGraphExporter {
     if ("strokes" in node) {
       try {
         strokes = (node as GeometryMixin).strokes;
-      } catch (e) {}
+      } catch (e) {
+        console.debug(`[SceneGraph] Failed to read strokes from ${node.name}: ${e}`);
+      }
     }
 
     // Get effects
@@ -239,7 +243,9 @@ export class SceneGraphExporter {
     if ("effects" in node) {
       try {
         effects = (node as BlendMixin).effects;
-      } catch (e) {}
+      } catch (e) {
+        console.debug(`[SceneGraph] Failed to read effects from ${node.name}: ${e}`);
+      }
     }
 
     // Get visibility

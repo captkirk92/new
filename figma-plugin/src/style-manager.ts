@@ -72,7 +72,9 @@ export class StyleManager {
           ]);
           count++;
           if (count % 10 === 0) await this.yield(); // Yield control
-        } catch (err) { /* Skip on timeout */ }
+        } catch (err) {
+          console.debug(`[StyleManager] Skipped color style "${key}": ${err}`);
+        }
       }
     }
     
@@ -87,7 +89,9 @@ export class StyleManager {
           ]);
           count++;
           if (count % 5 === 0) await this.yield(); // Yield control
-        } catch (err) { /* Skip on timeout */ }
+        } catch (err) {
+          console.debug(`[StyleManager] Skipped text style "${key}": ${err}`);
+        }
       }
     }
     
@@ -102,7 +106,9 @@ export class StyleManager {
           ]);
           count++;
           if (count % 10 === 0) await this.yield(); // Yield control
-        } catch (err) { /* Skip on timeout */ }
+        } catch (err) {
+          console.debug(`[StyleManager] Skipped effect style "${key}": ${err}`);
+        }
       }
     }
   }

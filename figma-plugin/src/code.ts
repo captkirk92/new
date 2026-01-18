@@ -118,7 +118,7 @@ import type { WebToFigmaSchema, ElementNode } from "../../shared/schema";
 
 // Log the imported schema type at module load to verify import
 console.log(
-  "[SCHEMA IMPORT CHECK] WebToFigmaSchema type imported from shared/schema.ts"
+  "[SCHEMA IMPORT CHECK] WebToFigmaSchema type imported from shared/schema.ts",
 );
 
 // BUILD ID - Verify correct plugin version is loaded
@@ -355,7 +355,7 @@ figma.ui.onmessage = async (msg) => {
 
   if (msg.type === "fix-legacy-screenshot-layer") {
     const { removed, scannedScopes } = removeLegacyScreenshotBaseLayers(
-      msg.scope === "page" ? "page" : "selection"
+      msg.scope === "page" ? "page" : "selection",
     );
     figma.ui.postMessage({
       type: "legacy-screenshot-fix-result",
@@ -425,10 +425,10 @@ function removeLegacyScreenshotBaseLayers(scope: "selection" | "page"): {
       continue;
     }
 
-    if ("findAll" in root) {
-      const matches = (root as any).findAll(
+    if ("findAll" in root && typeof (root as ChildrenMixin).findAll === "function") {
+      const matches = (root as ChildrenMixin).findAll(
         (n: SceneNode) =>
-          n.type === "RECTANGLE" && n.name === "Screenshot Base Layer"
+          n.type === "RECTANGLE" && n.name === "Screenshot Base Layer",
       ) as RectangleNode[];
 
       for (const node of matches) {
@@ -530,7 +530,7 @@ function generateFigmaSummary(figmaJson: any, mainFrame: FrameNode): any {
   }
   if (summary.outOfBoundsNodes > 0) {
     summary.warnings.push(
-      `Found ${summary.outOfBoundsNodes} nodes outside expected viewport bounds`
+      `Found ${summary.outOfBoundsNodes} nodes outside expected viewport bounds`,
     );
   }
   if (summary.imageNodes === 0 && summary.nodeCount > 10) {
@@ -554,7 +554,7 @@ async function exportAndUploadDebugArtifacts(
   jobId: string,
   schema: any,
   stats: any,
-  selectionMap?: Record<string, string>
+  selectionMap?: Record<string, string>,
 ) {
   try {
     const baseUrl = "http://localhost:4411";
@@ -572,12 +572,12 @@ async function exportAndUploadDebugArtifacts(
     await fetch(`${baseUrl}/api/debug/${jobId}/import_render.png`, {
       method: "POST",
       headers: { "Content-Type": "image/png" },
-      body: renderBytes as any,
+      body: new Blob([renderBytes], { type: "image/png" }),
     });
     console.log(
       `✅ [DEBUG] Uploaded import_render.png (${(
         renderBytes.byteLength / 1024
-      ).toFixed(1)} KB)`
+      ).toFixed(1)} KB)`,
     );
 
     // 2. Upload basic import report
@@ -615,7 +615,7 @@ async function exportAndUploadDebugArtifacts(
       `🗜️ [DEBUG] Compressed to: ${compressedSizeKB} KB (${(
         (1 - compressed.byteLength / figmaJsonString.length) *
         100
-      ).toFixed(1)}% reduction)`
+      ).toFixed(1)}% reduction)`,
     );
 
     await fetch(`${baseUrl}/api/debug/${jobId}/figma_nodes.json.gz`, {
@@ -652,7 +652,7 @@ async function exportAndUploadDebugArtifacts(
 
     // 6. Export and upload scene graph snapshot for gap analysis
     console.log(
-      `🔬 [DEBUG] Exporting scene graph snapshot for gap analysis...`
+      `🔬 [DEBUG] Exporting scene graph snapshot for gap analysis...`,
     );
     const sceneGraphExporter = new SceneGraphExporter();
     const sceneGraphSnapshot = sceneGraphExporter.exportFromNode(mainFrame);
@@ -671,12 +671,12 @@ async function exportAndUploadDebugArtifacts(
       `✅ [DEBUG] Uploaded figma_scene_graph.json.gz (${
         sceneGraphSnapshot.totalNodes
       } nodes, ${(sceneGraphCompressed.byteLength / 1024).toFixed(
-        1
-      )} KB compressed)`
+        1,
+      )} KB compressed)`,
     );
 
     console.log(
-      `✅ [DEBUG] All artifacts uploaded successfully for job ${jobId}`
+      `✅ [DEBUG] All artifacts uploaded successfully for job ${jobId}`,
     );
   } catch (e) {
     console.error("❌ [DEBUG] Failed to upload artifacts:", e);
@@ -687,7 +687,7 @@ async function exportAndUploadDebugArtifacts(
 async function handleImportRequest(
   data: IncomingSchemaData,
   options: Partial<EnhancedImportOptions> | undefined,
-  trigger: "import" | "auto-import" | "live-import"
+  trigger: "import" | "auto-import" | "live-import",
 ): Promise<void> {
   const runId = diag.startRun({ trigger, mode: "request" });
   diag.stepStart("PREFLIGHT", "Preflight Checks");
@@ -741,7 +741,7 @@ async function handleImportRequest(
       diag.info(
         "Unwrapped rawSchemaJson",
         { length: data.rawSchemaJson.length },
-        "PREFLIGHT"
+        "PREFLIGHT",
       );
     } catch (parseError) {
       const errorMsg =
@@ -750,7 +750,7 @@ async function handleImportRequest(
       diag.error(
         "Failed to parse rawSchemaJson",
         { error: errorMsg },
-        "PREFLIGHT"
+        "PREFLIGHT",
       );
       diag.stepEnd("PREFLIGHT", "error");
       diag.endRun("error", { message: errorMsg });
@@ -763,48 +763,169 @@ async function handleImportRequest(
     }
   }
 
-  // Unwrap multi-viewport format if present (checking for captures array is sufficient)
-  if (Array.isArray(schema.captures) && schema.captures.length > 0) {
-    console.log("🔓 Unwrapping multi-viewport capture format...");
+  // Handle multi-viewport format: create separate frames for each viewport
+  // CRITICAL FIX: Process ALL captures, not just the first one!
+  if (
+    schema.multiViewport &&
+    Array.isArray(schema.captures) &&
+    schema.captures.length > 0
+  ) {
+    console.log(
+      `🔓 Multi-viewport bundle detected with ${schema.captures.length} captures`,
+    );
     diag.info(
       "Multi-viewport format detected",
       { captures: schema.captures.length },
-      "PREFLIGHT"
+      "PREFLIGHT",
     );
 
-    let picked: any = null;
-    for (const cap of schema.captures) {
-      if (!cap) continue;
-      // Try common shapes
+    // Store all captures for processing
+    const allCaptures = schema.captures;
+    let successCount = 0;
+    let errorCount = 0;
+
+    diag.stepEnd("PREFLIGHT", "ok");
+
+    // Process each viewport capture sequentially
+    for (let i = 0; i < allCaptures.length; i++) {
+      const capture = allCaptures[i];
+      if (!capture) continue;
+
+      const viewportName = capture.viewport || `Viewport ${i + 1}`;
+      console.log(
+        `\n📐 [VIEWPORT ${i + 1}/${
+          allCaptures.length
+        }] Processing: ${viewportName}`,
+      );
+
+      // Extract schema from capture
+      let viewportSchema: any = null;
       const candidate =
-        cap.data?.root || cap.data?.tree
-          ? cap.data
-          : cap.data?.schema?.root || cap.data?.schema?.tree
-          ? cap.data.schema
-          : cap.data?.rawSchemaJson
-          ? JSON.parse(cap.data.rawSchemaJson)
-          : cap.data || cap.schema;
+        capture.data?.root || capture.data?.tree
+          ? capture.data
+          : capture.data?.schema?.root || capture.data?.schema?.tree
+            ? capture.data.schema
+            : capture.data?.rawSchemaJson
+              ? JSON.parse(capture.data.rawSchemaJson)
+              : capture.data || capture.schema;
+
       if (candidate?.root || candidate?.tree) {
-        picked = candidate;
-        break;
+        viewportSchema = candidate;
+      } else {
+        console.warn(
+          `⚠️ Viewport ${viewportName} has no valid schema, skipping`,
+        );
+        errorCount++;
+        continue;
+      }
+
+      // Apply migration if legacy tree exists
+      if (viewportSchema.tree && !viewportSchema.root) {
+        viewportSchema.root = viewportSchema.tree;
+        delete viewportSchema.tree;
+      }
+
+      // Final validation: ensure we have root data
+      if (!viewportSchema.root) {
+        console.warn(`⚠️ Viewport ${viewportName} has no root data, skipping`);
+        errorCount++;
+        continue;
+      }
+
+      try {
+        diag.stepStart("BUILD_NODES", `Building ${viewportName}`);
+
+        const resolvedOptions: Partial<EnhancedImportOptions> = {
+          ...defaultEnhancedOptions,
+          ...(options || {}),
+        };
+
+        // Prepare canvas for this viewport
+        const treeNorm = normalizeSchemaTreeForFigma(viewportSchema);
+        if (resolvedOptions.applyAutoLayout !== false) {
+          prepareLayoutSchema(viewportSchema);
+        }
+        sanitizeLargeVibrantPaletteFills(viewportSchema);
+
+        const enhancedOptions: Partial<EnhancedImportOptions> = {
+          createMainFrame: true,
+          enableBatchProcessing: resolvedOptions.enableBatchProcessing ?? true,
+          verifyPositions: false,
+          maxBatchSize: resolvedOptions.maxBatchSize ?? 10,
+          coordinateTolerance: resolvedOptions.coordinateTolerance ?? 2,
+          enableDebugMode: resolvedOptions.enableDebugMode ?? false,
+          retryFailedImages: resolvedOptions.retryFailedImages ?? true,
+          enableProgressiveLoading:
+            resolvedOptions.enableProgressiveLoading ?? false,
+          applyAutoLayout: resolvedOptions.applyAutoLayout,
+          useHierarchyInference: resolvedOptions.useHierarchyInference ?? false,
+          enableSemanticTreeOptimization:
+            resolvedOptions.enableSemanticTreeOptimization ?? false,
+          parseMetaTags: resolvedOptions.parseMetaTags ?? true,
+          // CRITICAL FIX: Explicitly propagate optimization options
+          // Use false as default to prevent unwanted visual changes
+          semanticNaming: resolvedOptions.semanticNaming ?? false,
+          detectComponents: resolvedOptions.detectComponents ?? false,
+          groupByRole: resolvedOptions.groupByRole ?? false,
+          addVisualMarkers: resolvedOptions.addVisualMarkers ?? false,
+          colorCodeByRole: resolvedOptions.colorCodeByRole ?? false,
+          minComponentInstances: resolvedOptions.minComponentInstances ?? 3,
+        };
+
+        const importer = new EnhancedFigmaImporter(
+          viewportSchema,
+          enhancedOptions,
+        );
+        const verificationReport = await importer.runImport();
+
+        // Rename the main frame to include viewport name
+        const mainFrame = importer.getMainFrame();
+        if (mainFrame) {
+          const originalName = mainFrame.name;
+          mainFrame.name = `${viewportName} - ${originalName}`;
+
+          // Position frames horizontally with spacing
+          mainFrame.x = i * (mainFrame.width + 100);
+          mainFrame.y = 0;
+
+          console.log(
+            `✅ Created frame: ${mainFrame.name} (${mainFrame.width}x${mainFrame.height}px)`,
+          );
+        }
+
+        diag.stepEnd("BUILD_NODES", "ok", {
+          viewport: viewportName,
+          nodes: verificationReport.totalElements,
+        });
+
+        successCount++;
+      } catch (viewportError) {
+        const message =
+          viewportError instanceof Error
+            ? viewportError.message
+            : "Viewport import failed";
+        console.error(`❌ Failed to import viewport ${viewportName}:`, message);
+        diag.error(`Viewport ${viewportName} failed`, { message });
+        errorCount++;
       }
     }
-    if (picked) {
-      schema = picked;
-    } else {
-      console.error(
-        "❌ Multi-viewport format detected but no valid capture data found"
-      );
-      diag.error("No valid viewport found in captures", {}, "PREFLIGHT");
-      diag.stepEnd("PREFLIGHT", "error");
-      diag.endRun("error", { message: "Invalid multi-viewport" });
-      figma.ui.postMessage({
-        type: "error",
-        message: "Multi-viewport format is invalid - no data in captures array",
-      });
-      isImporting = false;
-      return;
-    }
+
+    // Final status
+    diag.stepStart("VERIFY", "Finalizing");
+    const enhancedStats = {
+      viewports: allCaptures.length,
+      successful: successCount,
+      failed: errorCount,
+    };
+
+    figma.ui.postMessage({ type: "complete", stats: enhancedStats });
+    diag.stepEnd("VERIFY", "ok");
+    diag.endRun("ok", { viewports: successCount });
+
+    figma.notify(`✓ Imported ${successCount}/${allCaptures.length} viewports`);
+    postHandoffStatus("waiting");
+    isImporting = false;
+    return;
   }
 
   // Apply migration if legacy tree exists
@@ -818,7 +939,7 @@ async function handleImportRequest(
     diag.error(
       "Missing root in schema",
       { keys: Object.keys(schema) },
-      "PREFLIGHT"
+      "PREFLIGHT",
     );
     diag.stepEnd("PREFLIGHT", "error");
     diag.endRun("error", { message: "No root data" });
@@ -896,7 +1017,7 @@ async function handleImportRequest(
         jobId,
         schema,
         enhancedStats,
-        selectionMap
+        selectionMap,
       );
     }
 
@@ -920,7 +1041,7 @@ async function handleImportRequest(
 function postHandoffStatus(
   status: HandoffStatus,
   detail?: string,
-  meta?: Record<string, any>
+  meta?: Record<string, any>,
 ) {
   if (status === "error") {
     diag.error(`Handoff Status: ${status}`, { detail, ...meta });
@@ -1012,7 +1133,7 @@ async function checkServer(url: string): Promise<boolean> {
     });
 
     const timeoutPromise = new Promise<Response>((_, reject) =>
-      setTimeout(() => reject(new Error("Timeout")), 1500)
+      setTimeout(() => reject(new Error("Timeout")), 1500),
     );
 
     const resp = await Promise.race([fetchPromise, timeoutPromise]);
@@ -1045,7 +1166,7 @@ async function discoverServerAndStartPolling() {
     console.warn("[CONN] Could not connect to any server");
     postHandoffStatus(
       "error",
-      "Could not connect to helper app. Please check if start.sh is running."
+      "Could not connect to helper app. Please check if start.sh is running.",
     );
   }
 
@@ -1054,10 +1175,23 @@ async function discoverServerAndStartPolling() {
   if (!handoffPollTimer) {
     let lastPollStart = 0;
     handoffPollTimer = setInterval(() => {
-      // WATCHDOG: Reset stuck poll flag if > 60s
-      if (handoffPollInFlight && Date.now() - lastPollStart > 60000) {
-        console.warn("[POLL] Watchdog: Resetting stuck poll flag");
-        handoffPollInFlight = false;
+      // WATCHDOG: Warn if poll is stuck, but don't auto-reset
+      // Large imports (YouTube, Spotify) can legitimately take 2-5 minutes
+      const pollDuration = Date.now() - lastPollStart;
+      if (handoffPollInFlight && pollDuration > 120_000) {
+        // Only warn once per minute to avoid log spam
+        if (pollDuration % 60_000 < HANDOFF_POLL_INTERVAL) {
+          console.warn(
+            `[POLL] Watchdog: Import running for ${Math.floor(pollDuration / 60_000)}+ minutes`,
+          );
+        }
+        // After 5 minutes, notify user but still don't auto-reset (could corrupt state)
+        if (pollDuration > 300_000 && pollDuration < 300_000 + HANDOFF_POLL_INTERVAL) {
+          postHandoffStatus(
+            "error",
+            "Import taking unusually long. Reload plugin if stuck.",
+          );
+        }
       }
 
       if (handoffPollInFlight) return;
@@ -1079,7 +1213,7 @@ function currentHandoffBase(): string {
 function rotateHandoffBase() {
   handoffBaseIndex = (handoffBaseIndex + 1) % HANDOFF_BASES.length;
   console.log(
-    `[HANDOFF] Rotated to base index ${handoffBaseIndex}: ${currentHandoffBase()}`
+    `[HANDOFF] Rotated to base index ${handoffBaseIndex}: ${currentHandoffBase()}`,
   );
 }
 
@@ -1087,14 +1221,14 @@ function rotateHandoffBase() {
 function resetHandoffToPrimary() {
   if (handoffBaseIndex !== 0) {
     console.log(
-      `[HANDOFF] Resetting from fallback port (index ${handoffBaseIndex}) back to primary (4411)`
+      `[HANDOFF] Resetting from fallback port (index ${handoffBaseIndex}) back to primary (4411)`,
     );
     handoffBaseIndex = 0;
   }
 }
 
 function buildHandoffHeaders(
-  base: Record<string, string> = {}
+  base: Record<string, string> = {},
 ): Record<string, string> {
   const headers = { ...base };
   if (HANDOFF_API_KEY) headers["x-api-key"] = HANDOFF_API_KEY;
@@ -1200,7 +1334,7 @@ async function fetchHandoffHistory(): Promise<{
       });
       if (!response.ok) {
         lastError = new Error(
-          `History request failed: HTTP ${response.status}`
+          `History request failed: HTTP ${response.status}`,
         );
         continue;
       }
@@ -1228,7 +1362,7 @@ async function fetchHandoffJob(jobId: string): Promise<any> {
         `${currentHandoffBase()}/api/jobs/${jobId}`,
         {
           headers: buildHandoffHeaders({ "cache-control": "no-cache" }),
-        }
+        },
       );
       if (!response.ok) {
         lastError = new Error(`Job fetch failed: HTTP ${response.status}`);
@@ -1264,8 +1398,8 @@ async function pollHandoffJobs(): Promise<void> {
       postHandoffStatus(
         "waiting",
         `Cooling down… retrying in ${Math.ceil(
-          (handoffCooldownUntil - now) / 1000
-        )}s`
+          (handoffCooldownUntil - now) / 1000,
+        )}s`,
       );
       return;
     }
@@ -1316,7 +1450,7 @@ async function pollHandoffJobs(): Promise<void> {
         "[POLL] Response status:",
         response.status,
         "at",
-        currentHandoffBase()
+        currentHandoffBase(),
       );
 
       if (!response.ok) {
@@ -1329,8 +1463,8 @@ async function pollHandoffJobs(): Promise<void> {
           postHandoffStatus(
             "error",
             `Server rate limited. Retrying in ${Math.ceil(
-              handoffBackoffMs / 1000
-            )}s`
+              handoffBackoffMs / 1000,
+            )}s`,
           );
           updateServerConnection("disconnected");
           return;
@@ -1341,10 +1475,10 @@ async function pollHandoffJobs(): Promise<void> {
         const errorText = await response.text().catch(() => "");
         console.error(
           `[POLL] HTTP ${response.status} from ${currentHandoffBase()}:`,
-          errorText
+          errorText,
         );
         throw new Error(
-          `HTTP ${response.status}: ${errorText || "Unknown error"}`
+          `HTTP ${response.status}: ${errorText || "Unknown error"}`,
         );
       }
 
@@ -1356,7 +1490,7 @@ async function pollHandoffJobs(): Promise<void> {
       // ENHANCED: Reset to primary port when we successfully connect to fallback
       if (handoffBaseIndex !== 0) {
         console.log(
-          `[POLL] ✅ Successfully connected to fallback port, resetting to primary`
+          `[POLL] ✅ Successfully connected to fallback port, resetting to primary`,
         );
         resetHandoffToPrimary();
       }
@@ -1379,7 +1513,7 @@ async function pollHandoffJobs(): Promise<void> {
         await handleImportRequest(
           payload,
           { jobId: body.job.id },
-          "auto-import"
+          "auto-import",
         );
       } else {
         console.log("[POLL] No job in response");
@@ -1390,10 +1524,10 @@ async function pollHandoffJobs(): Promise<void> {
       clearTimeout(timeoutId);
       if (fetchError.name === "AbortError") {
         console.error(
-          `[POLL] ⏱️ Request timed out after 60s at ${currentHandoffBase()}`
+          `[POLL] ⏱️ Request timed out after 60s at ${currentHandoffBase()}`,
         );
         throw new Error(
-          `Request timed out after 60s (trying ${currentHandoffBase()})`
+          `Request timed out after 60s (trying ${currentHandoffBase()})`,
         );
       }
       throw fetchError;
@@ -1413,12 +1547,12 @@ async function pollHandoffJobs(): Promise<void> {
     const nextIndex = (handoffBaseIndex + 1) % HANDOFF_BASES.length;
     if (nextIndex !== 0) {
       console.log(
-        `[POLL] 🔄 Rotating to next server (${HANDOFF_BASES[nextIndex]})`
+        `[POLL] 🔄 Rotating to next server (${HANDOFF_BASES[nextIndex]})`,
       );
       rotateHandoffBase();
     } else {
       console.error(
-        `[POLL] ❌ All ${HANDOFF_BASES.length} server(s) failed, will retry on next poll`
+        `[POLL] ❌ All ${HANDOFF_BASES.length} server(s) failed, will retry on next poll`,
       );
     }
   } finally {
@@ -1501,14 +1635,21 @@ function decompressPayload(payload: any): any {
       // Validate result has expected schema structure
       if (!result || typeof result !== "object") {
         throw new Error(
-          `Decompressed payload is not an object: ${typeof result}`
+          `Decompressed payload is not an object: ${typeof result}`,
         );
       }
-      if (!result.root && !result.tree) {
+      // Accept either:
+      // 1. Single-viewport format with root/tree
+      // 2. Multi-viewport format with multiViewport flag and captures array
+      const isSingleViewport = !!(result.root || result.tree);
+      const isMultiViewport = !!(
+        result.multiViewport && Array.isArray(result.captures)
+      );
+      if (!isSingleViewport && !isMultiViewport) {
         throw new Error(
-          `Decompressed payload missing both 'root' and 'tree' fields. Keys: ${Object.keys(
-            result
-          ).join(", ")}`
+          `Decompressed payload missing expected fields. Need 'root'/'tree' for single-viewport or 'multiViewport'+'captures' for multi-viewport. Keys: ${Object.keys(
+            result,
+          ).join(", ")}`,
         );
       }
 
@@ -1529,11 +1670,11 @@ function decompressPayload(payload: any): any {
 
       // Handle specific error cases
       const msg = e instanceof Error ? e.message : String(e);
-      
+
       // Truncated JSON (common with large captures or network issues)
       if (msg.includes("Unexpected end of JSON input")) {
         throw new Error(
-          "Capture data is corrupt (truncated). The page may be too large to transfer reliably. Please try capturing a smaller section or use 'Server Capture'."
+          "Capture data is corrupt (truncated). The page may be too large to transfer reliably. Please try capturing a smaller section or use 'Server Capture'.",
         );
       }
 
@@ -1541,7 +1682,7 @@ function decompressPayload(payload: any): any {
       // If we failed to parse/inflate, it's a hard failure
       if (msg.match(/memory/i)) {
         throw new Error(
-          "Out of memory during import. The web page is too large for Figma to process at once. Try capturing a smaller section."
+          "Out of memory during import. The web page is too large for Figma to process at once. Try capturing a smaller section.",
         );
       }
       throw e;
@@ -1569,7 +1710,7 @@ function decompressPayload(payload: any): any {
       hasTree: !!(payload && payload.tree),
       directKeys:
         payload && typeof payload === "object" ? Object.keys(payload) : [],
-    }
+    },
   );
 
   return payload;
@@ -1624,7 +1765,7 @@ async function pingHandoffHealth(): Promise<void> {
       `${currentHandoffBase()}/api/health?source=plugin`,
       {
         headers: buildHandoffHeaders({ "cache-control": "no-cache" }),
-      }
+      },
     );
     if (!response.ok) {
       const text = await response.text();
@@ -1663,7 +1804,7 @@ async function pingHandoffHealth(): Promise<void> {
     rotateHandoffBase();
     console.warn(
       "[handoff] Health check failed, rotating base",
-      contextualMessage
+      contextualMessage,
     );
     figma.ui.postMessage({
       type: "handoff-health",
@@ -1685,7 +1826,7 @@ interface EnhancedUIOptions {
 // Enhanced import handler for the new UI
 async function handleEnhancedImport(
   data: any,
-  options: EnhancedUIOptions | undefined
+  options: EnhancedUIOptions | undefined,
 ): Promise<void> {
   if (isImporting) {
     figma.ui.postMessage({
@@ -1718,7 +1859,7 @@ async function handleEnhancedImport(
     if (treeNorm.removedNodes > 0 || treeNorm.renamedNodes > 0) {
       console.log(
         "🧹 Normalized schema tree for professional nesting:",
-        treeNorm
+        treeNorm,
       );
     }
 
@@ -1728,7 +1869,7 @@ async function handleEnhancedImport(
       console.log("✅ Layout schema prepared.");
     } else {
       console.log(
-        "🧷 Pixel-perfect mode: skipping prepareLayoutSchema() (Auto Layout disabled)"
+        "🧷 Pixel-perfect mode: skipping prepareLayoutSchema() (Auto Layout disabled)",
       );
     }
 
@@ -1789,7 +1930,7 @@ async function handleEnhancedImport(
 // Enhanced import handler V2 with pixel-perfect positioning and verification
 async function handleEnhancedImportV2(
   data: IncomingSchemaData,
-  options: Partial<EnhancedImportOptions> | undefined
+  options: Partial<EnhancedImportOptions> | undefined,
 ): Promise<void> {
   if (isImporting) {
     figma.ui.postMessage({
@@ -1833,7 +1974,7 @@ async function handleEnhancedImportV2(
     let schema = data;
     if (data.rawSchemaJson && typeof data.rawSchemaJson === "string") {
       console.log(
-        "🔓 Unwrapping rawSchemaJson string from chunked transfer..."
+        "🔓 Unwrapping rawSchemaJson string from chunked transfer...",
       );
       try {
         schema = JSON.parse(data.rawSchemaJson);
@@ -1865,16 +2006,16 @@ async function handleEnhancedImportV2(
           cap.data?.root || cap.data?.tree
             ? cap.data
             : cap.data?.schema?.root || cap.data?.schema?.tree
-            ? cap.data.schema
-            : cap.data?.rawSchemaJson
-            ? JSON.parse(cap.data.rawSchemaJson)
-            : cap.data || cap.schema;
+              ? cap.data.schema
+              : cap.data?.rawSchemaJson
+                ? JSON.parse(cap.data.rawSchemaJson)
+                : cap.data || cap.schema;
         if (candidate?.root || candidate?.tree) {
           picked = candidate;
           console.log(
             `✅ Using viewport: ${
               cap.viewport || cap.name || "unnamed"
-            } (V2), has ${candidate.root ? "root" : "tree"}`
+            } (V2), has ${candidate.root ? "root" : "tree"}`,
           );
           break;
         }
@@ -1886,7 +2027,7 @@ async function handleEnhancedImportV2(
               console.log(
                 `✅ Parsed rawSchemaJson for viewport: ${
                   cap.viewport || cap.name || "unnamed"
-                } (V2)`
+                } (V2)`,
               );
               break;
             }
@@ -1899,7 +2040,7 @@ async function handleEnhancedImportV2(
         schema = picked;
       } else {
         console.error(
-          "❌ Multi-viewport format detected but no valid capture data found (V2)"
+          "❌ Multi-viewport format detected but no valid capture data found (V2)",
         );
         figma.ui.postMessage({
           type: "error",
@@ -1913,7 +2054,7 @@ async function handleEnhancedImportV2(
     // Apply migration if legacy tree exists
     if (schema.tree && !schema.root) {
       console.log(
-        "🔄 [V2-MIGRATION] Converting legacy 'tree' to canonical 'root'"
+        "🔄 [V2-MIGRATION] Converting legacy 'tree' to canonical 'root'",
       );
       schema.root = schema.tree;
       delete schema.tree;
@@ -1928,7 +2069,7 @@ async function handleEnhancedImportV2(
             schema = parsed;
           } else if (parsed?.tree) {
             console.log(
-              "🔄 [NESTED-IMPORT] Converting rawSchemaJson legacy 'tree' to canonical 'root'"
+              "🔄 [NESTED-IMPORT] Converting rawSchemaJson legacy 'tree' to canonical 'root'",
             );
             parsed.root = parsed.tree;
             delete parsed.tree;
@@ -1941,7 +2082,7 @@ async function handleEnhancedImportV2(
         schema = schema.schema;
       } else if (schema.schema?.tree) {
         console.log(
-          "🔄 [NESTED-IMPORT] Converting nested legacy 'tree' to canonical 'root'"
+          "🔄 [NESTED-IMPORT] Converting nested legacy 'tree' to canonical 'root'",
         );
         schema.schema.root = schema.schema.tree;
         delete schema.schema.tree;
@@ -1972,7 +2113,7 @@ async function handleEnhancedImportV2(
         // Migrate if tree found
         if (nested.tree && !nested.root) {
           console.log(
-            "🔄 [NESTED-V2] Converting nested 'tree' to canonical 'root'"
+            "🔄 [NESTED-V2] Converting nested 'tree' to canonical 'root'",
           );
           nested.root = nested.tree;
           delete nested.tree;
@@ -2010,7 +2151,7 @@ async function handleEnhancedImportV2(
       diag.error(
         "No root data available (V2)",
         { keys: schema ? Object.keys(schema) : [] },
-        "PREFLIGHT"
+        "PREFLIGHT",
       );
 
       diag.stepEnd("PREFLIGHT", "error");
@@ -2069,7 +2210,7 @@ async function handleEnhancedImportV2(
       console.log(
         "🧹 Normalized schema tree for professional nesting:",
 
-        treeNorm
+        treeNorm,
       );
 
       diag.info("Normalized schema tree", treeNorm as any, "PREPARE_CANVAS");
@@ -2081,7 +2222,7 @@ async function handleEnhancedImportV2(
       console.log("✅ Layout schema prepared (V2).");
     } else {
       console.log(
-        "🧷 Pixel-perfect mode: skipping prepareLayoutSchema() (Auto Layout disabled)"
+        "🧷 Pixel-perfect mode: skipping prepareLayoutSchema() (Auto Layout disabled)",
       );
     }
 
@@ -2089,13 +2230,13 @@ async function handleEnhancedImportV2(
 
     if (removedPaletteFills > 0) {
       console.warn(
-        `⚠️ Removed ${removedPaletteFills} large-node Vibrant palette fill(s) for pixel fidelity`
+        `⚠️ Removed ${removedPaletteFills} large-node Vibrant palette fill(s) for pixel fidelity`,
       );
 
       diag.warn(
         `Removed ${removedPaletteFills} vibrant fills`,
         {},
-        "PREPARE_CANVAS"
+        "PREPARE_CANVAS",
       );
     }
 
@@ -2203,7 +2344,7 @@ async function handleEnhancedImportV2(
         jobId,
         schema,
         stats,
-        selectionMap
+        selectionMap,
       );
     }
 
