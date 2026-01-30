@@ -1,144 +1,211 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-  <meta charset="utf-8">
-  <link rel="stylesheet" href="popup.css">
-</head>
-<body>
-  <div class="container">
-    <h1>🎨 Web to Figma</h1>
-    
-    <div id="status" class="status">Ready to capture</div>
-    <div id="handoff-status" class="handoff-status hidden"></div>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="app-layout">
+      <!-- Sidebar - Page Queue -->
+      <aside class="sidebar">
+        <div class="sidebar-top">
+          <button id="add-page-btn" class="sidebar-btn" title="Add current page">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
+          <button id="clear-all-btn" class="sidebar-btn" title="Clear all pages">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+          </button>
+        </div>
+        <div id="page-queue" class="page-queue">
+          <!-- Page thumbnails will be added here dynamically -->
+        </div>
+        <div class="sidebar-bottom">
+          <button id="help-btn" class="sidebar-btn" title="Help">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+              <line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </button>
+        </div>
+      </aside>
 
-    <div class="target-url-section">
-      <label for="target-url">Target URL (optional)</label>
-      <input id="target-url" type="text" placeholder="https://example.com">
-      <p class="target-url-help">Leave blank to capture the current tab. Enter a URL to open it automatically before capturing.</p>
-    </div>
+      <!-- Main Content -->
+      <div class="container">
+        <!-- Header -->
+        <header class="header">
+          <div class="header-left">
+            <svg class="logo" viewBox="0 0 24 24" width="28" height="28">
+              <rect x="2" y="2" width="20" height="20" rx="4" fill="#22C55E"/>
+              <path d="M7 8h10M7 12h7M7 16h10" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <span class="app-name">figmafi</span>
+          </div>
+          <div class="header-right">
+            <button id="settings-btn" class="icon-btn" title="Settings">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </button>
+          </div>
+        </header>
 
-    <!-- Progress Bar Section -->
-    <div id="progress-section" class="progress-section hidden">
-      <div class="progress-header">
-        <span id="progress-phase" class="progress-phase">Initializing...</span>
-        <span id="progress-percent" class="progress-percent">0%</span>
-      </div>
-      <div class="progress-bar-container">
-        <div id="progress-bar-fill" class="progress-bar-fill"></div>
-      </div>
-      <div id="progress-message" class="progress-message">Starting extraction...</div>
-      <div id="progress-stats" class="progress-stats hidden">
-        <div class="progress-stat">
-          <span class="progress-stat-label">Elements:</span>
-          <span id="progress-stat-elements" class="progress-stat-value">0</span>
+        <!-- Page Preview -->
+        <div id="page-preview" class="page-preview">
+          <div class="preview-thumb">
+            <img id="preview-thumbnail" src="" alt="Page preview" />
+            <div id="preview-placeholder" class="preview-placeholder">
+              <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="2" y="3" width="20" height="14" rx="2"/>
+                <line x1="8" y1="21" x2="16" y2="21"/>
+                <line x1="12" y1="17" x2="12" y2="21"/>
+              </svg>
+              <span>Current page preview</span>
+            </div>
+          </div>
+          <div class="preview-info">
+            <span id="preview-page-title" class="preview-page-title">No page captured</span>
+            <span id="preview-page-url" class="preview-page-url"></span>
+          </div>
         </div>
-        <div class="progress-stat">
-          <span class="progress-stat-label">Figma Nodes:</span>
-          <span id="progress-stat-figma" class="progress-stat-value">0</span>
-        </div>
-        <div class="progress-stat">
-          <span class="progress-stat-label">Images:</span>
-          <span id="progress-stat-images" class="progress-stat-value">0</span>
-        </div>
-        <div class="progress-stat">
-          <span class="progress-stat-label">Styles:</span>
-          <span id="progress-stat-styles" class="progress-stat-value">0</span>
-        </div>
-        <div class="progress-stat">
-          <span class="progress-stat-label">Fonts:</span>
-          <span id="progress-stat-fonts" class="progress-stat-value">0</span>
-        </div>
-      </div>
-    </div>
 
-    <div class="connection-panel">
-      <div class="connection-item" id="server-connection">
-        <span id="server-connection-dot" class="connection-dot"></span>
-        <div class="connection-copy">
-          <span class="connection-title">Handoff Server</span>
-          <span id="server-connection-detail" class="connection-detail">Checking…</span>
+        <!-- Viewport Selector Cards -->
+        <div class="viewport-cards">
+          <label class="viewport-card">
+            <input type="checkbox" id="viewport-mobile" value="mobile" />
+            <div class="card-content">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="6" y="2" width="12" height="20" rx="2"/>
+                <line x1="10" y1="18" x2="14" y2="18"/>
+              </svg>
+              <span>Mobile</span>
+            </div>
+          </label>
+          <label class="viewport-card">
+            <input type="checkbox" id="viewport-tablet" value="tablet" />
+            <div class="card-content">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="4" y="2" width="16" height="20" rx="2"/>
+                <line x1="10" y1="18" x2="14" y2="18"/>
+              </svg>
+              <span>Tablet</span>
+            </div>
+          </label>
+          <label class="viewport-card">
+            <input type="checkbox" id="viewport-desktop" value="desktop" checked />
+            <div class="card-content">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="2" y="3" width="20" height="14" rx="2"/>
+                <line x1="8" y1="21" x2="16" y2="21"/>
+                <line x1="12" y1="17" x2="12" y2="21"/>
+              </svg>
+              <span>Desktop</span>
+            </div>
+          </label>
         </div>
-      </div>
-      <div class="connection-item" id="plugin-connection">
-        <span id="plugin-connection-dot" class="connection-dot"></span>
-        <div class="connection-copy">
-          <span class="connection-title">Figma Plugin Link</span>
-          <span id="plugin-connection-detail" class="connection-detail">Waiting for plugin…</span>
-        </div>
-      </div>
-      <div class="connection-item" id="transfer-connection">
-        <span id="transfer-connection-dot" class="connection-dot"></span>
-        <div class="connection-copy">
-          <span class="connection-title">Transfer Status</span>
-          <span id="transfer-connection-detail" class="connection-detail">Idle</span>
-        </div>
-      </div>
-    </div>
-    
-    <div id="preview-card" class="preview hidden">
-      <div class="preview-header">
-        <span class="preview-title" id="preview-title">Preview ready</span>
-        <div class="preview-actions">
-          <button id="toggle-overlay-btn" class="preview-toggle-btn" title="Toggle element overlay">🔲</button>
-          <button id="open-preview-btn" class="preview-open-btn" title="Open source page">↗</button>
-        </div>
-      </div>
-      <div id="screenshot-container" class="preview-body">
-        <img id="screenshot" alt="Screenshot preview">
-      </div>
-      <div class="preview-meta">
-        <span id="preview-url" class="preview-url"></span>
-        <span id="preview-timestamp" class="preview-timestamp"></span>
-      </div>
-      <div id="validation-summary" class="validation-summary hidden">
-        <span id="validation-status" class="validation-status"></span>
-        <span id="validation-details" class="validation-details"></span>
-      </div>
-    </div>
-    
-    <div class="stats hidden" id="stats">
-      <div class="stat-grid">
-        <div class="stat-item">
-          <span class="stat-label">Elements</span>
-          <span class="stat-value" id="stat-elements">0</span>
-        </div>
-        <div class="stat-item">
-          <span class="stat-label">JSON Size</span>
-          <span class="stat-value" id="stat-size">0 KB</span>
-        </div>
-      </div>
-    </div>
 
-    <div class="viewport-selector">
-      <div class="viewport-label">Capture Viewports:</div>
-      <div class="viewport-options">
-        <label class="viewport-option">
-          <input type="checkbox" id="viewport-mobile" value="mobile" checked>
-          <span>📱 Mobile (375px)</span>
-        </label>
-        <label class="viewport-option">
-          <input type="checkbox" id="viewport-tablet" value="tablet" checked>
-          <span>📱 Tablet (768px)</span>
-        </label>
-        <label class="viewport-option">
-          <input type="checkbox" id="viewport-desktop" value="desktop" checked>
-          <span id="desktop-viewport-label">💻 Desktop (Auto-detect)</span>
-        </label>
+        <!-- Toggle Options -->
+        <div class="options">
+          <div class="option-row">
+            <span class="option-label">Preprocess CSS</span>
+            <label class="toggle">
+              <input type="checkbox" id="preprocess-stylesheets" checked />
+              <span class="toggle-track"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Skeleton Animation Container (shown during capture) -->
+        <div id="skeleton-animation" class="skeleton-container hidden">
+          <div id="three-skeleton-canvas" class="three-skeleton-canvas"></div>
+        </div>
+
+        <!-- Progress Section (shown during capture) -->
+        <div id="progress-section" class="progress-section hidden">
+          <div class="progress-bar-track">
+            <div id="animated-progress-bar" class="progress-bar-fill"></div>
+          </div>
+          <div class="progress-info">
+            <span id="progress-phase" class="progress-phase">Initializing...</span>
+            <span id="progress-percent-text" class="progress-percent">0%</span>
+          </div>
+          <span id="progress-message" class="progress-message"></span>
+        </div>
+
+        <!-- Capture Button -->
+        <button id="capture-btn" class="capture-btn">
+          Capture Page
+        </button>
+
+        <!-- Post-Capture Actions -->
+        <div id="actions" class="actions hidden">
+          <button id="send-to-figma-btn" class="action-btn primary">
+            🚀 Send to Figma
+          </button>
+          <button id="download-btn" class="action-btn secondary">
+            💾 Download
+          </button>
+        </div>
+
+        <!-- Stats -->
+        <div id="stats" class="stats hidden">
+          <div class="stat">
+            <span class="stat-value" id="stat-elements">0</span>
+            <span class="stat-label">Elements</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value" id="stat-size">0 KB</span>
+            <span class="stat-label">Size</span>
+          </div>
+        </div>
+
+        <!-- Preview Card (post-capture) -->
+        <div id="preview-card" class="preview-card hidden">
+          <div class="preview-header">
+            <span id="preview-title" class="preview-title">Preview ready</span>
+            <div class="preview-actions">
+              <button id="toggle-overlay-btn" class="preview-action-btn" title="Toggle overlay">🔲</button>
+              <button id="open-preview-btn" class="preview-action-btn" title="Open page">↗</button>
+            </div>
+          </div>
+          <div id="screenshot-container" class="screenshot-container">
+            <img id="screenshot" alt="Screenshot preview" />
+          </div>
+          <div class="preview-meta">
+            <span id="preview-url" class="preview-url"></span>
+            <span id="preview-timestamp" class="preview-timestamp"></span>
+          </div>
+          <div id="validation-summary" class="validation-summary hidden">
+            <span id="validation-status" class="validation-status"></span>
+            <span id="validation-details" class="validation-details"></span>
+          </div>
+        </div>
+
+        <!-- Finished Modal -->
+        <div id="finished-modal" class="modal hidden">
+          <div class="modal-content">
+            <div class="modal-icon">🚀</div>
+            <h2 class="modal-title">Capture Finished!</h2>
+            <p id="finished-subtitle" class="modal-subtitle">Successfully sent to Figma</p>
+            <div class="modal-actions">
+              <button id="modal-download-btn" class="modal-btn primary">
+                💾 Download JSON
+              </button>
+              <button id="modal-close-btn" class="modal-btn secondary">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
-
-    <div class="capture-actions">
-      <button id="capture-btn" class="btn-primary" title="Capture the current page and send the data to Figma automatically">📸 Capture &amp; Send to Figma</button>
-      <button id="capture-download-btn" class="btn-secondary" title="Capture the page and download the raw JSON without sending to Figma">📸⬇️ Capture &amp; Download JSON</button>
-      <button id="capture-remote-btn" class="btn-outline" title="Use the headless capture service (Playwright/Puppeteer) for perfect assets">☁️📸 Server Capture (Playwright)</button>
-      <p class="capture-hint">Capture finishes and hands off to Figma automatically. Need the raw JSON? Use the download capture button or the download action below.</p>
-    </div>
-
-    <div class="actions hidden" id="actions">
-      <button id="send-to-figma-btn" class="btn-success">🚀 Send to Figma</button>
-      <button id="download-btn" class="btn-secondary">💾 Download JSON</button>
-    </div>
-  </div>
-  <script src="popup.js"></script>
-</body>
+    <script src="../three.min.js"></script>
+    <script src="popup.js"></script>
+  </body>
 </html>

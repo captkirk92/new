@@ -28,7 +28,9 @@ const imageTranscodeResolvers = new Map<
  */
 export function requestWebpTranscode(base64: string): Promise<Uint8Array> {
   if (!figma.ui) {
-    return Promise.reject(new Error('Figma UI not available for WebP transcode'));
+    return Promise.reject(
+      new Error("Figma UI not available for WebP transcode"),
+    );
   }
 
   const id = `webp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -36,13 +38,13 @@ export function requestWebpTranscode(base64: string): Promise<Uint8Array> {
   return new Promise<Uint8Array>((resolve, reject) => {
     const timeout = setTimeout(() => {
       webpResolvers.delete(id);
-      reject(new Error('WebP transcode timed out'));
+      reject(new Error("WebP transcode timed out"));
     }, 15000);
 
     webpResolvers.set(id, { resolve, reject, timeout });
 
     figma.ui.postMessage({
-      type: 'transcode-webp',
+      type: "transcode-webp",
       id,
       base64,
     });
@@ -55,11 +57,13 @@ export function requestWebpTranscode(base64: string): Promise<Uint8Array> {
  */
 export function requestImageTranscode(
   base64: string,
-  mimeType: string
+  mimeType: string,
+  targetWidth?: number,
+  targetHeight?: number,
 ): Promise<Uint8Array> {
   if (!figma.ui) {
     return Promise.reject(
-      new Error("Figma UI not available for image transcode")
+      new Error("Figma UI not available for image transcode"),
     );
   }
 
@@ -78,6 +82,8 @@ export function requestImageTranscode(
       id,
       base64,
       mimeType,
+      targetWidth,
+      targetHeight,
     });
   });
 }
@@ -99,18 +105,23 @@ export function handleWebpTranscodeResult(msg: any): void {
   }
 
   try {
-    const normalized = pngBase64.includes(',') ? pngBase64.split(',')[1] : pngBase64;
+    const normalized = pngBase64.includes(",")
+      ? pngBase64.split(",")[1]
+      : pngBase64;
     let bytes: Uint8Array;
-    if (typeof figma !== 'undefined' && typeof figma.base64Decode === 'function') {
+    if (
+      typeof figma !== "undefined" &&
+      typeof figma.base64Decode === "function"
+    ) {
       bytes = figma.base64Decode(normalized);
-    } else if (typeof atob === 'function') {
+    } else if (typeof atob === "function") {
       const bin = atob(normalized);
       bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) {
         bytes[i] = bin.charCodeAt(i);
       }
     } else {
-      throw new Error('No base64 decoder available');
+      throw new Error("No base64 decoder available");
     }
     entry.resolve(bytes);
   } catch (decodeError) {
@@ -135,9 +146,14 @@ export function handleImageTranscodeResult(msg: any): void {
   }
 
   try {
-    const normalized = pngBase64.includes(",") ? pngBase64.split(",")[1] : pngBase64;
+    const normalized = pngBase64.includes(",")
+      ? pngBase64.split(",")[1]
+      : pngBase64;
     let bytes: Uint8Array;
-    if (typeof figma !== "undefined" && typeof (figma as any).base64Decode === "function") {
+    if (
+      typeof figma !== "undefined" &&
+      typeof (figma as any).base64Decode === "function"
+    ) {
       bytes = (figma as any).base64Decode(normalized);
     } else if (typeof atob === "function") {
       const bin = atob(normalized);

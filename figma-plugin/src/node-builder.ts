@@ -1,4 +1,5 @@
 // Node Builder - Constructs Figma nodes from schema data
+import { FontManager } from "./font-manager";
 import { StyleManager } from "./style-manager";
 import { ComponentManager } from "./component-manager";
 import { ImportOptions } from "./import-options";
@@ -10,6 +11,7 @@ import {
   decomposeMatrix,
   ParsedTransform,
 } from "./transform-parser";
+import { fetchWithProxy } from "./utils/asset-proxy";
 import { ProfessionalLayoutSolver } from "./layout-solver";
 import {
   parseCssFilter,
@@ -21,10 +23,11 @@ import {
   ValidationIssueCode,
   FigmaNodeType,
 } from "../../shared/schema";
-
-// DEBUG FLAG: Show magenta placeholder fills when fill extraction fails
-// Set to true ONLY for debugging fill issues. OFF by default for pixel-perfect output.
-const DEBUG_SHOW_FILL_PLACEHOLDERS = false;
+import {
+  parseColorToRGBA,
+  type RGBA,
+  type RGB,
+} from "../../shared/color-utils";
 
 /**
  * Custom error for schema validation failures
@@ -352,7 +355,7 @@ interface ValidatedPaint {
   visible?: boolean;
   opacity?: number;
   blendMode?: BlendMode;
-  color?: RGBA;
+  color?: RGB;
   gradientTransform?: Transform;
   gradientStops?: ColorStop[];
   imageHash?: string;
@@ -382,7 +385,8 @@ interface ValidatedNodeData {
 
 export class NodeBuilder {
   private imageFetchCache = new Map<string, Uint8Array>();
-  private imagePaintCache = new Map<string, string>();
+  private imagePaintCache = new Map<string, string>(); // Maps asset hash -> Figma image hash
+  private imageObjectCache = new Map<string, Image>(); // Maps asset hash -> Figma Image object
   public assets: any;
   private fontCache = new Map<string, { family: string; style: string }>();
   // PHASE 2: Enhanced caching
@@ -402,6 +406,10 @@ export class NodeBuilder {
 
   private diagnostics: any;
 
+  // MEMORY SAFETY: When true, skip expensive layout intelligence analysis
+  // This is set for imports with 1000+ nodes to prevent WASM OOM crashes
+  public memorySafetyMode: boolean = false;
+
   constructor(
     private styleManager: StyleManager,
     private componentManager: ComponentManager,
@@ -410,6 +418,7 @@ export class NodeBuilder {
     private designTokensManager?: DesignTokensManager,
     private schema?: any,
     private diagnosticCollector?: any, // Use shared DiagnosticCollector
+    private fontManager?: FontManager,
   ) {
     this.assets = assets;
     // PIXEL-PERFECT: All geometry is captured in CSS pixels - no scaling needed
@@ -446,6 +455,134 @@ export class NodeBuilder {
   }
 
   /**
+   * Helper to retrieve the normalized Z-index from plugin data.
+   * Defaults to 0 if not found.
+   */
+  public getZIndex(node: SceneNode): number {
+    try {
+      const dataStr = node.getPluginData("cssZIndex");
+      if (dataStr) {
+        const data = JSON.parse(dataStr);
+        if (data && typeof data.normalized === "number") {
+          return data.normalized;
+        }
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+    return 0;
+  }
+
+  // Optimization: Shadow Tree to track child order without expensive bridge calls
+  private shadowChildren: Map<
+    string,
+    Array<{ node: SceneNode; zIndex: number }>
+  > = new Map();
+
+  /**
+   * Inserts a child node into a parent node at the correct index based on Z-index.
+   * Uses Shadow Tree optimization to avoid O(N^2) Figma bridge calls.
+   */
+  public insertChildByZIndex(
+    parent: BaseNode & ChildrenMixin,
+    child: SceneNode,
+  ): void {
+    const parentId = parent.id;
+    let list = this.shadowChildren.get(parentId);
+
+    if (!list) {
+      list = [];
+      this.shadowChildren.set(parentId, list);
+    }
+
+    const childZ = this.getZIndex(child);
+    let insertIndex = list.length; // Default to top
+
+    // HEURISTIC: Check if this child is a "Background Layer" that should be forced to the back
+    // This fixes issues where large container divs (with Z-Index 0) cover their own content
+    const isBackground = this.isLikelyBackgroundLayer(child, parent as any);
+
+    if (isBackground && childZ <= 0) {
+      // Force to bottom
+      insertIndex = 0;
+    } else {
+      // Standard Z-Index sorting using Shadow List (Fast JS access)
+      for (let i = 0; i < list.length; i++) {
+        const existingItem = list[i];
+        const existingZ = existingItem.zIndex;
+
+        // childZ < existingZ -> Insert before
+        if (childZ < existingZ) {
+          insertIndex = i;
+          break;
+        }
+      }
+    }
+
+    // Update Shadow Tree
+    list.splice(insertIndex, 0, { node: child, zIndex: childZ });
+
+    // Perform Actual Insertion
+    if (insertIndex >= parent.children.length) {
+      parent.appendChild(child);
+    } else {
+      parent.insertChild(insertIndex, child);
+    }
+  }
+
+  /**
+   * HEURISTIC: Determine if a node is likely a background layer that should be behind everything else.
+   * Criteria:
+   * 1. It is a FRAME or RECTANGLE.
+   * 2. It matches the parent's size (or very close).
+   * 3. It is positioned at/near (0,0).
+   * 4. It has fills (visual background).
+   * 5. (Optional) It has few or no children (not a layout wrapper, just a visual plane).
+   */
+  private isLikelyBackgroundLayer(
+    child: SceneNode,
+    parent: BaseNode & ChildrenMixin & LayoutMixin,
+  ): boolean {
+    // Only apply to Frame/Rectangle children of Frames
+    if (
+      (child.type !== "FRAME" && child.type !== "RECTANGLE") ||
+      parent.type !== "FRAME"
+    ) {
+      return false;
+    }
+
+    const parentWidth = parent.width;
+    const parentHeight = parent.height;
+
+    // Safety check for unsized parents
+    if (parentWidth === 0 || parentHeight === 0) return false;
+
+    // 1. Size Check (Approx > 95% match)
+    const sizeMatch =
+      child.width >= parentWidth * 0.95 && child.height >= parentHeight * 0.95;
+
+    // 2. Position Check (Near top-left)
+    const positionMatch = Math.abs(child.x) < 20 && Math.abs(child.y) < 20;
+
+    if (sizeMatch && positionMatch) {
+      // If it's a Frame, ensure it doesn't have many children (if it has children, it might be a wrapper, not just a bg)
+      if (child.type === "FRAME") {
+        // If it has many children, it's likely a content wrapper, NOT a background plane.
+        // Background planes usually have 0 children (just fill) or maybe 1 (overlay).
+        if (child.children.length > 2) return false;
+      }
+
+      // Ensure it actually has a visible fill to be a "covering" problem
+      if ("fills" in child && Array.isArray(child.fills)) {
+        const visibleFills = child.fills.filter((f) => f.visible !== false);
+        if (visibleFills.length > 0) return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * CRITICAL: Validate and sanitize node data to ensure Figma API compliance
    * This prevents silent failures from invalid properties and paint objects
    */
@@ -475,7 +612,10 @@ export class NodeBuilder {
     const dimensions = this.validateDimensions(rawWidth, rawHeight, nodeId);
 
     // PROFESSIONAL: Apply layout validation and correction
-    const correctedData = this.applyProfessionalLayoutValidation(data);
+    // MEMORY SAFETY: Skip expensive layout validation for large imports
+    const correctedData = this.memorySafetyMode
+      ? data
+      : this.applyProfessionalLayoutValidation(data);
 
     const validated: ValidatedNodeData = {
       id: nodeId,
@@ -490,7 +630,10 @@ export class NodeBuilder {
     };
 
     // Copy all other properties as-is, but sanitize critical paint arrays
+    // CRITICAL FIX: Merge property-by-property to avoid overwriting validated layout object
+    const validatedLayout = { ...validated.layout };
     Object.assign(validated, correctedData);
+    validated.layout = validatedLayout;
 
     // CRITICAL: Sanitize fills to remove schema-specific metadata
     if (data.fills && Array.isArray(data.fills)) {
@@ -540,7 +683,8 @@ export class NodeBuilder {
         : null,
       absoluteTransform2x3:
         "absoluteTransform" in node
-          ? (node as SceneNode & { absoluteTransform: Transform }).absoluteTransform
+          ? (node as SceneNode & { absoluteTransform: Transform })
+              .absoluteTransform
           : null,
       fillsActual: getNodeFills(node)?.length ?? 0,
       strokesActual: getNodeStrokes(node)?.length ?? 0,
@@ -837,7 +981,24 @@ export class NodeBuilder {
 
     // Type-specific normalization
     if (type === "SOLID" && paint.color) {
-      sanitized.color = this.validateColor(paint.color);
+      const colorData = this.validateColor(paint.color);
+      sanitized.color = { r: colorData.r, g: colorData.g, b: colorData.b };
+
+      // If the color had an alpha channel, and opacity isn't already explicitly set, use it
+      if (
+        colorData.a !== undefined &&
+        colorData.a !== 1 &&
+        sanitized.opacity === undefined
+      ) {
+        sanitized.opacity = colorData.a;
+      } else if (
+        colorData.a !== undefined &&
+        colorData.a !== 1 &&
+        sanitized.opacity !== undefined
+      ) {
+        // Multiply if both exist for maximum fidelity
+        sanitized.opacity *= colorData.a;
+      }
     }
 
     return sanitized;
@@ -868,7 +1029,8 @@ export class NodeBuilder {
         return {
           type: "SOLID",
           visible: true,
-          color: { r: 0.9, g: 0.9, b: 0.9, a: 0.5 },
+          color: { r: 0.9, g: 0.9, b: 0.9 },
+          opacity: 0.5,
         };
 
       default:
@@ -884,7 +1046,7 @@ export class NodeBuilder {
       type: "SOLID",
       visible: true,
       opacity: 1,
-      color: { r: 0.8, g: 0.8, b: 0.8, a: 1 },
+      color: { r: 0.8, g: 0.8, b: 0.8 },
     };
   }
 
@@ -895,9 +1057,9 @@ export class NodeBuilder {
     return (
       color &&
       typeof color === "object" &&
-      typeof color.r === "number" &&
-      typeof color.g === "number" &&
-      typeof color.b === "number" &&
+      Number.isFinite(color.r) &&
+      Number.isFinite(color.g) &&
+      Number.isFinite(color.b) &&
       color.r >= 0 &&
       color.r <= 1 &&
       color.g >= 0 &&
@@ -1112,6 +1274,10 @@ export class NodeBuilder {
       ["sohne-var", ["Inter", "Helvetica Neue", "Arial", "sans-serif"]],
       ["Sohne", ["Inter", "Helvetica Neue", "Arial", "sans-serif"]],
       ["Stripe Sans", ["Inter", "Helvetica Neue", "Arial", "sans-serif"]],
+      [
+        "ui-sans-serif",
+        ["Inter", "-apple-system", "system-ui", "Arial", "sans-serif"],
+      ],
     ]);
 
     // ENHANCED: Try the exact family first, then fallbacks
@@ -1275,7 +1441,10 @@ export class NodeBuilder {
     }
   }
 
-  async createNode(nodeData: any): Promise<SceneNode | null> {
+  async createNode(
+    nodeData: any,
+    parentAbsoluteBounds?: { x: number; y: number },
+  ): Promise<SceneNode | null> {
     if (!nodeData) return null;
 
     // SVG DEBUG LOGGER
@@ -1346,7 +1515,10 @@ export class NodeBuilder {
         return null;
       }
 
-      await this.afterCreate(node, nodeData, { reuseComponent: false });
+      await this.afterCreate(node, nodeData, {
+        reuseComponent: false,
+        parentAbsoluteBounds,
+      });
 
       if (nodeData.type === "COMPONENT") {
         const component = node as ComponentNode;
@@ -1375,7 +1547,7 @@ export class NodeBuilder {
     } catch (e) {
       console.error(
         `❌ [NODE_BUILDER] createNode failed for ${nodeData.type} ${nodeData.id}:`,
-        e,
+        e instanceof Error ? e.message : JSON.stringify(e, null, 2),
       );
       // FAILURE RECOVERY: Return a red fallback frame so the user sees *something*
       console.warn(`⚠️ [RECOVERY] Creating fallback node for ${nodeData.id}`);
@@ -1593,17 +1765,45 @@ export class NodeBuilder {
         : baseStyle;
 
       const originalFontFamily = fontFamily;
-      const strictCloneMode = this.options?.strictCloneMode ?? false;
+      const strictCloneMode = this.options?.strictCloneMode ?? true; // FIDELITY FIX: Default to true
 
       let fontLoadResult: { family: string; style: string } | null = null;
       if (strictCloneMode) {
         // Strict clone: only accept the exact requested font (no family fallback).
+
         try {
-          await figma.loadFontAsync({
-            family: fontFamily,
-            style: finalFontStyle,
-          });
-          fontLoadResult = { family: fontFamily, style: finalFontStyle };
+          if (this.fontManager) {
+            // [NEW] Use FontManager to find best match (fuzzy + weight mapping)
+            const weightNumeric =
+              typeof data.textStyle.fontWeight === "number"
+                ? data.textStyle.fontWeight
+                : 400;
+            const bestFont = await this.fontManager.findBestFont(
+              fontFamily,
+              baseStyle,
+              weightNumeric,
+              isItalic,
+            );
+
+            if (bestFont) {
+              await figma.loadFontAsync(bestFont);
+              fontLoadResult = bestFont;
+            } else {
+              // Try legacy exact load if manager found nothing
+              await figma.loadFontAsync({
+                family: fontFamily,
+                style: finalFontStyle,
+              });
+              fontLoadResult = { family: fontFamily, style: finalFontStyle };
+            }
+          } else {
+            // Legacy path (no manager)
+            await figma.loadFontAsync({
+              family: fontFamily,
+              style: finalFontStyle,
+            });
+            fontLoadResult = { family: fontFamily, style: finalFontStyle };
+          }
         } catch {
           fontLoadResult = null;
         }
@@ -1618,7 +1818,92 @@ export class NodeBuilder {
             { screenshotAssetId: data.screenshotAssetId || null },
           );
 
-          // Prefer capture-time pixel fallback (element screenshot) if provided.
+          // [PRIORITY 1] Try Safe Fallback First (Inter/Arial) to keep text editable
+          // We prefer slightly wrong font over a static image or missing text.
+          const SAFE_FALLBACKS = [
+            "Inter",
+            "Arial",
+            "Helvetica",
+            "Roboto",
+            "sans-serif",
+          ];
+          let loadedFallbackFont: FontName | null = null;
+
+          for (const fallbackFamily of SAFE_FALLBACKS) {
+            try {
+              // Try standard weights
+              const candidate = { family: fallbackFamily, style: "Regular" };
+              await figma.loadFontAsync(candidate);
+              loadedFallbackFont = candidate;
+              break;
+            } catch (e) {
+              // Try next
+            }
+          }
+
+          if (loadedFallbackFont) {
+            console.warn(
+              `⚠️ [STRICT CLONE] Missing font "${originalFontFamily}", falling back to safe font "${loadedFallbackFont.family}"`,
+            );
+
+            const textNode = figma.createText();
+            textNode.fontName = loadedFallbackFont;
+            textNode.characters = characters;
+
+            // Apply other known properties best-effort
+            const fallbackSize = data.textStyle?.fontSize || 12;
+            if (data.layout?.width) {
+              textNode.resize(
+                data.layout.width,
+                data.layout.height || fallbackSize * 1.5,
+              );
+            }
+            textNode.fontSize = Math.max(1, fallbackSize);
+
+            // Tint safely (red-ish to indicate it's not exact, or just black?)
+            // Let's keep it normal color so it looks "good enough", but add a plugin data flag.
+            // MEMORY SAFETY FIX: Sanitize fills to remove schema-specific properties that Figma's API rejects
+            if (data.fills && Array.isArray(data.fills)) {
+              try {
+                const sanitizedFills = this.sanitizePaintArray(
+                  data.fills,
+                  "fills",
+                  data.id || "text",
+                );
+                textNode.fills =
+                  sanitizedFills.length > 0
+                    ? (sanitizedFills as Paint[])
+                    : [{ type: "SOLID", color: { r: 0, g: 0, b: 0 } }];
+              } catch (e) {
+                console.warn(
+                  "  ⚠️ [TEXT] Failed to apply sanitized fills, falling back to black",
+                  e,
+                );
+                try {
+                  textNode.fills = [
+                    { type: "SOLID", color: { r: 0, g: 0, b: 0 } },
+                  ];
+                } catch (fallbackError) {
+                  console.error(
+                    "  ❌ [TEXT] Even fallback fill failed",
+                    fallbackError,
+                  );
+                }
+              }
+            } else {
+              textNode.fills = [{ type: "SOLID", color: { r: 0, g: 0, b: 0 } }];
+            }
+
+            this.safeSetPluginData(
+              textNode,
+              "strictCloneMissingFont",
+              `Original: ${originalFontFamily} ${finalFontStyle}`,
+            );
+
+            return textNode as any;
+          }
+
+          // [PRIORITY 2] Prefer capture-time pixel fallback (element screenshot) if provided.
           const screenshotId = data.screenshotAssetId;
           const screenshotAsset =
             screenshotId && this.assets?.images
@@ -1634,11 +1919,6 @@ export class NodeBuilder {
             base64Candidate.length > 0
           ) {
             try {
-              const bytes = await this.base64ToImageBytes(
-                base64Candidate,
-                false,
-              );
-              const image = figma.createImage(bytes);
               const targetWidth = Math.max(
                 this.roundForPixelPerfection(
                   data.layout?.width || data.absoluteLayout?.width || 100,
@@ -1651,6 +1931,14 @@ export class NodeBuilder {
                 ),
                 0.01,
               );
+
+              const image = await this.createFigmaImageFromAsset(
+                screenshotAsset,
+                screenshotId!,
+                targetWidth * 2,
+                targetHeight * 2,
+              );
+              if (!image) throw new Error("Failed to create fallback image");
 
               const imageFrame = figma.createFrame();
               imageFrame.name = `${data.name || "Text"} (strict clone raster)`;
@@ -1686,37 +1974,11 @@ export class NodeBuilder {
             }
           }
 
-          // No pixel fallback available: visible placeholder (strict clone cannot guarantee fidelity).
+          // If even safe fonts fail (unlikely), ONLY THEN do we revert to the rectangle.
           console.error(
-            `❌ [STRICT CLONE] Missing font and no screenshot fallback for ${originalFontFamily} ${finalFontStyle}`,
+            `❌ [STRICT CLONE] Critical: Missing original font AND all safe fallbacks for ${originalFontFamily}`,
           );
-          const placeholder = figma.createRectangle();
-          placeholder.name = `${
-            data.name || "Text"
-          } (missing font - strict clone)`;
-          placeholder.resize(
-            Math.max(
-              this.roundForPixelPerfection(data.layout?.width || 100),
-              0.01,
-            ),
-            Math.max(
-              this.roundForPixelPerfection(data.layout?.height || 20),
-              0.01,
-            ),
-          );
-          placeholder.fills = [
-            { type: "SOLID", color: { r: 1, g: 0.85, b: 0.85 } },
-          ];
-          placeholder.strokes = [
-            { type: "SOLID", color: { r: 0.8, g: 0.2, b: 0.2 } },
-          ];
-          placeholder.strokeWeight = 1;
-          this.safeSetPluginData(
-            placeholder,
-            "strictCloneMissingFont",
-            `${originalFontFamily} ${finalFontStyle}`,
-          );
-          return placeholder as any;
+          return null;
         }
       } else {
         // Non-strict mode: Try fonts from the stack first, then fall back to default chain.
@@ -1749,28 +2011,9 @@ export class NodeBuilder {
             { error: "All fallbacks failed" },
           );
           console.error(
-            `❌ Font loading failed completely for ${originalFontFamily}. Creating rectangle placeholder.`,
+            `❌ Font loading failed completely for ${originalFontFamily}. Dropping text node.`,
           );
-          const placeholder = figma.createRectangle();
-          placeholder.name = `${data.name || "Text"} (font failed)`;
-          placeholder.resize(
-            Math.max(
-              this.roundForPixelPerfection(data.layout?.width || 100),
-              0.01,
-            ),
-            Math.max(
-              this.roundForPixelPerfection(data.layout?.height || 20),
-              0.01,
-            ),
-          );
-          placeholder.fills = [
-            { type: "SOLID", color: { r: 0.9, g: 0.9, b: 0.9 } },
-          ];
-          placeholder.strokes = [
-            { type: "SOLID", color: { r: 0.7, g: 0.7, b: 0.7 } },
-          ];
-          placeholder.strokeWeight = 1;
-          return placeholder as any;
+          return null;
         }
       }
 
@@ -1899,11 +2142,14 @@ export class NodeBuilder {
       // CRITICAL FIX: Apply text fills from textStyle.fills (primary) or data.fills (fallback)
       // Text color is extracted into textStyle.fills in dom-extractor.ts:extractTypography
       if (data.textStyle?.fills?.length) {
-        text.fills = await this.convertFillsAsync(data.textStyle.fills);
+        text.fills = await this.convertFillsAsync(
+          data.textStyle.fills,
+          data.layout,
+        );
         // removed agent log block
       } else if (data.fills && data.fills.length > 0) {
         // Fallback: use node.fills if textStyle.fills is not available
-        text.fills = await this.convertFillsAsync(data.fills);
+        text.fills = await this.convertFillsAsync(data.fills, data.layout);
         // removed agent log block
       } else {
         // removed agent log block
@@ -2151,6 +2397,24 @@ export class NodeBuilder {
     const finalWidth = Math.max(targetWidth, 1);
     const finalHeight = Math.max(targetHeight, 1);
 
+    // CRITICAL FIX: Prevent vertical text wrapping for suspiciously narrow widths
+    // If the width is very small (< font size) but text is long, it's likely a capture error.
+    // Force WIDTH_AND_HEIGHT to let Figma calculate the natural width.
+    // Also handling cases where width is effectively 0 or 1 from capture defaults
+    if (
+      text.textAutoResize === "HEIGHT" &&
+      (finalWidth < (text.fontSize as number) || finalWidth < 5) &&
+      characters.length > 1
+    ) {
+      console.warn(
+        `⚠️ [TEXT] Detected potential vertical wrapping for "${characters.substring(
+          0,
+          10,
+        )}..." (width: ${finalWidth}, fontSize: ${text.fontSize}). Forcing WIDTH_AND_HEIGHT.`,
+      );
+      text.textAutoResize = "WIDTH_AND_HEIGHT";
+    }
+
     // CRITICAL: Apply sizing based on textAutoResize mode
     if (text.textAutoResize === "NONE") {
       // Fixed size - use exact dimensions
@@ -2214,6 +2478,74 @@ export class NodeBuilder {
       );
     }
 
+    // HIGH-FIDELITY: Hyperlink support
+    // Apply href from anchor tags to text nodes for prototype interactivity
+    if (data.hyperlink || data.href) {
+      try {
+        const href = data.hyperlink || data.href;
+        // Validate URL
+        if (
+          typeof href === "string" &&
+          href.length > 0 &&
+          !href.startsWith("javascript:")
+        ) {
+          // Apply hyperlink to entire text range
+          const hyperlink: HyperlinkTarget = {
+            type: "URL",
+            value: href,
+          };
+          text.setRangeHyperlink(0, text.characters.length, hyperlink);
+          console.log(
+            `🔗 [HYPERLINK] Applied link to "${data.name}": ${href.substring(0, 50)}...`,
+          );
+          this.safeSetPluginData(text, "hyperlink", href);
+        }
+      } catch (hyperlinkErr) {
+        console.warn(
+          `⚠️ [HYPERLINK] Failed to apply hyperlink to ${data.name}:`,
+          hyperlinkErr,
+        );
+      }
+    }
+
+    // HIGH-FIDELITY: Per-segment hyperlinks for inline links
+    // If text has inline segments with individual hrefs, apply them
+    if (data.hyperlinkSegments && Array.isArray(data.hyperlinkSegments)) {
+      for (const segment of data.hyperlinkSegments) {
+        try {
+          if (
+            segment.href &&
+            segment.start !== undefined &&
+            segment.end !== undefined
+          ) {
+            const hyperlink: HyperlinkTarget = {
+              type: "URL",
+              value: segment.href,
+            };
+            const start = Math.max(
+              0,
+              Math.min(segment.start, text.characters.length),
+            );
+            const end = Math.max(
+              start,
+              Math.min(segment.end, text.characters.length),
+            );
+            if (start < end) {
+              text.setRangeHyperlink(start, end, hyperlink);
+              console.log(
+                `🔗 [HYPERLINK] Applied inline link [${start}-${end}]: ${segment.href.substring(0, 30)}...`,
+              );
+            }
+          }
+        } catch (segmentErr) {
+          console.warn(
+            `⚠️ [HYPERLINK] Failed to apply segment hyperlink:`,
+            segmentErr,
+          );
+        }
+      }
+    }
+
     console.log(
       `📝 Created text node: "${characters.substring(0, 50)}${
         characters.length > 50 ? "..." : ""
@@ -2245,11 +2577,8 @@ export class NodeBuilder {
           segment.style.fontFamily ||
           (currentFont !== figma.mixed ? currentFont.family : "Inter");
 
-        let style = "Regular";
-        if (fontWeight >= 700) style = "Bold";
-        else if (fontWeight >= 600) style = "SemiBold";
-        else if (fontWeight >= 500) style = "Medium";
-        else if (fontWeight >= 300) style = "Light";
+        // FIDELITY FIX: Use proper font-weight mapping (100-900 range)
+        let style = this.mapFontWeight(fontWeight);
 
         if (isItalic) {
           style = style === "Regular" ? "Italic" : `${style} Italic`;
@@ -2403,7 +2732,7 @@ export class NodeBuilder {
 
     // Inline SVGs should be turned into vectors instead of rasterized images
     if (asset) {
-      const svgMarkup = this.extractSvgMarkup(asset);
+      const svgMarkup = await this.extractSvgMarkup(asset);
       if (svgMarkup) {
         try {
           const baseUrl = asset?.url || (this.assets as any)?.baseUrl;
@@ -2558,11 +2887,17 @@ export class NodeBuilder {
               `🔄 [LAST RESORT] Attempting to fetch image from URL: ${imageUrl}`,
             );
             // Use fetchImage which automatically routes external URLs to proxy
-            const bytes = await this.fetchImage(imageUrl);
-            const contentType = "image/png";
+            const { bytes, contentType: fetchedContentType } =
+              await this.fetchImage(imageUrl);
             const transcodedBytes = await this.transcodeIfUnsupportedRaster(
               bytes,
-              contentType,
+              fetchedContentType || "image/png",
+              data.layout?.width
+                ? Math.max(data.layout.width * 2, 1)
+                : undefined,
+              data.layout?.height
+                ? Math.max(data.layout.height * 2, 1)
+                : undefined,
             );
             const figmaImage = figma.createImage(transcodedBytes);
             const finalImagePaint: ImagePaint = {
@@ -2583,11 +2918,11 @@ export class NodeBuilder {
         } else {
           // No URL available, use the fallback
 
-          // CRITICAL FIX: Replace "empty" rectangle with a meaningful placeholder
-          // This ensures failed images are visible and debuggable
-          const placeholder = await this.createImagePlaceholder(data, hash);
-          rect.remove(); // Remove the empty rectangle
-          return placeholder;
+          // Image resolution failed. Keep the fallback rectangle.
+          console.warn(
+            `⚠️ Image missing for ${hash}, keeping fallback rectangle`,
+          );
+          return rect;
         }
 
         diagnostics.logIssue(
@@ -2658,71 +2993,6 @@ export class NodeBuilder {
     return rect;
   }
 
-  // NEW: Create a visible placeholder for failed images
-  private async createImagePlaceholder(
-    data: any,
-    hash: string | undefined,
-  ): Promise<FrameNode> {
-    const frame = figma.createFrame();
-    frame.name = `[MISSING] ${data.name || "Image"}`;
-    const width = Math.max(
-      this.roundForPixelPerfection(data.layout?.width || 1),
-      1,
-    );
-    const height = Math.max(
-      this.roundForPixelPerfection(data.layout?.height || 1),
-      1,
-    );
-    frame.resize(width, height);
-
-    // Light gray background to indicate missing content
-    frame.fills = [{ type: "SOLID", color: { r: 0.93, g: 0.93, b: 0.93 } }];
-
-    // Dashed border
-    frame.strokes = [{ type: "SOLID", color: { r: 0.8, g: 0.8, b: 0.8 } }];
-    (frame as any).strokeDashPattern = [4, 4];
-
-    // Apply corner radius if present
-    if (data.cornerRadius) {
-      this.applyCornerRadius(frame, data.cornerRadius);
-    }
-
-    try {
-      await figma.loadFontAsync({ family: "Inter", style: "Medium" });
-
-      // "IMAGE MISSING" label
-      const label = figma.createText();
-      label.characters = "IMAGE MISSING";
-      const fontSize = Math.max(10, Math.min(width, height) * 0.1);
-      label.fontSize = fontSize;
-      label.fills = [{ type: "SOLID", color: { r: 0.6, g: 0.6, b: 0.6 } }];
-
-      // Center the label
-      label.x = (width - label.width) / 2;
-      label.y = (height - label.height) / 2;
-      frame.appendChild(label);
-
-      // Hash info for debugging (smaller text)
-      if (hash && height > 40) {
-        await figma.loadFontAsync({ family: "Inter", style: "Regular" });
-        const hashText = figma.createText();
-        hashText.characters =
-          hash.substring(0, 12) + (hash.length > 12 ? "..." : "");
-        hashText.fontSize = Math.max(8, fontSize * 0.6);
-        hashText.fills = [{ type: "SOLID", color: { r: 0.7, g: 0.7, b: 0.7 } }];
-
-        hashText.x = (width - hashText.width) / 2;
-        hashText.y = label.y + label.height + 4;
-        frame.appendChild(hashText);
-      }
-    } catch (e) {
-      // Fallback if font load fails - just keep the gray box
-      console.warn("Failed to create placeholder text", e);
-    }
-
-    return frame;
-  }
-
   private async createVector(data: any): Promise<SceneNode | null> {
     const baseUrl =
       (this.assets as any)?.baseUrl ||
@@ -2739,11 +3009,11 @@ export class NodeBuilder {
         if (raw.startsWith("data:")) {
           const { payload, isBase64 } = this.extractDataUrlParts(raw);
           const decoded = isBase64
-            ? this.base64ToString(payload, { allowSvg: true })
+            ? await this.base64ToString(payload, { allowSvg: true })
             : this.safeDecodeUriComponent(payload);
           svgString = decoded.trim().startsWith("<") ? decoded : raw;
         } else if (!raw.startsWith("<")) {
-          svgString = this.base64ToString(raw, { allowSvg: true });
+          svgString = await this.base64ToString(raw, { allowSvg: true });
         }
 
         const needsInlining = /<use\b/i.test(svgString);
@@ -2847,7 +3117,10 @@ export class NodeBuilder {
   private async afterCreate(
     node: SceneNode,
     data: any,
-    meta: { reuseComponent: boolean },
+    meta: {
+      reuseComponent: boolean;
+      parentAbsoluteBounds?: { x: number; y: number };
+    },
   ): Promise<void> {
     // Helper to safely execute operations with isolated error handling
     const safeExec = async (opName: string, op: () => void | Promise<void>) => {
@@ -2903,7 +3176,7 @@ export class NodeBuilder {
       // SAFETY: Each operation wrapped for isolation - if one fails, others still run
       await safeExec("applyPositioning", () => {
         if (typeof this.applyPositioning === "function") {
-          this.applyPositioning(node, validatedData);
+          this.applyPositioning(node, validatedData, meta.parentAbsoluteBounds);
         }
       });
 
@@ -3204,6 +3477,11 @@ export class NodeBuilder {
     elementWidth: number,
     elementHeight: number,
   ): void {
+    // Check if professional transform was already applied to avoid double application
+    if (node.getPluginData("professionalTransformApplied") === "true") {
+      return;
+    }
+
     // Check if node has absoluteTransform data from new schema
     const absoluteTransform = data.absoluteTransform;
     if (!absoluteTransform) {
@@ -3232,19 +3510,36 @@ export class NodeBuilder {
     }
 
     // Apply the transform matrix directly to the Figma node
-    // Matrix format: [scaleX, skewY, skewX, scaleY, translateX, translateY]
     try {
-      // Convert to Figma's relativeTransform format
-      // Figma uses a 2x3 transform matrix: [[a, c, e], [b, d, f]]
+      // P0 FIDELITY FIX: Calculate correct translation accounting for transform-origin and static position
+      // CSS transforms pivot around transform-origin (default center), while Figma pivots around top-left (0,0).
+      // We must compensate for this pivot difference AND add the static layout position.
+
+      const staticX = data.layout?.x ?? 0;
+      const staticY = data.layout?.y ?? 0;
+
+      const ox = (origin?.x ?? 0.5) * elementWidth;
+      const oy = (origin?.y ?? 0.5) * elementHeight;
+
+      // Calculate adjusted translation
+      // tx_final = staticX + tx + originX * (1 - a) - originY * c
+      // ty_final = staticY + ty + originY * (1 - d) - originX * b
+      const tx_final = staticX + tx + ox * (1 - a) - oy * c;
+      const ty_final = staticY + ty + oy * (1 - d) - ox * b;
+
+      // Convert to Figma's relativeTransform format: [[a, c, tx], [b, d, ty]]
       const relativeTransform: Transform = [
-        [a, c, tx],
-        [b, d, ty],
+        [a, c, tx_final],
+        [b, d, ty_final],
       ];
 
       // Apply the transform
       if ("relativeTransform" in node) {
         (node as any).relativeTransform = relativeTransform;
-        console.log(`  ✅ Applied matrix transform:`, relativeTransform);
+        console.log(
+          `  ✅ Applied matrix transform with origin compensation:`,
+          relativeTransform,
+        );
       }
 
       // Store original local size for validation
@@ -3285,14 +3580,23 @@ export class NodeBuilder {
     matrix: number[],
     localSize?: { width: number; height: number },
   ): void {
-    const [a, b, c, d, tx, ty] = matrix;
+    const safeMatrix = matrix.map((v) => (Number.isFinite(v) ? v : 0));
+    const a = safeMatrix[0] ?? 1;
+    const b = safeMatrix[1] ?? 0;
+    const c = safeMatrix[2] ?? 0;
+    const d = safeMatrix[3] ?? 1;
+    const tx = safeMatrix[4] ?? 0;
+    const ty = safeMatrix[5] ?? 0;
 
     // Extract rotation from matrix
-    const rotation = Math.atan2(b, a);
-    if (rotation !== 0 && "rotation" in node) {
-      node.rotation = rotation;
+    const rotationRadians = Math.atan2(b, a);
+    if (rotationRadians !== 0 && "rotation" in node) {
+      const rotationDegrees = (rotationRadians * 180) / Math.PI;
+      // Figma rotation is in degrees clockwise.
+      // Math.atan2 returns radians, which we convert to degrees.
+      node.rotation = rotationDegrees;
       console.log(
-        `  🔄 Fallback: Applied rotation: ${(rotation * 180) / Math.PI}°`,
+        `  🔄 Fallback: Applied rotation: ${rotationDegrees.toFixed(2)}°`,
       );
     }
 
@@ -3311,8 +3615,10 @@ export class NodeBuilder {
 
     // Apply translation
     if (tx !== 0 || ty !== 0) {
-      node.x = (node.x || 0) + tx;
-      node.y = (node.y || 0) + ty;
+      const currentX = Number.isFinite(node.x) ? node.x : 0;
+      const currentY = Number.isFinite(node.y) ? node.y : 0;
+      node.x = currentX + tx;
+      node.y = currentY + ty;
       console.log(`  📍 Fallback: Applied translation: (${tx}, ${ty})`);
     }
   }
@@ -3501,28 +3807,71 @@ export class NodeBuilder {
   /**
    * PROFESSIONAL: Enhanced positioning with layout intelligence and hybrid strategies
    */
-  private applyPositioning(node: SceneNode, data: any) {
+
+  private applyPositioning(
+    node: SceneNode,
+    data: any,
+    parentAbsoluteBounds?: { x: number; y: number },
+  ) {
     try {
+      // CRITICAL FIX: Apply stacking context (z-index)
+      // This ensures the node has 'cssZIndex' data for sorting in the parent
+      this.applyStackingContext(node, data);
+
       if (data.layout) {
+        // ROOT CAUSE FIX: Do NOT modify data.layout in-place.
+        // Use local variables to calculate relative offsets.
+        let relX = data.layout.x ?? 0;
+        let relY = data.layout.y ?? 0;
+
+        if (
+          parentAbsoluteBounds &&
+          typeof parentAbsoluteBounds.x === "number" &&
+          typeof parentAbsoluteBounds.y === "number"
+        ) {
+          relX = relX - parentAbsoluteBounds.x;
+          relY = relY - parentAbsoluteBounds.y;
+        }
+
         // PROFESSIONAL: Analyze layout intelligence for optimal positioning strategy
+        // PROFESSIONAL: Analyze layout intelligence for optimal positioning strategy
+        // MEMORY SAFETY: Skip this expensive analysis for large imports to prevent OOM
         let layoutIntelligence;
-        try {
-          layoutIntelligence =
-            this.professionalLayoutSolver.analyzeLayoutIntelligence(data);
-        } catch (intellErr) {
-          const errMsg =
-            intellErr instanceof Error ? intellErr.message : String(intellErr);
-          // Only log errors
-          console.error(
-            `❌ [applyPositioning] analyzeLayoutIntelligence failed for ${data.name}: ${errMsg}`,
-          );
-          // Create minimal fallback
+        if (this.memorySafetyMode) {
+          // Minimal fallback - no expensive layout analysis
           layoutIntelligence = {
             inferredLayout: { layoutMode: "NONE" },
             confidenceScore: 0,
             hybridStrategy: { mode: "ABSOLUTE" },
-            fallbackStrategy: { mode: "ABSOLUTE", reasoning: "Error fallback" },
+            fallbackStrategy: {
+              mode: "ABSOLUTE",
+              reasoning: "Memory safety mode",
+            },
           };
+        } else {
+          try {
+            layoutIntelligence =
+              this.professionalLayoutSolver.analyzeLayoutIntelligence(data);
+          } catch (intellErr) {
+            const errMsg =
+              intellErr instanceof Error
+                ? intellErr.message
+                : String(intellErr);
+            // Only log errors
+            console.error(
+              `❌ [applyPositioning] analyzeLayoutIntelligence failed for ${data.name}: ${errMsg}`,
+            );
+            // Create minimal fallback
+            layoutIntelligence = {
+              inferredLayout: { layoutMode: "NONE" },
+              confidenceScore: 0,
+              hybridStrategy: { mode: "ABSOLUTE" },
+              fallbackStrategy: {
+                mode: "ABSOLUTE",
+                reasoning: "Error fallback",
+              },
+            };
+          }
         }
 
         // Apply professional hybrid positioning strategy
@@ -3536,15 +3885,19 @@ export class NodeBuilder {
           );
         }
 
-        // ENHANCED: Use comprehensive coordinate validation and normalization
+        // Use normalized coordinates from helper
         let coordResult;
         try {
-          coordResult = this.validateAndNormalizeCoordinates(data.layout);
+          // Pass the RELATIVE coordinates for normalization
+          coordResult = this.validateAndNormalizeCoordinates({
+            ...data.layout,
+            x: relX,
+            y: relY,
+          });
         } catch (err) {
-          // Silent fallback for validation errors to keep performance high
           coordResult = {
-            x: data.layout.x || 0,
-            y: data.layout.y || 0,
+            x: relX,
+            y: relY,
             width: data.layout.width || 100,
             height: data.layout.height || 100,
             isValid: true,
@@ -3651,7 +4004,12 @@ export class NodeBuilder {
         this.applyProfessionalTransform(node, data, x, y);
 
         // CRITICAL FIX: Always apply positioning if we have valid coordinates
+        // BUT skip if professional transform handled it (as it includes positioning)
+        const professionalTransformApplied =
+          node.getPluginData("professionalTransformApplied") === "true";
+
         if (
+          !professionalTransformApplied &&
           typeof x === "number" &&
           typeof y === "number" &&
           isFinite(x) &&
@@ -4265,7 +4623,10 @@ export class NodeBuilder {
             console.log(
               `  ✅ Processing ${data.fills.length} fills for ${data.name}`,
             );
-            const fillPaints = await this.convertFillsAsync(data.fills);
+            const fillPaints = await this.convertFillsAsync(
+              data.fills,
+              data.layout,
+            );
 
             // removed agent log block
 
@@ -4505,7 +4866,7 @@ export class NodeBuilder {
               visible: true,
             };
 
-            paints.push(await this.resolveImagePaint(imageFill));
+            paints.push(await this.resolveImagePaint(imageFill, data.layout));
           }
 
           // 3.5. CRITICAL FIX: If we have an early fallback color but no paints yet, apply it immediately
@@ -4687,41 +5048,10 @@ export class NodeBuilder {
                 isLikelyContainer &&
                 !hasExplicitTransparent
               ) {
-                // Only add placeholder if debug flag is enabled
-                if (DEBUG_SHOW_FILL_PLACEHOLDERS) {
-                  // Add visible magenta placeholder for debugging
-                  console.warn(
-                    `  🔴 [FILL PLACEHOLDER] Adding magenta placeholder for ${data.name} - fill extraction failed`,
-                    {
-                      hasStyle: !!data.style,
-                      styleBg: data.style?.backgroundColor,
-                      directBg: data.backgroundColor,
-                      fillColor: data.fillColor,
-                      cssVariables: data.cssVariables
-                        ? Object.keys(data.cssVariables).length
-                        : 0,
-                      inheritanceSource:
-                        data.colorInheritance?.backgroundColorSource,
-                      hasInheritanceFlags: !!data.inheritanceFlags,
-                      originalBackground:
-                        data.colorInheritance?.originalBackground,
-                    },
-                  );
-                  paints.push(
-                    figma.util.solidPaint(
-                      { r: 1, g: 0, b: 1 }, // Magenta - obvious for debugging
-                      {
-                        opacity: 0.3,
-                        visible: true,
-                      },
-                    ),
-                  );
-                } else {
-                  // Production mode: log once but don't affect visuals
-                  console.log(
-                    `  ⚪ [FILL] No fill found for ${data.name} - element stays transparent`,
-                  );
-                }
+                // Production mode: log once but don't affect visuals
+                console.log(
+                  `  ⚪ [FILL] No fill found for ${data.name} - element stays transparent`,
+                );
               } else {
                 // For elements that don't need fills (small, explicitly transparent), just log
                 console.log(
@@ -4784,7 +5114,31 @@ export class NodeBuilder {
               }
 
               // removed agent log block
-              (node as SceneNodeWithGeometry).fills = validPaints;
+              // PROACTIVE CRASH PREVENTION: Wrap assignment in try-catch
+              try {
+                (node as SceneNodeWithGeometry).fills = validPaints;
+              } catch (e) {
+                console.error(
+                  `❌ [ACCESSIBILITY] SAFETY: Failed to set fills for ${data.name}. This is likely due to invalid paint data escaping validation.`,
+                  e,
+                );
+                // Fallback to a safe known good fill (transparent or black) to prevent visual artifacts
+                try {
+                  (node as SceneNodeWithGeometry).fills = [
+                    {
+                      type: "SOLID",
+                      color: { r: 0, g: 0, b: 0 },
+                      opacity: 0,
+                      visible: true,
+                    },
+                  ]; // Safe fallback
+                } catch (fallbackError) {
+                  console.error(
+                    "  ❌ Even fallback fill failed - node might not support fills",
+                    fallbackError,
+                  );
+                }
+              }
               // removed agent log block
               console.log(
                 `  ✅ Applied ${validPaints.length} fill(s) to ${data.name} (computedBgTransparent: ${computedBgIsTransparent}, fillsInherited: ${fillsAreInherited}):`,
@@ -4989,6 +5343,26 @@ export class NodeBuilder {
       this.applyCornerRadius(node as any, data.cornerRadius);
     }
 
+    // HIGH-FIDELITY: Corner Smoothing (iOS-style rounded corners)
+    // Figma supports cornerSmoothing for premium rounded corner aesthetics
+    if ("cornerSmoothing" in node) {
+      if (data.cornerSmoothing !== undefined) {
+        // Direct value from schema (0-1 range)
+        (node as any).cornerSmoothing = Math.max(
+          0,
+          Math.min(1, data.cornerSmoothing),
+        );
+      } else if (
+        data.cornerRadius &&
+        typeof data.cornerRadius === "number" &&
+        data.cornerRadius > 0
+      ) {
+        // Auto-detect: Apply subtle smoothing (0.6) for any rounded corners
+        // This creates more natural-looking curves similar to iOS/macOS
+        (node as any).cornerSmoothing = 0.6;
+      }
+    }
+
     const existingEffects =
       "effects" in node ? [...((node as BlendMixin).effects || [])] : [];
     if (data.effects?.length && "effects" in node) {
@@ -5022,6 +5396,87 @@ export class NodeBuilder {
     }
     if (data.mixBlendMode && "blendMode" in node) {
       (node as any).blendMode = data.mixBlendMode;
+    }
+
+    // HIGH-FIDELITY: Stroke Cap (stroke-linecap CSS equivalent)
+    // Affects how line ends are drawn for strokes
+    if ("strokeCap" in node && data.strokeCap) {
+      const capMap: Record<string, StrokeCap> = {
+        butt: "NONE",
+        round: "ROUND",
+        square: "SQUARE",
+      };
+      const mappedCap = capMap[data.strokeCap.toLowerCase()];
+      if (mappedCap) {
+        (node as any).strokeCap = mappedCap;
+      }
+    } else if ("strokeCap" in node && data.strokes?.[0]?.strokeCap) {
+      (node as any).strokeCap = data.strokes[0].strokeCap;
+    }
+
+    // HIGH-FIDELITY: Stroke Join (stroke-linejoin CSS equivalent)
+    // Affects how corners are drawn where strokes meet
+    if ("strokeJoin" in node && data.strokeJoin) {
+      const joinMap: Record<string, StrokeJoin> = {
+        miter: "MITER",
+        round: "ROUND",
+        bevel: "BEVEL",
+      };
+      const mappedJoin = joinMap[data.strokeJoin.toLowerCase()];
+      if (mappedJoin) {
+        (node as any).strokeJoin = mappedJoin;
+      }
+    } else if ("strokeJoin" in node && data.strokes?.[0]?.strokeJoin) {
+      (node as any).strokeJoin = data.strokes[0].strokeJoin;
+    }
+
+    // HIGH-FIDELITY: Stroke Miter Limit
+    if ("strokeMiterLimit" in node && data.strokeMiterLimit !== undefined) {
+      (node as any).strokeMiterLimit = Math.max(1, data.strokeMiterLimit);
+    }
+
+    // HIGH-FIDELITY: Mask support (clip-path / mask CSS equivalent)
+    // If this node is marked as a mask, set isMask = true
+    if ("isMask" in node && data.isMask === true) {
+      (node as any).isMask = true;
+      console.log(`🎭 [MASK] Applied mask to ${data.name}`);
+    }
+
+    // HIGH-FIDELITY: clipsContent for overflow: hidden
+    // This is already partially handled but ensuring robustness
+    if ("clipsContent" in node) {
+      if (data.clipsContent !== undefined) {
+        (node as FrameNode).clipsContent = data.clipsContent;
+      } else if (
+        data.layoutContext?.overflow === "hidden" ||
+        data.layoutContext?.overflow === "scroll" ||
+        data.layoutContext?.overflow === "auto"
+      ) {
+        (node as FrameNode).clipsContent = true;
+      }
+    }
+
+    // HIGH-FIDELITY: Layout Grids (for design reference)
+    // Capture CSS Grid properties and store as layout grids
+    if (
+      "layoutGrids" in node &&
+      data.layoutGrids &&
+      Array.isArray(data.layoutGrids)
+    ) {
+      try {
+        (node as FrameNode).layoutGrids = data.layoutGrids;
+        console.log(
+          `📐 [GRID] Applied ${data.layoutGrids.length} layout grids to ${data.name}`,
+        );
+      } catch (e) {
+        console.warn(`⚠️ Failed to apply layout grids:`, e);
+      }
+    }
+
+    // HIGH-FIDELITY: Item Reverse Z-Index (for flex-direction: *-reverse)
+    if ("itemReverseZIndex" in node && data.itemReverseZIndex === true) {
+      (node as FrameNode).itemReverseZIndex = true;
+      console.log(`🔄 [LAYOUT] Applied reverse Z-index for ${data.name}`);
     }
   }
 
@@ -5386,7 +5841,32 @@ export class NodeBuilder {
         (node as any).opacity = opacity;
       }
     } else {
-      node.visible = true;
+      // DROPDOWN FIX: Check for common dropdown/popup classes and hide them by default
+      // This prevents "stacked" artifacts where absolute positioned menus all appear at once
+      const hiddenClasses = [
+        "dropdown-menu",
+        "dropdown-content",
+        "submenu",
+        "sub-menu",
+        "popup-content",
+        "tooltip-content",
+      ];
+      
+      const hasHiddenClass = data.cssClasses && data.cssClasses.some((cls: string) => 
+        hiddenClasses.includes(cls.toLowerCase())
+      );
+
+      // Check if aria-expanded is explicitly true (if we captured attributes)
+      const isExpanded = data.attributes && data.attributes["aria-expanded"] === "true";
+
+      if (hasHiddenClass && !isExpanded) {
+        node.visible = false;
+        console.log(
+          `🙈 [VISIBILITY] Hiding potential dropdown/popup "${node.name}" to prevent stacking artifacts`
+        );
+      } else {
+        node.visible = true;
+      }
     }
   }
 
@@ -5585,85 +6065,88 @@ export class NodeBuilder {
         backgrounds?.length || 0
       } backgrounds`,
     );
-    backgrounds?.forEach((layer, i) => {
-      const fill = layer?.fill || layer;
-      console.log(`  Background ${i}:`, {
-        layerType: layer?.type,
-        hasFill: !!layer?.fill,
-        fillType: fill?.type,
-        hasImageHash: !!fill?.imageHash,
-        imageHash: fill?.imageHash,
+    if (backgrounds) {
+      backgrounds.forEach((layer, i) => {
+        const fill = layer?.fill || layer;
+        console.log(`  Background ${i}:`, {
+          layerType: layer?.type,
+          hasFill: !!layer?.fill,
+          fillType: fill?.type,
+          hasImageHash: !!fill?.imageHash,
+          imageHash: fill?.imageHash,
+        });
       });
-    });
 
-    for (const layer of backgrounds) {
-      if (!layer) continue;
+      for (const layer of backgrounds) {
+        if (!layer) continue;
 
-      const fill = layer.fill || layer;
+        const fill = layer.fill || layer;
 
-      if (fill.type === "SOLID" && fill.color) {
-        const { r, g, b } = fill.color;
-        const opacity =
-          fill.opacity !== undefined ? fill.opacity : (fill.color.a ?? 1);
-        if (opacity <= 0) {
+        if (fill.type === "SOLID" && fill.color) {
+          const { r, g, b } = fill.color;
+          const opacity =
+            fill.opacity !== undefined ? fill.opacity : (fill.color.a ?? 1);
+          if (opacity <= 0) {
+            continue;
+          }
+          console.log(`  🎨 Converting SOLID background:`, {
+            r,
+            g,
+            b,
+            opacity,
+          });
+          paints.push(
+            figma.util.solidPaint(
+              { r, g, b },
+              {
+                opacity,
+                visible: fill.visible !== false,
+              },
+            ),
+          );
           continue;
         }
-        console.log(`  🎨 Converting SOLID background:`, {
-          r,
-          g,
-          b,
-          opacity,
-        });
-        paints.push(
-          figma.util.solidPaint(
-            { r, g, b },
-            {
-              opacity,
-              visible: fill.visible !== false,
-            },
-          ),
-        );
-        continue;
-      }
 
-      if (
-        (fill.type === "GRADIENT_LINEAR" || fill.type === "GRADIENT_RADIAL") &&
-        fill.gradientStops
-      ) {
-        console.log(
-          `  🌈 Converting ${fill.type} gradient with ${fill.gradientStops.length} stops`,
-        );
-        paints.push({
-          type: fill.type,
-          gradientStops: fill.gradientStops.map((stop: any) => {
-            const { r, g, b, a } = stop.color;
-            return {
-              position: stop.position,
-              color: { r, g, b, a },
-            };
-          }),
-          gradientTransform: fill.gradientTransform || [
-            [1, 0, 0],
-            [0, 1, 0],
-          ],
-          visible: fill.visible !== false,
-        } as GradientPaint);
-        continue;
-      }
-
-      if (fill.type === "IMAGE") {
-        paints.push(
-          await this.resolveImagePaintWithBackground(fill, layer, nodeLayout),
-        );
-        continue;
-      }
-
-      if (fill.type === "SVG") {
-        const svgPaint = await this.resolveSVGPaint(fill);
-        if (svgPaint) {
-          paints.push(svgPaint);
+        if (
+          (fill.type === "GRADIENT_LINEAR" ||
+            fill.type === "GRADIENT_RADIAL") &&
+          fill.gradientStops
+        ) {
+          console.log(
+            `  🌈 Converting ${fill.type} gradient with ${fill.gradientStops.length} stops`,
+          );
+          paints.push({
+            type: fill.type,
+            gradientStops: fill.gradientStops.map((stop: any) => {
+              const { r, g, b, a } = stop.color;
+              return {
+                position: stop.position,
+                color: { r, g, b, a },
+              };
+            }),
+            gradientTransform: fill.gradientTransform || [
+              [1, 0, 0],
+              [0, 1, 0],
+            ],
+            visible: fill.visible !== false,
+          } as GradientPaint);
+          continue;
         }
-        continue;
+
+        if (fill.type === "IMAGE") {
+          paints.push(
+            await this.resolveImagePaintWithBackground(fill, layer, nodeLayout),
+          );
+          continue;
+        }
+
+        if (fill.type === "SVG") {
+          const svgPaint = await this.resolveSVGPaint(fill);
+          if (svgPaint) {
+            paints.push(svgPaint);
+          }
+          continue;
+        }
       }
     }
 
@@ -5673,6 +6156,7 @@ export class NodeBuilder {
 
   private async convertFillsAsync(
     fills: any[],
+    nodeLayout?: { width: number; height: number },
     context?: { tokenId?: string; property?: string },
   ): Promise<Paint[]> {
     const paints: Paint[] = [];
@@ -5793,7 +6277,7 @@ export class NodeBuilder {
       }
 
       if (fill.type === "IMAGE") {
-        const imagePaint = await this.resolveImagePaint(fill);
+        const imagePaint = await this.resolveImagePaint(fill, nodeLayout);
         // CRITICAL: Validate that IMAGE fills result in IMAGE paints
         if (imagePaint.type === "IMAGE") {
           paints.push(imagePaint);
@@ -5870,51 +6354,39 @@ export class NodeBuilder {
   ): Promise<Paint> {
     const hash = fill.imageHash;
 
-    // Diagnostic logging for image resolution
-    console.log(`🔍 resolveImagePaintWithBackground called:`, {
-      hash,
-      hasAssets: !!this.assets,
-      hasImages: !!this.assets?.images,
-      hashFound: !!this.assets?.images?.[hash],
-      availableHashes: this.assets?.images
-        ? Object.keys(this.assets.images).slice(0, 5)
-        : [],
-    });
+    console.log(`🔍 resolveImagePaintWithBackground called:`, { hash });
 
     if (!hash) {
-      console.error(
-        `❌ resolveImagePaintWithBackground: No imageHash in fill:`,
-        fill,
-      );
       return figma.util.solidPaint({ r: 0.9, g: 0.9, b: 0.9 });
     }
 
-    // Try to resolve the image using the robust logic from resolveImagePaint
-    // We'll reuse the asset resolution part but handle the paint construction manually
     let imageHash: string | undefined;
     let image: Image | null = null;
 
-    // Check cache first
     if (this.imagePaintCache.has(hash)) {
       imageHash = this.imagePaintCache.get(hash)!;
     } else {
-      // 1. Try to find in assets
       if (this.assets?.images?.[hash]) {
         try {
           const asset = this.assets.images[hash];
-          image = await this.createFigmaImageFromAsset(asset, hash);
+          image = await this.createFigmaImageFromAsset(
+            asset,
+            hash,
+            nodeLayout?.width ? nodeLayout.width * 2 : undefined,
+            nodeLayout?.height ? nodeLayout.height * 2 : undefined,
+          );
 
-          // If asset exists but image creation failed (no data), try URL fallback from asset
           if (!image) {
             const assetUrl =
               asset.url || asset.originalUrl || asset.absoluteUrl;
             if (assetUrl && !assetUrl.startsWith("data:")) {
-              console.log(`  🔄 [BG FALLBACK] Trying asset URL: ${assetUrl}`);
               try {
-                const bytes = await this.fetchImage(assetUrl);
+                const { bytes, contentType } = await this.fetchImage(assetUrl);
                 const transcoded = await this.transcodeIfUnsupportedRaster(
                   bytes,
-                  "image/png",
+                  contentType || "image/png",
+                  nodeLayout?.width ? nodeLayout.width * 2 : undefined,
+                  nodeLayout?.height ? nodeLayout.height * 2 : undefined,
                 );
                 image = figma.createImage(transcoded);
               } catch (e) {
@@ -5923,65 +6395,38 @@ export class NodeBuilder {
             }
           }
         } catch (e) {
-          console.warn(
-            `  ⚠️ Failed to create image from asset ${hash} for background`,
-            e,
-          );
+          console.warn(`  ⚠️ Failed to create image from asset ${hash}`, e);
         }
       }
 
-      // 2. Fallback: If not in assets, or asset failed, try URL extraction
       if (!image) {
-        // Check if hash IS a URL
-        if (
-          hash.startsWith("http://") ||
-          hash.startsWith("https://") ||
-          hash.startsWith("data:")
-        ) {
-          console.log(
-            `  🔍 [BG] Hash is URL, fetching directly: ${hash.substring(
-              0,
-              50,
-            )}...`,
-          );
+        if (hash.startsWith("http") || hash.startsWith("data:")) {
           try {
-            let bytes: Uint8Array;
-            if (hash.startsWith("data:")) {
-              // Handle data URI
-              const matches = hash.match(/^data:([^;]+);base64,(.+)$/);
-              if (matches) {
-                const binary = atob(matches[2]);
-                bytes = new Uint8Array(binary.length);
-                for (let i = 0; i < binary.length; i++)
-                  bytes[i] = binary.charCodeAt(i);
-              } else {
-                bytes = await this.fetchImage(hash);
-              }
-            } else {
-              bytes = await this.fetchImage(hash);
-            }
+            const { bytes, contentType } = await this.fetchImage(hash);
             const transcoded = await this.transcodeIfUnsupportedRaster(
               bytes,
-              "image/png",
+              contentType || "image/png",
+              nodeLayout?.width ? nodeLayout.width * 2 : undefined,
+              nodeLayout?.height ? nodeLayout.height * 2 : undefined,
             );
             image = figma.createImage(transcoded);
           } catch (e) {
-            console.error(`  ❌ [BG] Direct URL fetch failed for ${hash}`, e);
+            console.warn(`  ❌ [BG] direct URL fetch failed for ${hash}`, e);
           }
         }
 
-        // Check if fill has URL
         if (!image && fill.url) {
-          console.log(`  🔍 [BG] Fetching from fill.url: ${fill.url}`);
           try {
-            const bytes = await this.fetchImage(fill.url);
+            const { bytes, contentType } = await this.fetchImage(fill.url);
             const transcoded = await this.transcodeIfUnsupportedRaster(
               bytes,
-              "image/png",
+              contentType || "image/png",
+              nodeLayout?.width ? nodeLayout.width * 2 : undefined,
+              nodeLayout?.height ? nodeLayout.height * 2 : undefined,
             );
             image = figma.createImage(transcoded);
           } catch (e) {
-            console.error(`  ❌ [BG] Fill URL fetch failed`, e);
+            console.warn(`  ❌ [BG] fill.url fetch failed`, e);
           }
         }
       }
@@ -5989,492 +6434,186 @@ export class NodeBuilder {
       if (image) {
         this.imagePaintCache.set(hash, image.hash);
         imageHash = image.hash;
-        console.log(
-          `✅ [BG] Successfully resolved background image: ${imageHash}`,
-        );
       } else {
-        console.error(`❌ [BG] Failed to resolve background image for ${hash}`);
         return {
           type: "SOLID",
-          color: { r: 0.9, g: 0.9, b: 0.9 },
-          opacity: 1,
+          color: { r: 0, g: 0, b: 0 },
+          opacity: 0,
         } as SolidPaint;
       }
     }
 
     const scaleMode = this.getScaleModeFromRepeat(layer.repeat);
-
     const imageTransform = this.calculateImageTransform(
       layer.position,
       layer.size,
       nodeLayout,
-      this.assets.images[hash],
+      this.assets?.images?.[hash],
     );
 
-    const paint: ImagePaint = {
+    return {
       type: "IMAGE",
       imageHash,
       scaleMode,
       visible: fill.visible !== false,
       ...(imageTransform && { imageTransform }),
-      ...(fill.rotation !== undefined && { rotation: fill.rotation }),
-      ...(fill.scalingFactor !== undefined && {
-        scalingFactor: fill.scalingFactor,
-      }),
-    };
-
-    return paint;
+    } as ImagePaint;
   }
 
-  async resolveImagePaint(fill: any): Promise<Paint> {
+  async resolveImagePaint(
+    fill: any,
+    nodeLayout?: { width: number; height: number },
+  ): Promise<Paint> {
     const hash = fill.imageHash;
 
-    console.log(`🖼️ [FIGMA IMPORT] Resolving image paint for hash: ${hash}`);
-
     if (!hash) {
-      console.error(
-        "❌ resolveImagePaint: No imageHash provided in fill:",
-        fill,
-      );
-      return {
-        type: "SOLID",
-        opacity: 0.5,
-      } as SolidPaint;
+      return { type: "SOLID", opacity: 0.5 } as SolidPaint;
     }
 
-    const resolveScaleMode = (): "FILL" | "FIT" | "CROP" | "TILE" => {
-      let scaleMode = fill.scaleMode || "FILL";
+    const buildImagePaint = (figmaImageHash: string): ImagePaint => {
+      let scaleMode: "FILL" | "FIT" | "CROP" | "TILE" =
+        fill.scaleMode || "FILL";
       if (fill.objectFit) {
         scaleMode = this.mapObjectFitToScaleMode(fill.objectFit);
       }
-      return scaleMode;
-    };
 
-    const resolveImageTransform = (): Transform | undefined => {
-      if (fill.imageTransform) return fill.imageTransform as Transform;
+      let imageTransform: Transform | undefined = fill.imageTransform;
+
+      // P1 FIX: Handle object-position for COVER/CONTAIN by switching to CROP + Transform
+      // Figma's FILL/FIT always centers the image. If object-position is not center,
+      // we must manually calculate the CROP transform to achieve the offset.
       if (
+        !imageTransform &&
+        fill.objectFit &&
         fill.objectPosition &&
-        fill.objectPosition !== "center center" &&
-        fill.objectPosition !== "50% 50%"
+        fill.objectPosition !== "center center"
       ) {
-        return this.parseObjectPositionToTransform(fill.objectPosition);
-      }
-      return undefined;
-    };
+        const asset = this.assets?.images?.[hash];
+        // We need natural dimensions to calculate correct crop
+        if (asset && asset.width && asset.height && nodeLayout) {
+          const posParts = fill.objectPosition.trim().split(/\s+/);
+          // Handle 1-value syntax (e.g. "left" -> "left center")
+          const positionObj = {
+            x: posParts[0] || "50%",
+            y: posParts[1] || (posParts.length === 1 ? "50%" : "50%"),
+          };
 
-    const buildImagePaint = (figmaImageHash: string): ImagePaint => {
-      const imageTransform = resolveImageTransform();
+          const calculated = this.calculateImageTransform(
+            positionObj,
+            { width: fill.objectFit, height: fill.objectFit }, // Pass fit as size keyword
+            nodeLayout,
+            { width: asset.width, height: asset.height },
+          );
+
+          if (calculated) {
+            scaleMode = "CROP";
+            imageTransform = calculated;
+            // console.log(`🖼️ [IMAGE] Converted ${fill.objectFit} + ${fill.objectPosition} to CROP`);
+          }
+        }
+      }
+
+      if (
+        !imageTransform &&
+        fill.objectPosition &&
+        fill.objectPosition !== "center center"
+      ) {
+        imageTransform = this.parseObjectPositionToTransform(
+          fill.objectPosition,
+        );
+      }
+
       return {
         type: "IMAGE",
         imageHash: figmaImageHash,
-        scaleMode: resolveScaleMode(),
+        scaleMode,
         visible: fill.visible !== false,
         ...(imageTransform && { imageTransform }),
       };
     };
 
-    // PHASE 1 OPTIMIZATION: Check pre-resolved images first (from parallel pre-loading)
-    if ((this as any).preResolvedImages?.has(hash)) {
-      const preResolvedPaint = (this as any).preResolvedImages.get(hash);
-      console.log(`  ✅ Using pre-resolved image paint for ${hash}`);
-      // If it's already an ImagePaint, return it directly
-      if (preResolvedPaint && preResolvedPaint.type === "IMAGE") {
-        return preResolvedPaint as ImagePaint;
-      }
-      // Otherwise, use it as-is (might be a fallback solid paint)
-      return preResolvedPaint as Paint;
-    }
-
-    // Check if we already have a Figma image hash cached
     if (this.imagePaintCache.has(hash)) {
-      console.log(`  ✅ Using cached Figma image hash for ${hash}`);
       return buildImagePaint(this.imagePaintCache.get(hash)!);
     }
 
     let image: Image | null = null;
-    let failureReason = "unknown";
 
-    // 1. Try to find in assets
     if (this.assets?.images?.[hash]) {
-      console.log(
-        `  📁 Found asset for hash ${hash}, attempting to create image`,
-      );
       try {
         const asset = this.assets.images[hash];
-
-        // CRITICAL: Check if asset has base64 data
-        const hasBase64 = !!(asset.data || asset.base64);
-        const assetUrl = asset.url || asset.originalUrl || asset.absoluteUrl;
-
-        console.log(
-          `  📊 Asset details: hasBase64=${hasBase64}, url=${
-            assetUrl ? assetUrl.substring(0, 60) + "..." : "none"
-          }`,
+        image = await this.createFigmaImageFromAsset(
+          asset,
+          hash,
+          nodeLayout?.width ? nodeLayout.width * 2 : undefined,
+          nodeLayout?.height ? nodeLayout.height * 2 : undefined,
         );
 
-        if (!hasBase64 && assetUrl) {
-          console.warn(
-            `  ⚠️ Asset exists but has no base64 data - will try URL fallback: ${assetUrl.substring(
-              0,
-              80,
-            )}...`,
-          );
-        }
-
-        image = await this.createFigmaImageFromAsset(asset, hash);
-        if (image) {
-          console.log(`  ✅ Successfully created image from asset`);
-        } else {
-          console.warn(
-            `  ⚠️ Asset exists but createFigmaImageFromAsset returned null`,
-          );
-          // Asset exists but image creation failed - try URL fallback immediately
-          if (assetUrl && assetUrl !== hash && !assetUrl.startsWith("data:")) {
-            console.log(
-              `  🔄 [IMMEDIATE FALLBACK] Trying asset URL: ${assetUrl.substring(
-                0,
-                80,
-              )}...`,
-            );
+        if (!image) {
+          const assetUrl = asset.url || asset.originalUrl || asset.absoluteUrl;
+          if (assetUrl && !assetUrl.startsWith("data:")) {
             try {
-              // Use fetchImage which automatically routes external URLs to proxy
-              const bytes = await this.fetchImage(assetUrl);
-              const contentType = "image/png";
-              const transcodedBytes = await this.transcodeIfUnsupportedRaster(
+              const { bytes, contentType } = await this.fetchImage(assetUrl);
+              const transcoded = await this.transcodeIfUnsupportedRaster(
                 bytes,
-                contentType,
+                contentType || "image/png",
+                nodeLayout?.width
+                  ? Math.max(nodeLayout.width * 2, 1)
+                  : undefined,
+                nodeLayout?.height
+                  ? Math.max(nodeLayout.height * 2, 1)
+                  : undefined,
               );
-              image = figma.createImage(transcodedBytes);
-              console.log(
-                `  ✅ Successfully fetched and created image from asset URL`,
-              );
-            } catch (urlError) {
-              const errorMsg =
-                urlError instanceof Error ? urlError.message : String(urlError);
-              console.warn(`  ⚠️ Asset URL fetch failed:`, errorMsg);
-              failureReason = `Asset URL fetch error: ${errorMsg}`;
+              image = figma.createImage(transcoded);
+            } catch (e) {
+              console.warn(`  ❌ [FILL FALLBACK] Asset URL fetch failed:`, e);
             }
-          } else {
-            console.warn(
-              `  ⚠️ Asset has no valid URL for fallback (url=${assetUrl})`,
-            );
-            failureReason = "Asset has no valid URL";
           }
         }
       } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        console.warn(
-          `  ⚠️ Failed to create image from asset ${hash}:`,
-          errorMsg,
-        );
-        failureReason = `Asset creation error: ${errorMsg}`;
+        console.warn(`  ⚠️ Failed to resolve image from asset ${hash}`, e);
       }
     } else {
-      console.warn(
-        `  ⚠️ No asset found for hash ${hash}, trying URL extraction`,
-      );
-
-      // CRITICAL FIX: If hash not found, try to extract URL from fill or hash itself
-      // This is the P0 Image Pipeline Fix
-
-      // Check if hash IS a URL (common in non-embedded mode)
-      if (hash.startsWith("http://") || hash.startsWith("https://")) {
-        console.log(`  🔍 Hash is a URL, attempting direct fetch`);
+      if (hash.startsWith("http") || hash.startsWith("data:")) {
         try {
-          const bytes = await this.fetchImage(hash);
-          const transcodedBytes = await this.transcodeIfUnsupportedRaster(
+          const { bytes, contentType } = await this.fetchImage(hash);
+          const transcoded = await this.transcodeIfUnsupportedRaster(
             bytes,
-            "image/png",
+            contentType || "image/png",
+            nodeLayout?.width ? Math.max(nodeLayout.width * 2, 1) : undefined,
+            nodeLayout?.height ? Math.max(nodeLayout.height * 2, 1) : undefined,
           );
-          image = figma.createImage(transcodedBytes);
-          console.log(`  ✅ Successfully fetched image from hash URL`);
-        } catch (urlError) {
-          console.error(`  ❌ Direct URL fetch failed for ${hash}`, urlError);
-        }
-      }
-
-      // Check if fill has URL
-      const fillUrl = fill.url;
-      if (
-        !image &&
-        fillUrl &&
-        (fillUrl.startsWith("http") || fillUrl.startsWith("data:"))
-      ) {
-        console.log(
-          `  🔍 Fill has URL, attempting fetch: ${fillUrl.substring(0, 60)}...`,
-        );
-        try {
-          const bytes = await this.fetchImage(fillUrl);
-          const transcodedBytes = await this.transcodeIfUnsupportedRaster(
-            bytes,
-            "image/png",
-          );
-          image = figma.createImage(transcodedBytes);
-          console.log(`  ✅ Successfully fetched image from fill URL`);
-        } catch (urlError) {
-          console.error(`  ❌ Fill URL fetch failed`, urlError);
-        }
-      }
-
-      // PIXEL-PERFECT FIX: Detect hash mismatch by comparing hash formats
-      const allAssetKeys = Object.keys(this.assets?.images || {});
-
-      if (allAssetKeys.length > 0) {
-        // Check if hash format is completely different
-        const hashPattern = hash.match(/^[0-9a-f]+$/i) ? "hex" : "other";
-        const assetPattern = allAssetKeys[0].match(/^[0-9a-f]+$/i)
-          ? "hex"
-          : "other";
-
-        if (hashPattern !== assetPattern) {
-          console.warn(
-            `  ⚠️ [HASH MISMATCH] Hash format mismatch: requested=${hashPattern}, assets=${assetPattern}`,
-          );
-        }
-      }
-
-      // Strategy 2: Try normalized hash (remove prefixes)
-      const normalizedHash = hash?.replace(/^(image:|img_)/, "");
-      if (!image && normalizedHash && this.assets?.images?.[normalizedHash]) {
-        console.log(`  🔍 Trying normalized hash: ${normalizedHash}`);
-        // Check if normalized hash was preloaded with a different key
-        if (this.imagePaintCache.has(normalizedHash)) {
-          console.log(`  ✅ Found preloaded image for normalized hash`);
-          const cachedFigmaHash = this.imagePaintCache.get(normalizedHash)!;
-          this.imagePaintCache.set(hash, cachedFigmaHash);
-          return buildImagePaint(cachedFigmaHash);
-        }
-        try {
-          const asset = this.assets.images[normalizedHash];
-          image = await this.createFigmaImageFromAsset(asset, normalizedHash);
-          console.log(`  ✅ Successfully created image from normalized hash`);
+          image = figma.createImage(transcoded);
         } catch (e) {
-          console.warn(`  ⚠️ Normalized hash also failed`, e);
+          console.warn(`  ❌ direct URL fetch failed for ${hash}`, e);
         }
       }
 
-      // Strategy 3: Case-insensitive lookup
-      if (!image && this.assets?.images) {
-        const lowerHash = hash?.toLowerCase();
-        for (const [key, value] of Object.entries(this.assets.images)) {
-          if (key.toLowerCase() === lowerHash) {
-            console.log(`  🔍 Found case-insensitive match: ${key}`);
-            // Check if this key was preloaded
-            if (this.imagePaintCache.has(key)) {
-              console.log(
-                `  ✅ Found preloaded image for case-insensitive match`,
-              );
-              const cachedFigmaHash = this.imagePaintCache.get(key)!;
-              this.imagePaintCache.set(hash, cachedFigmaHash);
-              return buildImagePaint(cachedFigmaHash);
-            }
-            try {
-              image = await this.createFigmaImageFromAsset(value, key);
-              console.log(
-                `  ✅ Successfully created image from case-insensitive match`,
-              );
-              break;
-            } catch (e) {
-              console.warn(`  ⚠️ Case-insensitive match also failed`, e);
-            }
-          }
-        }
-      }
-    }
-
-    // Strategy 4: Try fill.url if present (CRITICAL for Etsy lazy-loaded images)
-    if (!image && fill.url && fill.url !== hash) {
-      try {
-        console.log(
-          `🌐 [FIGMA] Attempting to fetch image from fill.url: ${fill.url}`,
-        );
-
-        // Use fetchImage which automatically routes external URLs to proxy
-        const bytes = await this.fetchImage(fill.url);
-        const contentType = "image/png"; // Proxy returns base64, assume PNG for transcoding
-        const transcodedBytes = await this.transcodeIfUnsupportedRaster(
-          bytes,
-          contentType,
-        );
-        image = figma.createImage(transcodedBytes);
-        console.log(`  ✅ Successfully created image from fill.url`);
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        console.warn(`  ❌ Failed to fetch from fill.url:`, errorMsg);
-        failureReason = `fetch error: ${errorMsg}`;
-      }
-    }
-
-    // Strategy 4.5: Also try asset URL if asset exists but image creation failed
-    if (!image && this.assets?.images?.[hash]) {
-      const asset = this.assets.images[hash];
-      const assetUrl = asset.url || asset.originalUrl || asset.absoluteUrl;
-      if (assetUrl && assetUrl !== hash && assetUrl !== fill.url) {
+      if (!image && fill.url) {
         try {
-          console.log(`🌐 [FIGMA] Trying asset URL as fallback: ${assetUrl}`);
-          // Use fetchImage which automatically routes external URLs to proxy
-          const bytes = await this.fetchImage(assetUrl);
-          const contentType = "image/png";
-          const transcodedBytes = await this.transcodeIfUnsupportedRaster(
+          const { bytes, contentType } = await this.fetchImage(fill.url);
+          const transcoded = await this.transcodeIfUnsupportedRaster(
             bytes,
-            contentType,
+            contentType || "image/png",
+            nodeLayout?.width ? Math.max(nodeLayout.width * 2, 1) : undefined,
+            nodeLayout?.height ? Math.max(nodeLayout.height * 2, 1) : undefined,
           );
-          image = figma.createImage(transcodedBytes);
-          console.log(`  ✅ Successfully fetched image from asset URL`);
+          image = figma.createImage(transcoded);
         } catch (e) {
-          console.warn(`  ❌ Asset URL fetch failed:`, e);
+          console.warn(`  ❌ fill.url fetch failed`, e);
         }
-      }
-    }
-
-    // Strategy 5: If not in assets, and hash looks like a URL, try to fetch it
-    if (!image && (hash.startsWith("http") || hash.startsWith("data:"))) {
-      try {
-        console.log(
-          `🌐 [FIGMA] Attempting to fetch image from hash URL: ${hash.substring(
-            0,
-            80,
-          )}...`,
-        );
-
-        let bytes: Uint8Array;
-        let contentType = "image/png";
-
-        if (hash.startsWith("data:")) {
-          // Parse data URL directly
-          const matches = hash.match(/^data:([^;]+);base64,(.+)$/);
-          if (matches && matches.length === 3) {
-            contentType = matches[1];
-            const binaryString = atob(matches[2]);
-            const len = binaryString.length;
-            bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-          } else {
-            // Fallback to fetch for malformed data URLs or non-base64
-            bytes = await this.fetchImage(hash);
-          }
-        } else {
-          // Use fetchImage which automatically routes external URLs to proxy
-          bytes = await this.fetchImage(hash);
-        }
-
-        const transcodedBytes = await this.transcodeIfUnsupportedRaster(
-          bytes,
-          contentType,
-        );
-        image = figma.createImage(transcodedBytes);
-        console.log(`  ✅ Successfully fetched image from hash URL`);
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        console.warn(`  ❌ Failed to fetch image from URL ${hash}:`, e);
-        failureReason = `URL fetch error: ${errorMsg}`;
       }
     }
 
     if (!image) {
-      // CRITICAL: Try one more time with all available asset keys (fuzzy matching)
-      if (this.assets?.images && !image) {
-        const allKeys = Object.keys(this.assets.images);
-        const hashSuffix = hash.slice(-8);
-        const candidates = allKeys.filter(
-          (key) => key.endsWith(hashSuffix) || hash.endsWith(key.slice(-8)),
-        );
-
-        // Deterministic guard: only accept fuzzy matching when there is exactly one candidate.
-        if (candidates.length === 1) {
-          const key = candidates[0];
-          console.log(`  🔍 Trying fuzzy hash match: ${key} for ${hash}`);
-          // Check if this key was preloaded
-          if (this.imagePaintCache.has(key)) {
-            console.log(`  ✅ Found preloaded image for fuzzy match`);
-            const cachedFigmaHash = this.imagePaintCache.get(key)!;
-            this.imagePaintCache.set(hash, cachedFigmaHash);
-            return buildImagePaint(cachedFigmaHash);
-          }
-          try {
-            const asset = this.assets.images[key];
-            image = await this.createFigmaImageFromAsset(asset, key);
-            if (image) {
-              console.log(
-                `  ✅ Found image via fuzzy match (unique candidate)`,
-              );
-              this.imagePaintCache.set(hash, image.hash);
-              this.imagePaintCache.set(key, image.hash);
-            }
-          } catch {
-            // ignore
-          }
-        } else if (candidates.length > 1) {
-          console.warn(
-            `  ⚠️ Ambiguous fuzzy image hash match for ${hash} (${candidates.length} candidates) - skipping fuzzy mapping to avoid wrong images`,
-          );
-        }
-      }
-
-      if (!image) {
-        console.error(
-          `❌ resolveImagePaint: Image hash "${hash}" not found in assets and fetch failed`,
-        );
-        console.error(
-          `  📊 Available asset keys (${
-            Object.keys(this.assets?.images || {}).length
-          } total):`,
-          Object.keys(this.assets?.images || {}).slice(0, 10),
-        );
-        diagnostics.logIssue(
-          "unknown",
-          "unknown",
-          "IMAGE",
-          `Image hash "${hash}" not found in assets and fetch failed`,
-          {
-            hash,
-            url: hash.startsWith("http") ? hash : undefined,
-            availableKeys: Object.keys(this.assets?.images || {}).length,
-          },
-          { result: "fallback to solid" },
-        );
-        // Return a more visible placeholder so missing images are obvious
-        return {
-          type: "SOLID",
-          color: { r: 1, g: 0.5, b: 0.5 }, // Light red to indicate missing image
-          opacity: 0.7,
-        } as SolidPaint;
-      }
+      return {
+        type: "SOLID",
+        color: { r: 0, g: 0, b: 0 },
+        opacity: 0,
+      } as SolidPaint;
     }
 
     this.imagePaintCache.set(hash, image.hash);
-    console.log(`✅ Created Figma image with hash: ${image.hash}`);
-
-    let scaleMode = fill.scaleMode || "FILL";
-    if (fill.objectFit) {
-      scaleMode = this.mapObjectFitToScaleMode(fill.objectFit);
-    }
-
-    // CRITICAL FIX: Use imageTransform from fill if provided, otherwise calculate from objectPosition
-    let imageTransform: Transform | undefined = undefined;
-    if (fill.imageTransform) {
-      // Use the pre-calculated transform from the schema
-      imageTransform = fill.imageTransform;
-    } else if (
-      fill.objectPosition &&
-      fill.objectPosition !== "center center" &&
-      fill.objectPosition !== "50% 50%"
-    ) {
-      // Calculate transform from objectPosition if not already provided
-      imageTransform = this.parseObjectPositionToTransform(fill.objectPosition);
-    }
-
-    const imagePaint: ImagePaint = {
-      type: "IMAGE",
-      imageHash: image.hash,
-      scaleMode,
-      visible: fill.visible !== false,
-      ...(imageTransform && { imageTransform }),
-    };
-
-    return imagePaint;
+    return buildImagePaint(image.hash);
   }
 
   async resolveSVGPaint(fill: any): Promise<Paint | null> {
@@ -6502,6 +6641,17 @@ export class NodeBuilder {
       return null;
     }
 
+    const cacheKey = `SVG:${svgRef}`;
+    if (this.imageObjectCache.has(cacheKey)) {
+      const image = this.imageObjectCache.get(cacheKey)!;
+      return {
+        type: "IMAGE",
+        imageHash: image.hash,
+        scaleMode: fill.scaleMode || "FILL",
+        visible: fill.visible !== false,
+      };
+    }
+
     try {
       // Create vector node from SVG markup
       const vectorNode = figma.createNodeFromSvg(svgAsset.svgCode);
@@ -6521,6 +6671,7 @@ export class NodeBuilder {
       });
 
       const image = figma.createImage(imageBytes);
+      this.imageObjectCache.set(cacheKey, image);
 
       // Clean up the temporary vector node
       vectorNode.remove();
@@ -6705,18 +6856,28 @@ export class NodeBuilder {
         hasChildren: data.children && data.children.length > 0,
       });
 
-      // Decode base64 data URL to Uint8Array
-      const base64Data = dataUrl.split(",")[1];
-      if (!base64Data) {
-        console.warn("[PHASE 5] Invalid dataUrl format - missing base64 data");
-        return;
+      // Check cache first
+      let image: Image;
+      if (this.imageObjectCache.has(dataUrl)) {
+        image = this.imageObjectCache.get(dataUrl)!;
+      } else {
+        // Decode base64 data URL to Uint8Array
+        const base64Data = dataUrl.split(",")[1];
+        if (!base64Data) {
+          console.warn(
+            "[PHASE 5] Invalid dataUrl format - missing base64 data",
+          );
+          return;
+        }
+
+        // Convert base64 to Uint8Array
+        const bytes = this.base64ToUint8Array(base64Data);
+
+        // Create Figma image from bytes
+        image = figma.createImage(bytes);
+        this.imageObjectCache.set(dataUrl, image);
       }
 
-      // Convert base64 to Uint8Array
-      const bytes = this.base64ToUint8Array(base64Data);
-
-      // Create Figma image from bytes
-      const image = figma.createImage(bytes);
       const imageHash = image.hash;
 
       // Create ImagePaint
@@ -7056,90 +7217,34 @@ export class NodeBuilder {
     return 0;
   }
 
-  private async fetchImageViaProxy(url: string): Promise<Uint8Array> {
-    // Try common handoff server URLs (prioritize 4411)
-    const handoffBases = ["http://127.0.0.1:4411", "http://localhost:4411"];
+  private async fetchImageViaProxy(
+    url: string,
+  ): Promise<{ bytes: Uint8Array; contentType?: string }> {
+    try {
+      const result = await fetchWithProxy(url);
 
-    for (const base of handoffBases) {
-      try {
-        const proxyUrl = `${base}/api/proxy?url=${encodeURIComponent(url)}`;
-        console.log(`  🔄 [PROXY] Attempting to fetch via proxy: ${base}`);
+      console.log(
+        `  ✅ [PROXY] Successfully fetched image via proxy (${result.bytes.length} bytes, type: ${result.contentType})`,
+      );
 
-        let signal: AbortSignal | undefined;
-        let timeoutId: any;
-        if (typeof AbortController !== "undefined") {
-          const controller = new AbortController();
-          timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
-          signal = controller.signal;
-        }
+      this.imageFetchCache.set(url, result.bytes);
+      // Note: we don't cache contentType in the bytes cache yet, but it's returned for immediate use
+      return result;
+    } catch (error) {
+      console.error(
+        `❌ [PROXY FAILED] All handoff server proxies failed for image fetch.`,
+      );
+      console.error(`   URL: ${url.substring(0, 60)}...`);
+      console.error(`   DIAGNOSIS:`);
+      console.error(
+        `     1. Ensure handoff server is running: node handoff-server.cjs`,
+      );
+      console.error(
+        `     2. Check server is accessible: curl http://localhost:4411/api/health`,
+      );
 
-        const fetchOptions: any = {
-          headers: {
-            Accept: "application/json",
-          },
-        };
-        if (signal) {
-          fetchOptions.signal = signal;
-        }
-
-        const response = await fetch(proxyUrl, fetchOptions);
-        if (timeoutId) clearTimeout(timeoutId);
-
-        if (response.ok) {
-          const data = (await response.json()) as {
-            ok?: boolean;
-            data?: string;
-            error?: string;
-          };
-          if (data.ok && data.data) {
-            // data.data is a data URL like "data:image/png;base64,..."
-            const base64Match = data.data.match(/^data:[^;]+;base64,(.+)$/);
-            if (base64Match) {
-              const base64 = base64Match[1];
-              // Convert base64 to Uint8Array
-              const bytes = this.base64ToUint8Array(base64);
-              console.log(
-                `  ✅ [PROXY] Successfully fetched image via ${base} (${bytes.length} bytes)`,
-              );
-              this.imageFetchCache.set(url, bytes);
-              return bytes;
-            } else {
-              console.warn(`  ⚠️ [PROXY] Invalid data format from ${base}`);
-            }
-          } else {
-            console.warn(
-              `  ⚠️ [PROXY] Server returned error:`,
-              data.error || "Unknown error",
-            );
-          }
-        } else {
-          console.warn(`  ⚠️ [PROXY] HTTP ${response.status} from ${base}`);
-        }
-      } catch (proxyError) {
-        const errorMsg =
-          proxyError instanceof Error ? proxyError.message : String(proxyError);
-        console.warn(`  ⚠️ [PROXY] Failed to connect to ${base}:`, errorMsg);
-        // Try next base URL
-        continue;
-      }
+      throw error;
     }
-
-    // PIXEL-PERFECT FIX: Add diagnostic message when all proxies fail
-    console.error(
-      `❌ [PROXY FAILED] All handoff server proxies failed for image fetch.`,
-    );
-    console.error(`   Attempted servers:`, handoffBases);
-    console.error(`   DIAGNOSIS:`);
-    console.error(
-      `     1. Ensure handoff server is running: node handoff-server.cjs`,
-    );
-    console.error(
-      `     2. Check server is accessible: curl http://localhost:4411/api/health`,
-    );
-    console.error(`     3. Check firewall/network settings`);
-    console.error(`     4. Check server logs for proxy errors`);
-
-    throw new Error(`All proxy attempts failed for ${url.substring(0, 60)}...`);
   }
 
   private isExternalUrl(url: string): boolean {
@@ -7151,9 +7256,11 @@ export class NodeBuilder {
     return url.startsWith("http://") || url.startsWith("https://");
   }
 
-  private async fetchImage(url: string): Promise<Uint8Array> {
+  private async fetchImage(
+    url: string,
+  ): Promise<{ bytes: Uint8Array; contentType?: string }> {
     if (this.imageFetchCache.has(url)) {
-      return this.imageFetchCache.get(url)!;
+      return { bytes: this.imageFetchCache.get(url)! };
     }
 
     // For external URLs, skip direct fetch and use proxy immediately (avoids CORS)
@@ -7173,7 +7280,7 @@ export class NodeBuilder {
       let timeoutId: any;
       if (typeof AbortController !== "undefined") {
         const controller = new AbortController();
-        timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
+        timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout (reduced)
         signal = controller.signal;
       }
 
@@ -7191,10 +7298,11 @@ export class NodeBuilder {
       if (timeoutId) clearTimeout(timeoutId);
 
       if (response.ok) {
+        const contentType = response.headers.get("content-type") || undefined;
         const arrayBuffer = await response.arrayBuffer();
         const bytes = new Uint8Array(arrayBuffer);
         this.imageFetchCache.set(url, bytes);
-        return bytes;
+        return { bytes, contentType };
       }
       throw new Error(`HTTP ${response.status}`);
     } catch (directError) {
@@ -7266,10 +7374,17 @@ export class NodeBuilder {
   private async transcodeIfUnsupportedRaster(
     bytes: Uint8Array,
     mimeHint?: string,
+    targetWidth?: number,
+    targetHeight?: number,
   ): Promise<Uint8Array> {
     const hint = (mimeHint || "").toLowerCase();
     if (this.isAvifBytes(bytes) || hint.includes("avif")) {
-      return requestImageTranscode(this.uint8ToBase64(bytes), "image/avif");
+      return requestImageTranscode(
+        this.uint8ToBase64(bytes),
+        "image/avif",
+        targetWidth,
+        targetHeight,
+      );
     }
     if (this.isWebpBytes(bytes) || hint.includes("webp")) {
       return this.transcodeWebpWithRetry(this.uint8ToBase64(bytes), 2);
@@ -7434,7 +7549,10 @@ export class NodeBuilder {
     }
 
     // YouTube video player needs precise positioning
-    if (data.htmlTag === "video" || data.name?.includes("video player")) {
+    if (
+      data.htmlTag === "video" ||
+      (data.name && data.name.includes("video player"))
+    ) {
       return true;
     }
 
@@ -7571,87 +7689,24 @@ export class NodeBuilder {
     }
 
     const trimmed = value.trim();
-    const lower = trimmed.toLowerCase();
+    const lower = trimmed.toLowerCase(); // parseColorToRGBA handles case
 
-    // Handle transparent/empty - return undefined (no color)
-    if (
-      lower === "transparent" ||
-      lower === "rgba(0, 0, 0, 0)" ||
-      lower === "rgba(0,0,0,0)" ||
-      trimmed === ""
-    ) {
-      this.colorParseCache.set(value, null);
-      return undefined;
-    }
-
-    // Handle hex colors (#rgb, #rrggbb, #rrggbbaa)
-    const hexMatch = /^#([0-9a-fA-F]{3,8})$/.exec(trimmed);
-    if (hexMatch) {
-      const h = hexMatch[1];
-      if (h.length === 3) {
-        const r = parseInt(h[0] + h[0], 16) / 255;
-        const g = parseInt(h[1] + h[1], 16) / 255;
-        const b = parseInt(h[2] + h[2], 16) / 255;
-        const result = { r, g, b, a: 1 };
-        this.colorParseCache.set(value, result);
-        return result;
-      }
-      if (h.length === 6) {
-        const r = parseInt(h.slice(0, 2), 16) / 255;
-        const g = parseInt(h.slice(2, 4), 16) / 255;
-        const b = parseInt(h.slice(4, 6), 16) / 255;
-        const result = { r, g, b, a: 1 };
-        this.colorParseCache.set(value, result);
-        return result;
-      }
-      if (h.length === 8) {
-        const r = parseInt(h.slice(0, 2), 16) / 255;
-        const g = parseInt(h.slice(2, 4), 16) / 255;
-        const b = parseInt(h.slice(4, 6), 16) / 255;
-        const a = parseInt(h.slice(6, 8), 16) / 255;
-        const result = { r, g, b, a };
-        this.colorParseCache.set(value, result);
-        return result;
-      }
-    }
-
-    // Handle rgb/rgba - more flexible regex to handle spaces and decimals
-    const rgbMatch =
-      /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i.exec(
-        trimmed,
-      );
-    if (rgbMatch) {
-      const r = Math.min(255, parseFloat(rgbMatch[1])) / 255;
-      const g = Math.min(255, parseFloat(rgbMatch[2])) / 255;
-      const b = Math.min(255, parseFloat(rgbMatch[3])) / 255;
-      const a = rgbMatch[4]
-        ? Math.max(0, Math.min(1, parseFloat(rgbMatch[4])))
-        : 1;
+    // Use shared parser for standard formats (hex, rgb, rgba, transparent)
+    const parsed = parseColorToRGBA(trimmed);
+    if (parsed) {
       // CRITICAL FIX: Only skip completely transparent colors
       // Match threshold with DOM extractor to prevent capture/import mismatches
-      if (a <= 0.001) return undefined;
-      const result = { r, g, b, a };
-      this.colorParseCache.set(value, result);
-      return result;
-    }
+      if (parsed.a <= 0.001) {
+        this.colorParseCache.set(value, null);
+        return undefined;
+      }
 
-    // Handle modern CSS rgb()/rgba() syntax: rgb(0 0 0 / 0.5)
-    const spaceRgbMatch =
-      /^rgba?\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+%?))?\s*\)$/i.exec(
-        trimmed,
-      );
-    if (spaceRgbMatch) {
-      const r = Math.min(255, parseFloat(spaceRgbMatch[1])) / 255;
-      const g = Math.min(255, parseFloat(spaceRgbMatch[2])) / 255;
-      const b = Math.min(255, parseFloat(spaceRgbMatch[3])) / 255;
-      const aRaw = spaceRgbMatch[4];
-      const a = aRaw
-        ? aRaw.endsWith("%")
-          ? Math.max(0, Math.min(1, parseFloat(aRaw) / 100))
-          : Math.max(0, Math.min(1, parseFloat(aRaw)))
-        : 1;
-      if (a <= 0.001) return undefined;
-      const result = { r, g, b, a };
+      const result = {
+        r: Math.round(parsed.r * 255) / 255,
+        g: Math.round(parsed.g * 255) / 255,
+        b: Math.round(parsed.b * 255) / 255,
+        a: parsed.a,
+      };
       this.colorParseCache.set(value, result);
       return result;
     }
@@ -7750,7 +7805,14 @@ export class NodeBuilder {
   private async createFigmaImageFromAsset(
     asset: any,
     hash: string,
+    targetWidth?: number,
+    targetHeight?: number,
   ): Promise<Image | null> {
+    // ⚡️ PERFORMANCE FIX: Check object cache first to avoid redundant decode/createImage calls
+    if (this.imageObjectCache.has(hash)) {
+      return this.imageObjectCache.get(hash)!;
+    }
+
     let base64Candidate: string | undefined =
       asset?.data || asset?.base64 || asset?.screenshot;
     const url = asset?.url;
@@ -7763,10 +7825,10 @@ export class NodeBuilder {
       asset?.contentType === "image/avif" ||
       (typeof url === "string" && url.toLowerCase().includes(".avif"));
     let isSvgAsset =
-      asset?.mimeType?.includes("svg") ||
-      asset?.contentType?.includes("svg") ||
+      (asset && asset.mimeType && asset.mimeType.includes("svg")) ||
+      (asset && asset.contentType && asset.contentType.includes("svg")) ||
       (typeof url === "string" && url.toLowerCase().includes(".svg")) ||
-      !!asset?.svgCode;
+      !!(asset && asset.svgCode);
 
     if (!isSvgAsset && base64Candidate) {
       const { payload, mimeTypeHint } =
@@ -7783,7 +7845,7 @@ export class NodeBuilder {
         let svgMarkup: string | null = asset?.svgCode || null;
         if (!svgMarkup && base64Candidate) {
           try {
-            svgMarkup = this.base64ToString(base64Candidate, {
+            svgMarkup = await this.base64ToString(base64Candidate, {
               allowSvg: true,
             });
           } catch (decodeError) {
@@ -7796,8 +7858,8 @@ export class NodeBuilder {
         if (!svgMarkup && url) {
           try {
             // Use fetchImage which automatically routes external URLs to proxy
-            const bytes = await this.fetchImage(url);
-            svgMarkup = this.uint8ToString(bytes);
+            const { bytes } = await this.fetchImage(url);
+            svgMarkup = await this.uint8ToString(bytes);
           } catch (fetchError) {
             console.warn("SVG fetch failed", fetchError);
           }
@@ -7805,10 +7867,14 @@ export class NodeBuilder {
 
         if (svgMarkup) {
           // Inline external <use> references so sprite-based icons render
+          // PERF-FIX: Yield before heavy SVG manipulation
+          await new Promise((r) => setTimeout(r, 0));
           const inlinedMarkup = await this.inlineSvgUsesInPlugin(
             svgMarkup,
             url,
           );
+          // PERF-FIX: Yield again before Figma's synchronous SVG parsing
+          await new Promise((r) => setTimeout(r, 0));
           const vectorRoot = figma.createNodeFromSvg(inlinedMarkup);
           // Resize to expected dimensions if provided
           if (
@@ -7819,9 +7885,13 @@ export class NodeBuilder {
           ) {
             vectorRoot.resize(asset.width, asset.height);
           }
+          // PERF-FIX: Yield before exportAsync (marks control back to Figma UI)
+          await new Promise((r) => setTimeout(r, 0));
           const pngBytes = await vectorRoot.exportAsync({ format: "PNG" });
           vectorRoot.remove();
-          return figma.createImage(pngBytes);
+          const image = figma.createImage(pngBytes);
+          this.imageObjectCache.set(hash, image);
+          return image;
         }
       } catch (svgError) {
         console.warn(
@@ -7845,7 +7915,12 @@ export class NodeBuilder {
           const payload = base64Candidate.includes(",")
             ? base64Candidate.split(",")[1]
             : base64Candidate;
-          imageBytes = await requestImageTranscode(payload, "image/avif");
+          imageBytes = await requestImageTranscode(
+            payload,
+            "image/avif",
+            targetWidth,
+            targetHeight,
+          );
         } else if (isWebpAsset) {
           // Keep existing WebP path (uses retries + UI canvas).
           imageBytes = await this.base64ToImageBytes(base64Candidate, true);
@@ -7857,6 +7932,8 @@ export class NodeBuilder {
           imageBytes = await this.transcodeIfUnsupportedRaster(
             imageBytes,
             mimeHint,
+            targetWidth,
+            targetHeight,
           );
         }
       } catch (error) {
@@ -7873,11 +7950,14 @@ export class NodeBuilder {
         console.log(
           `  🔄 [FIGMA] Asset has URL fallback, trying fetch: ${url}`,
         );
-        imageBytes = await this.fetchImage(url);
+        const { bytes: b, contentType: ct } = await this.fetchImage(url);
+        imageBytes = b;
         if (imageBytes?.length) {
           imageBytes = await this.transcodeIfUnsupportedRaster(
             imageBytes,
-            mimeHint,
+            ct || mimeHint,
+            targetWidth,
+            targetHeight,
           );
         }
         console.log(`  ✅ Fetched bytes from URL: ${imageBytes.length}`);
@@ -7901,6 +7981,7 @@ export class NodeBuilder {
 
     try {
       const image = figma.createImage(imageBytes);
+      this.imageObjectCache.set(hash, image);
       return image;
     } catch (error: any) {
       const message = error?.message || String(error);
@@ -7912,12 +7993,16 @@ export class NodeBuilder {
       if (url && !triedUrl) {
         try {
           triedUrl = true;
-          const fetched = await this.fetchImage(url);
+          const { bytes: fetchedBytes, contentType: fetchedContentType } =
+            await this.fetchImage(url);
           const supported = await this.transcodeIfUnsupportedRaster(
-            fetched,
-            mimeHint,
+            fetchedBytes,
+            fetchedContentType || mimeHint,
+            targetWidth,
+            targetHeight,
           );
           const image = figma.createImage(supported);
+          this.imageObjectCache.set(hash, image);
           console.log(`✅ createImage succeeded via URL fallback for ${hash}`);
           return image;
         } catch (urlFallbackError) {
@@ -7943,6 +8028,7 @@ export class NodeBuilder {
           }
           if (transBytes?.length) {
             const image = figma.createImage(transBytes);
+            this.imageObjectCache.set(hash, image);
             console.log(`✅ createImage succeeded after transcode for ${hash}`);
             return image;
           }
@@ -8017,14 +8103,47 @@ export class NodeBuilder {
 
   private normalizeBase64Payload(payload: string): string {
     if (typeof payload !== "string") return "";
-    let normalized = payload.replace(/\s/g, "");
-    normalized = this.safeDecodeUriComponent(normalized);
-    normalized = normalized.replace(/-/g, "+").replace(/_/g, "/");
-    normalized = normalized.replace(/[^A-Za-z0-9+/=]/g, "");
-    while (normalized.length % 4 !== 0) {
-      normalized += "=";
+
+    // PERF-FIX: Avoid multiple global regex passes on potentially huge strings.
+    // Instead, do a single pass to strip whitespace and data URL prefixes.
+    let cleanPayload = payload.trim();
+    if (cleanPayload.startsWith("data:")) {
+      const commaIndex = cleanPayload.indexOf(",");
+      if (commaIndex !== -1) {
+        cleanPayload = cleanPayload.substring(commaIndex + 1);
+      }
     }
-    return normalized;
+
+    // Single pass to remove all whitespace and invalid characters efficiently
+    // This is much faster than .replace(/\s/g, '').replace(/-/g, '+')...
+    let result = "";
+    for (let i = 0; i < cleanPayload.length; i++) {
+      const char = cleanPayload[i];
+      // Skip whitespace
+      if (char <= " ") continue;
+      // Normalize URL-safe base64
+      if (char === "-") {
+        result += "+";
+      } else if (char === "_") {
+        result += "/";
+      } else if (
+        (char >= "A" && char <= "Z") ||
+        (char >= "a" && char <= "z") ||
+        (char >= "0" && char <= "9") ||
+        char === "+" ||
+        char === "/" ||
+        char === "="
+      ) {
+        result += char;
+      }
+    }
+
+    // Ensure proper padding
+    while (result.length % 4 !== 0) {
+      result += "=";
+    }
+
+    return result;
   }
 
   private isSvgPayload(
@@ -8059,7 +8178,7 @@ export class NodeBuilder {
     return bytes;
   }
 
-  private extractSvgMarkup(asset: any): string | null {
+  private async extractSvgMarkup(asset: any): Promise<string | null> {
     const mimeHint = asset?.mimeType || asset?.contentType;
     const rawSource =
       typeof asset?.data === "string"
@@ -8085,7 +8204,7 @@ export class NodeBuilder {
         if (!isBase64 && combinedPayload.trim().startsWith("<")) {
           return combinedPayload;
         }
-        return this.base64ToString(combinedPayload, { allowSvg: true });
+        return await this.base64ToString(combinedPayload, { allowSvg: true });
       } catch (error) {
         console.warn("Failed to decode SVG data URL", error);
       }
@@ -8105,7 +8224,7 @@ export class NodeBuilder {
     }
 
     try {
-      return this.base64ToString(combinedPayload, { allowSvg: true });
+      return await this.base64ToString(combinedPayload, { allowSvg: true });
     } catch (error) {
       const decoded = this.safeDecodeUriComponent(combinedPayload);
       if (decoded.trim().startsWith("<")) {
@@ -8358,9 +8477,9 @@ export class NodeBuilder {
 
       if (
         typeof figma !== "undefined" &&
-        typeof figma.base64Decode === "function"
+        typeof (figma as any).base64Decode === "function"
       ) {
-        return figma.base64Decode(clean);
+        return (figma as any).base64Decode(clean);
       }
 
       if (typeof atob === "function") {
@@ -8411,17 +8530,11 @@ export class NodeBuilder {
     }
   }
 
-  /**
-   * Inline <use> references in an SVG by fetching external sprite symbols when needed.
-   * This helps logos/icons defined via sprite sheets render correctly.
-   */
   private async inlineSvgUsesInPlugin(
     svgMarkup: string,
     baseUrl?: string,
   ): Promise<string> {
     try {
-      // Figma plugin main thread does not reliably provide DOMParser; when missing,
-      // skip inlining and rely on capture-side inlining instead.
       if (typeof (globalThis as any).DOMParser !== "function") {
         return svgMarkup;
       }
@@ -8449,9 +8562,8 @@ export class NodeBuilder {
             if (spriteCache.has(absUrl)) {
               symbolDoc = spriteCache.get(absUrl)!;
             } else {
-              // Use fetchImage which automatically routes external URLs to proxy
-              const bytes = await this.fetchImage(absUrl);
-              const text = this.uint8ToString(bytes);
+              const { bytes } = await this.fetchImage(absUrl);
+              const text = await this.uint8ToString(bytes);
               symbolDoc = parser.parseFromString(text, "image/svg+xml");
               spriteCache.set(absUrl, symbolDoc);
             }
@@ -8503,7 +8615,7 @@ export class NodeBuilder {
     }
   }
 
-  private uint8ToString(bytes: Uint8Array): string {
+  private async uint8ToString(bytes: Uint8Array): Promise<string> {
     if (typeof TextDecoder !== "undefined") {
       try {
         return new TextDecoder("utf-8").decode(bytes);
@@ -8512,25 +8624,28 @@ export class NodeBuilder {
       }
     }
 
-    // Fallback: simple character conversion (efficient for large arrays)
     let result = "";
     const CHUNK_SIZE = 8192;
     for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+      // PERF-FIX: Yield to main thread every 256kb to avoid blocking rAF
+      if (i > 0 && i % 262144 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
       const chunk = bytes.subarray(i, i + CHUNK_SIZE);
       result += String.fromCharCode.apply(null, chunk as any);
     }
     return result;
   }
 
-  private base64ToString(
+  private async base64ToString(
     base64: string,
     options?: { allowSvg?: boolean },
-  ): string {
+  ): Promise<string> {
     const normalized = base64.includes(",") ? base64.split(",")[1] : base64;
     const clean = normalized.replace(/\s/g, "");
 
     const bytes = this.base64ToUint8Array(clean, options?.allowSvg === true);
-    return this.uint8ToString(bytes);
+    return await this.uint8ToString(bytes);
   }
 
   private mapFontWeight(weight: number): string {
@@ -8585,6 +8700,25 @@ export class NodeBuilder {
         finalY += ty;
       }
 
+      // HIGH FIDELITY FIX: Use relativeTransform if supported to preserve skew/scale/rotation precisely
+      if ("relativeTransform" in node) {
+        try {
+          (node as any).relativeTransform = [
+            [a, c, finalX],
+            [b, d, finalY],
+          ];
+          // If we use relativeTransform, we don't need manual x/y/rotation/resize
+          // But we DO need to ensure the node is at its untransformed size
+          if ("resize" in node) {
+            (node as LayoutMixin).resize(layout.width, layout.height);
+          }
+          return;
+        } catch (e) {
+          console.warn(`Failed to apply relativeTransform in fallback:`, e);
+          // Continue to manual decomposition fallback
+        }
+      }
+
       node.x = finalX;
       node.y = finalY;
 
@@ -8600,8 +8734,9 @@ export class NodeBuilder {
       }
 
       if ("rotation" in node && this.shouldApplyRotation(matrix)) {
-        const rotation = Math.atan2(b, a);
-        (node as any).rotation = rotation;
+        const rotationRadians = Math.atan2(b, a);
+        const rotationDegrees = (rotationRadians * 180) / Math.PI;
+        (node as any).rotation = rotationDegrees;
       }
 
       if ("resize" in node && this.shouldApplyScale(matrix)) {
@@ -8643,12 +8778,14 @@ export class NodeBuilder {
         );
       }
     } else if (matrix.length === 16) {
-      const tx = matrix[12] || 0;
-      const ty = matrix[13] || 0;
-      const tz = matrix[14] || 0;
+      const tx = Number.isFinite(matrix[12]) ? matrix[12] : 0;
+      const ty = Number.isFinite(matrix[13]) ? matrix[13] : 0;
+      const tz = Number.isFinite(matrix[14]) ? matrix[14] : 0;
 
-      node.x = layout.x + tx;
-      node.y = layout.y + ty;
+      const safeX = Number.isFinite(layout.x) ? layout.x : 0;
+      const safeY = Number.isFinite(layout.y) ? layout.y : 0;
+      node.x = safeX + tx;
+      node.y = safeY + ty;
 
       this.safeSetPluginData(
         node,
@@ -8902,13 +9039,13 @@ export class NodeBuilder {
             console.log(
               `🔄 [PROFESSIONAL TRANSFORM] Applied relativeTransform matrix`,
             );
-            return; // Skip regular positioning since transform handles it
             // Mark as professionally transformed to prevent double application
             this.safeSetPluginData(
               node,
               "professionalTransformApplied",
               "true",
             );
+            return; // Skip regular positioning since transform handles it
           }
         }
       } catch (error) {
@@ -9030,7 +9167,10 @@ export class NodeBuilder {
         this.professionalLayoutSolver.analyzeLayoutIntelligence(correctedData);
 
       // Apply intelligent corrections based on layout analysis
-      if (layoutIntelligence.confidenceScore > 0.8) {
+      // STRICTER THRESHOLD: 0.9 (was 0.8 during investigation)
+      // If we are not 90% sure, we MUST fallback to absolute positioning to prevent
+      // vertical stacking glitches on complex layouts.
+      if (layoutIntelligence.confidenceScore > 0.9) {
         console.log(
           `🏆 [LAYOUT VALIDATION] High confidence layout detected (${(
             layoutIntelligence.confidenceScore * 100
@@ -9072,13 +9212,21 @@ export class NodeBuilder {
             layoutIntelligence.inferredLayout.layoutWrap;
         }
       } else {
-        console.log(
-          `🔍 [LAYOUT VALIDATION] Low confidence layout (${(
+        console.error(
+          `🚫 [LAYOUT VALIDATION] Low confidence layout (${(
             layoutIntelligence.confidenceScore * 100
-          ).toFixed(1)}%) - using fallback strategy: ${
+          ).toFixed(
+            1,
+          )}%) - REVOKING AUTO LAYOUT to prevent collapse. Strategy: ${
             layoutIntelligence.fallbackStrategy.mode
           }`,
         );
+
+        // NUCLEAR OPTION: If confidence is low, strictly FORBID Auto Layout.
+        // This prevents "Vertical Stacking" of desktop pages.
+        if (correctedData.autoLayout) {
+          delete correctedData.autoLayout;
+        }
 
         // Apply fallback strategy
         switch (layoutIntelligence.fallbackStrategy.mode) {

@@ -44,6 +44,26 @@ const DEFAULT_OPTIONS: AssetCompletenessOptions = {
 };
 
 /**
+ * Check if the current page URL is capturable via CDP/captureVisibleTab.
+ * Chrome blocks CDP attachment to certain URL schemes for security.
+ */
+function isCapturablePageUrl(): boolean {
+  const protocol = window.location.protocol;
+  const restrictedProtocols = [
+    "chrome-extension:",
+    "chrome:",
+    "edge:",
+    "about:",
+    "data:",
+    "javascript:",
+    "file:",
+    "view-source:",
+    "chrome-search:",
+  ];
+  return !restrictedProtocols.includes(protocol);
+}
+
+/**
  * Asset Completeness Validator
  *
  * Guarantees that every imageHash in the schema has embedded bytes.
@@ -140,11 +160,12 @@ export class AssetCompletenessValidator {
    */
   findMissingAssets(
     referencedHashes: Set<string>,
-    assets: Record<string, any>
+    assets: Record<string, any>,
   ): string[] {
     const missing: string[] = [];
 
-    for (const hash of referencedHashes) {
+    // TS Fix: Convert Set iteration to Array
+    for (const hash of Array.from(referencedHashes)) {
       const asset = assets[hash];
 
       // Check for embedded bytes (base64 or data field)
@@ -161,7 +182,7 @@ export class AssetCompletenessValidator {
         if (this.options.logVerbose) {
           const reason = !asset ? "NO_ASSET_ENTRY" : "EMPTY_BYTES";
           console.warn(
-            `⚠️ [ASSET_COMPLETENESS] Missing bytes for hash: ${hash} (${reason})`
+            `⚠️ [ASSET_COMPLETENESS] Missing bytes for hash: ${hash} (${reason})`,
           );
 
           if (asset) {
@@ -191,8 +212,14 @@ export class AssetCompletenessValidator {
   async captureElementAsRaster(
     element: Element,
     width: number,
-    height: number
+    height: number,
   ): Promise<{ base64: string; mimeType: string } | null> {
+    // Early exit for non-capturable URLs (chrome-extension://, chrome://, etc.)
+    // CDP/captureVisibleTab always fails on these URLs - skip to avoid runaway loops
+    if (!isCapturablePageUrl()) {
+      return null;
+    }
+
     try {
       // Strategy 1: For images, try direct canvas draw (fastest if same-origin)
       if (element instanceof HTMLImageElement) {
@@ -210,7 +237,7 @@ export class AssetCompletenessValidator {
 
             if (base64 && base64.length > 100) {
               console.log(
-                `✅ [RASTER] Captured image element via canvas: ${base64.length} bytes`
+                `✅ [RASTER] Captured image element via canvas: ${base64.length} bytes`,
               );
               return { base64, mimeType: "image/png" };
             }
@@ -218,7 +245,7 @@ export class AssetCompletenessValidator {
         } catch (e) {
           // Tainted canvas - continue to CDP capture
           console.warn(
-            `⚠️ [RASTER] Canvas draw failed (CORS), trying CDP capture...`
+            `⚠️ [RASTER] Canvas draw failed (CORS), trying CDP capture...`,
           );
         }
       }
@@ -251,7 +278,7 @@ export class AssetCompletenessValidator {
         const result = await this.captureElementViaCDP(clipRect);
         if (result) {
           console.log(
-            `✅ [RASTER] Captured element via CDP screenshot: ${result.base64.length} bytes`
+            `✅ [RASTER] Captured element via CDP screenshot: ${result.base64.length} bytes`,
           );
           return result;
         }
@@ -300,7 +327,7 @@ export class AssetCompletenessValidator {
               const base64 = dataUrl.split(",")[1];
               if (base64 && base64.length > 100) {
                 console.log(
-                  `✅ [RASTER] Captured via SVG foreignObject: ${base64.length} bytes`
+                  `✅ [RASTER] Captured via SVG foreignObject: ${base64.length} bytes`,
                 );
                 resolve({ base64, mimeType: "image/png" });
               } else {
@@ -338,12 +365,17 @@ export class AssetCompletenessValidator {
     height: number;
     scale?: number;
   }): Promise<{ base64: string; mimeType: string } | null> {
+    // Early exit for non-capturable URLs - CDP always fails on chrome-extension://, etc.
+    if (!isCapturablePageUrl()) {
+      return null;
+    }
+
     try {
       // Request CDP clip capture from background script
       const response: any = await new Promise((resolve, reject) => {
         const timeout = setTimeout(
           () => reject(new Error("CDP capture timeout")),
-          5000
+          5000,
         );
 
         chrome.runtime.sendMessage(
@@ -364,7 +396,7 @@ export class AssetCompletenessValidator {
             } else {
               resolve(response);
             }
-          }
+          },
         );
       });
 
@@ -407,15 +439,15 @@ export class AssetCompletenessValidator {
       { nodeId: string; url?: string; element?: Element }
     >,
     fetchViaBackground: (
-      url: string
-    ) => Promise<{ base64: string; mimeType?: string } | null>
+      url: string,
+    ) => Promise<{ base64: string; mimeType?: string } | null>,
   ): Promise<string[]> {
     const fixedHashes: string[] = [];
 
     // Phase 1: Tier A (Parallel Fetch)
     // We can fetch many images at once via background script
     console.log(
-      `🔄 [ASSET_FIX] Phase 1: Parallel Fetch (Tier A) for ${missingHashes.length} assets...`
+      `🔄 [ASSET_FIX] Phase 1: Parallel Fetch (Tier A) for ${missingHashes.length} assets...`,
     );
     const FETCH_BATCH_SIZE = 10;
     for (let i = 0; i < missingHashes.length; i += FETCH_BATCH_SIZE) {
@@ -432,15 +464,27 @@ export class AssetCompletenessValidator {
                 assets[hash].base64 = result.base64;
                 assets[hash].data = result.base64;
                 assets[hash].mimeType = result.mimeType || "image/png";
+                // Preserve URL for plugin fallback
+                assets[hash].url = nodeInfo.url;
+                assets[hash].originalUrl = nodeInfo.url;
                 this.metrics.successfullyEmbedded++;
                 this.metrics.totalEmbeddedBytes += result.base64.length;
                 fixedHashes.push(hash);
+              } else {
+                // Fetch returned no base64 - still preserve URL for plugin to try proxy
+                if (!assets[hash]) assets[hash] = { id: hash };
+                assets[hash].url = nodeInfo.url;
+                assets[hash].originalUrl = nodeInfo.url;
               }
             } catch (e) {
               this.recordFailureReason("Fetch failed");
+              // Fetch failed - still preserve URL for plugin to try proxy
+              if (!assets[hash]) assets[hash] = { id: hash };
+              assets[hash].url = nodeInfo.url;
+              assets[hash].originalUrl = nodeInfo.url;
             }
           }
-        })
+        }),
       );
       if (i > 0 && i % 50 === 0) console.log(`   Processed ${i} fetches...`);
     }
@@ -448,11 +492,11 @@ export class AssetCompletenessValidator {
     // Phase 2: Tier B (Serial Rasterization)
     // CDP debugger cannot be shared easily, so we rasterize serially
     const remainingToFix = missingHashes.filter(
-      (h) => !fixedHashes.includes(h)
+      (h) => !fixedHashes.includes(h),
     );
     if (remainingToFix.length > 0 && this.options.enableRasterFallback) {
       console.log(
-        `🔄 [ASSET_FIX] Phase 2: Serial Rasterization (Tier B) for ${remainingToFix.length} assets...`
+        `🔄 [ASSET_FIX] Phase 2: Serial Rasterization (Tier B) for ${remainingToFix.length} assets...`,
       );
       for (let i = 0; i < remainingToFix.length; i++) {
         const hash = remainingToFix[i];
@@ -463,7 +507,7 @@ export class AssetCompletenessValidator {
             const result = await this.captureElementAsRaster(
               nodeInfo.element,
               rect.width,
-              rect.height
+              rect.height,
             );
             if (result?.base64 && result.base64.length > 100) {
               const rasterHash = `raster_${hash}`;
@@ -484,23 +528,38 @@ export class AssetCompletenessValidator {
               assets[hash].base64 = result.base64;
               assets[hash].data = result.base64;
               assets[hash].mimeType = result.mimeType;
+              // Preserve URL for plugin fallback
+              if (nodeInfo.url) {
+                assets[hash].url = nodeInfo.url;
+                assets[hash].originalUrl = nodeInfo.url;
+              }
 
               this.metrics.rasterFallbackCount++;
               this.metrics.totalEmbeddedBytes += result.base64.length;
               fixedHashes.push(hash);
+            } else if (nodeInfo.url) {
+              // Rasterization returned no base64 - still preserve URL for plugin to try proxy
+              if (!assets[hash]) assets[hash] = { id: hash };
+              assets[hash].url = nodeInfo.url;
+              assets[hash].originalUrl = nodeInfo.url;
             }
           } catch (e) {
             this.recordFailureReason("Rasterization failed");
+            // Rasterization failed - still preserve URL for plugin to try proxy
+            if (nodeInfo.url) {
+              if (!assets[hash]) assets[hash] = { id: hash };
+              assets[hash].url = nodeInfo.url;
+              assets[hash].originalUrl = nodeInfo.url;
+            }
           }
         }
         if (i > 0 && i % 10 === 0) {
           console.log(`   Rasterized ${i}/${remainingToFix.length}...`);
-          // Check for timeout to avoid hanging the whole capture
+          // Check for timeout to avoid hanging the whole capture (60s limit)
           const elapsed = Date.now() - (this as any)._passStartTime || 0;
-          if (elapsed > 200000) {
-            // arbitrary 200s limit for assets
+          if (elapsed > 60000) {
             console.warn(
-              "⚠️ [ASSET_FIX] Asset validation taking too long, aborting remaining rasters"
+              "⚠️ [ASSET_FIX] Asset validation taking too long (>60s), aborting remaining scans",
             );
             break;
           }
@@ -533,61 +592,79 @@ export class AssetCompletenessValidator {
 
     this.metrics.failureReasons.set(
       key,
-      (this.metrics.failureReasons.get(key) || 0) + 1
+      (this.metrics.failureReasons.get(key) || 0) + 1,
     );
   }
 
   /**
-   * Remove imageHash references for assets that couldn't be fixed
-   * This prevents phantom "builder errors" that are actually "schema missing bytes"
+   * Handle unfixed image references - PRESERVE URLs for plugin fallback
+   *
+   * CRITICAL FIX: Previously this deleted imageHash references, preventing
+   * the Figma plugin from using its own URL-based fallback (proxy fetch).
+   * Now we preserve the URL so the plugin can attempt to fetch the image.
    */
   removeUnfixedReferences(
     root: ElementNode,
-    unfixedHashes: Set<string>
+    unfixedHashes: Set<string>,
+    assets?: Record<string, any>,
   ): number {
+    let preservedCount = 0;
     let removedCount = 0;
 
     const traverse = (node: any) => {
       if (!node) return;
 
-      // Remove direct imageHash if unfixed
+      // For direct imageHash, check if we have a URL in asset
+      // If URL exists, KEEP the imageHash - plugin can fetch via proxy
       if (node.imageHash && unfixedHashes.has(node.imageHash)) {
-        console.warn(
-          `🗑️ [ASSET_CLEANUP] Removing unfixed imageHash: ${
-            node.imageHash
-          } from node ${node.id || node.name}`
-        );
-        delete node.imageHash;
-        removedCount++;
+        const asset = assets?.[node.imageHash];
+        const hasUrl =
+          asset?.url && typeof asset.url === "string" && asset.url.length > 0;
+
+        if (hasUrl) {
+          // PRESERVE: Plugin can fetch this via proxy
+          console.log(
+            `✅ [ASSET_PRESERVE] Keeping imageHash ${node.imageHash} (URL available for plugin fallback)`,
+          );
+          preservedCount++;
+          // Don't delete - let plugin try URL fetch
+        } else {
+          // No URL available - log but still preserve for plugin to handle
+          console.warn(
+            `⚠️ [ASSET_PRESERVE] No URL for imageHash: ${
+              node.imageHash
+            } on node ${
+              node.id || node.name
+            } - preserving anyway for plugin diagnostics`,
+          );
+          preservedCount++;
+          // Don't delete - plugin has fallback logic
+        }
       }
 
-      // Clean fills array
+      // For fills array, also preserve instead of removing
       if (Array.isArray(node.fills)) {
-        const originalLength = node.fills.length;
-        node.fills = node.fills.filter((fill: any) => {
+        for (const fill of node.fills) {
           if (fill?.imageHash && unfixedHashes.has(fill.imageHash)) {
-            console.warn(
-              `🗑️ [ASSET_CLEANUP] Removing unfixed fill imageHash: ${fill.imageHash}`
-            );
-            removedCount++;
-            return false;
-          }
-          return true;
-        });
+            const asset = assets?.[fill.imageHash];
+            const hasUrl =
+              asset?.url &&
+              typeof asset.url === "string" &&
+              asset.url.length > 0;
 
-        // If we removed image fills, add a placeholder fill
-        if (node.fills.length === 0 && originalLength > 0) {
-          node.fills = [
-            {
-              type: "SOLID",
-              color: { r: 0.9, g: 0.9, b: 0.9 },
-              opacity: 1,
-              visible: true,
-              _placeholder: true,
-              _reason: "IMAGE_ASSET_UNAVAILABLE",
-            },
-          ];
+            if (hasUrl) {
+              console.log(
+                `✅ [ASSET_PRESERVE] Keeping fill imageHash ${fill.imageHash} (URL available)`,
+              );
+            } else {
+              console.warn(
+                `⚠️ [ASSET_PRESERVE] No URL for fill imageHash: ${fill.imageHash} - preserving for plugin`,
+              );
+            }
+            preservedCount++;
+          }
         }
+        // Don't filter fills - preserve all
       }
 
       // Traverse children and pseudo-elements
@@ -601,7 +678,11 @@ export class AssetCompletenessValidator {
     };
 
     traverse(root);
-    return removedCount;
+
+    console.log(
+      `📦 [ASSET_PRESERVE] Preserved ${preservedCount} imageHash references for plugin fallback`,
+    );
+    return removedCount; // Returns 0 now since we don't remove
   }
 
   /**
@@ -614,10 +695,11 @@ export class AssetCompletenessValidator {
       { nodeId: string; url?: string; element?: Element }
     >,
     fetchViaBackground: (
-      url: string
-    ) => Promise<{ base64: string; mimeType?: string } | null>
+      url: string,
+    ) => Promise<{ base64: string; mimeType?: string } | null>,
   ): Promise<AssetValidationResult> {
     this.metrics = this.createEmptyMetrics();
+    (this as any)._passStartTime = Date.now();
 
     console.log("\n" + "=".repeat(60));
     console.log("🔍 [ASSET_COMPLETENESS] Starting asset validation...");
@@ -626,21 +708,33 @@ export class AssetCompletenessValidator {
     // Step 1: Collect all referenced hashes
     const referencedHashes = this.collectReferencedHashes(schema.root);
     this.metrics.totalReferencedHashes = referencedHashes.size;
+
+    if (referencedHashes.size === 0) {
+      console.log("ℹ️ [ASSET_COMPLETENESS] No images referenced in schema.");
+      return {
+        isComplete: true,
+        metrics: this.metrics,
+        missingHashes: [],
+        fixedHashes: [],
+      };
+    }
+
     console.log(
-      `📋 [ASSET_COMPLETENESS] Found ${referencedHashes.size} unique imageHash references`
+      `📋 [ASSET_COMPLETENESS] Found ${referencedHashes.size} unique imageHash references`,
     );
 
     // Step 2: Find missing assets
     const assets = schema.assets?.images || {};
     const missingBefore = this.findMissingAssets(referencedHashes, assets);
     console.log(
-      `⚠️ [ASSET_COMPLETENESS] ${missingBefore.length} hashes missing embedded bytes`
+      `⚠️ [ASSET_COMPLETENESS] ${missingBefore.length} hashes missing embedded bytes`,
     );
 
     // Count already-embedded
     const alreadyEmbedded = referencedHashes.size - missingBefore.length;
     this.metrics.successfullyEmbedded = alreadyEmbedded;
-    for (const hash of referencedHashes) {
+    // TS Fix: Convert Set iteration to Array
+    for (const hash of Array.from(referencedHashes)) {
       const asset = assets[hash];
       if (asset?.base64) {
         this.metrics.totalEmbeddedBytes += asset.base64.length;
@@ -652,21 +746,22 @@ export class AssetCompletenessValidator {
       missingBefore,
       assets,
       nodeHashMap,
-      fetchViaBackground
+      fetchViaBackground,
     );
 
     // Step 4: Check what's still missing
     const missingAfter = this.findMissingAssets(referencedHashes, assets);
 
-    // Step 5: Remove unfixed references to prevent phantom errors
+    // Step 5: Preserve unfixed references for plugin fallback (don't delete)
     if (missingAfter.length > 0) {
       const unfixedSet = new Set(missingAfter);
-      const removedCount = this.removeUnfixedReferences(
+      const preservedCount = this.removeUnfixedReferences(
         schema.root,
-        unfixedSet
+        unfixedSet,
+        assets,
       );
-      console.warn(
-        `🗑️ [ASSET_COMPLETENESS] Removed ${removedCount} unfixable imageHash references`
+      console.log(
+        `📦 [ASSET_COMPLETENESS] ${missingAfter.length} imageHash refs preserved for plugin URL fallback`,
       );
     }
 
@@ -677,21 +772,21 @@ export class AssetCompletenessValidator {
     console.log("📊 [ASSET_COMPLETENESS] VALIDATION REPORT");
     console.log("=".repeat(60));
     console.log(
-      `   Total Referenced Hashes:  ${this.metrics.totalReferencedHashes}`
+      `   Total Referenced Hashes:  ${this.metrics.totalReferencedHashes}`,
     );
     console.log(
-      `   Successfully Embedded:    ${this.metrics.successfullyEmbedded}`
+      `   Successfully Embedded:    ${this.metrics.successfullyEmbedded}`,
     );
     console.log(`   Failed Fetches:           ${this.metrics.failedFetches}`);
     console.log(
-      `   Raster Fallbacks:         ${this.metrics.rasterFallbackCount}`
+      `   Raster Fallbacks:         ${this.metrics.rasterFallbackCount}`,
     );
     console.log(
       `   Total Embedded Bytes:     ${(
         this.metrics.totalEmbeddedBytes /
         1024 /
         1024
-      ).toFixed(2)} MB`
+      ).toFixed(2)} MB`,
     );
     console.log(`   Fetch Attempts:           ${this.metrics.fetchAttempts}`);
     console.log(`   Fixed in This Pass:       ${fixedHashes.length}`);
@@ -699,12 +794,13 @@ export class AssetCompletenessValidator {
     console.log(
       `   Status:                   ${
         isComplete ? "✅ COMPLETE" : "⚠️ INCOMPLETE"
-      }`
+      }`,
     );
 
     if (this.metrics.failureReasons.size > 0) {
       console.log(`   Failure Reasons:`);
-      for (const [reason, count] of this.metrics.failureReasons) {
+      // TS Fix: Convert Map iteration to Array
+      for (const [reason, count] of Array.from(this.metrics.failureReasons)) {
         console.log(`      ${reason}: ${count}`);
       }
     }

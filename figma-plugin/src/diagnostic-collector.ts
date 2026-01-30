@@ -36,6 +36,7 @@ export class DiagnosticCollector {
     rasterizationTimeMs: 0,
     layoutSolverTimeMs: 0,
   };
+  private customMetrics: Record<string, any> = {};
   public disabled: boolean = false;
   public failureOnlyMode: boolean = false;
 
@@ -45,6 +46,14 @@ export class DiagnosticCollector {
       .substr(2, 9)}`;
     this.sourceUrl = sourceUrl;
     this.startTime = Date.now();
+  }
+
+  /**
+   * Add a custom metric to the diagnostic report
+   */
+  addMetric(key: string, value: any): void {
+    if (this.disabled) return;
+    this.customMetrics[key] = value;
   }
 
   /**
@@ -433,6 +442,7 @@ export class DiagnosticCollector {
         rasterizationTimeMs: this.performanceMetrics.rasterizationTimeMs,
         layoutSolverTimeMs: this.performanceMetrics.layoutSolverTimeMs,
       },
+      customMetrics: this.customMetrics,
       systemInfo: {
         figmaVersion: "unknown", // figma.version is not available in plugin API
         pluginVersion: "1.0.0", // TODO: Read from package.json or manifest

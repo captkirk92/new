@@ -167,6 +167,33 @@ export function parseCssFilter(filter: string): ParsedCssFilter[] {
       return { kind: "saturate", amount };
     }
 
+    // FIDELITY FIX #3: Add missing filter functions (P0 - HIGH IMPACT)
+    // These filters cannot be represented in Figma and will trigger rasterization
+    if (fn === "hue-rotate") {
+      // hue-rotate() takes degrees
+      const deg = parseFloat(args.replace("deg", ""));
+      if (!Number.isFinite(deg)) return { kind: "unknown", raw: p };
+      return { kind: "unknown", raw: p }; // Mark as unknown to trigger rasterization
+    }
+
+    if (fn === "grayscale") {
+      const v = Number(args.replace("%", ""));
+      if (!Number.isFinite(v)) return { kind: "unknown", raw: p };
+      return { kind: "unknown", raw: p }; // Mark as unknown to trigger rasterization
+    }
+
+    if (fn === "invert") {
+      const v = Number(args.replace("%", ""));
+      if (!Number.isFinite(v)) return { kind: "unknown", raw: p };
+      return { kind: "unknown", raw: p }; // Mark as unknown to trigger rasterization
+    }
+
+    if (fn === "sepia") {
+      const v = Number(args.replace("%", ""));
+      if (!Number.isFinite(v)) return { kind: "unknown", raw: p };
+      return { kind: "unknown", raw: p }; // Mark as unknown to trigger rasterization
+    }
+
     return { kind: "unknown", raw: p };
   });
 }

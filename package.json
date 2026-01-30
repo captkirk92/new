@@ -1,7 +1,7 @@
 {
-  "name": "BlueprintAI",
+  "name": "figmafi",
   "version": "1.0.0",
-  "description": "Web to Figma - Full stack page capture and import",
+  "description": "figmafi - Convert web pages to Figma designs",
   "private": true,
   "type": "commonjs",
   "scripts": {
@@ -11,6 +11,7 @@
     "build:extension": "cd chrome-extension && npm run build",
     "build:plugin": "cd figma-plugin && npm run build",
     "build:all": "npm run build:extension && npm run build:plugin",
+    "build:parallel": "concurrently \"npm run build:extension\" \"npm run build:plugin\"",
     "install:all": "npm install && cd chrome-extension && npm install && cd ../figma-plugin && npm install",
     "test": "npm run test:plugin",
     "test:plugin": "cd figma-plugin && npm test",
@@ -18,10 +19,17 @@
     "test:plugin:coverage": "cd figma-plugin && npm run test:coverage",
     "test:capture": "node test/capture-harness.js",
     "test:fullpage": "node tools/automation/run-fullpage-capture.mjs",
+    "test:fidelity": "node test/run-fidelity-comparison.js",
+    "test:fidelity:analyze": "node test/analyze-fidelity.js",
     "validate:pixels": "node tools/validation/pixel-diff.js",
+    "validate:fidelity": "node tools/validation/fidelity-test.js",
+    "validate:fidelity:all": "node tools/validation/fidelity-test.js",
     "validate:schema": "node tools/validation/schema-guardrails.js",
+    "auto-test": "node tools/automation/auto-capture-test.js",
+    "quick-test": "./tools/automation/quick-test.sh",
     "clean": "npm run clean:extension && rm -rf node_modules",
-    "clean:extension": "rm -rf chrome-extension/dist chrome-extension/node_modules/.cache node_modules/.cache && rm -f chrome-extension/tsconfig.tsbuildinfo tsconfig.tsbuildinfo"
+    "clean:extension": "rm -rf chrome-extension/dist chrome-extension/node_modules/.cache node_modules/.cache && rm -f chrome-extension/tsconfig.tsbuildinfo tsconfig.tsbuildinfo",
+    "handoff-server": "node handoff-server.cjs"
   },
   "dependencies": {
     "body-parser": "^1.20.2",
@@ -39,8 +47,10 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "baseline-browser-mapping": "^2.9.11",
+    "baseline-browser-mapping": "^2.9.18",
+    "concurrently": "^9.2.1",
     "gemini-code-flow": "^0.1.0",
-    "playwright": "^1.57.0"
+    "playwright": "^1.57.0",
+    "typescript": "^5.9.3"
   }
 }

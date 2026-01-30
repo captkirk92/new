@@ -71,15 +71,67 @@
     .status.loading { background: #dbeafe; color: #1e40af; }
     .status.success { background: #d1fae5; color: #065f46; }
     .status.error { background: #fee2e2; color: #991b1b; }
-    .spinner {
-      width: 16px;
-      height: 16px;
-      border: 2px solid currentColor;
-      border-top-color: transparent;
-      border-radius: 50%;
-      animation: spin 0.6s linear infinite;
+    .loader-container {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      width: 100%;
+      height: 250px;
+      overflow: hidden;
     }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .loader-svg {
+      width: 100%;
+      height: 100%;
+    }
+    .grid-line {
+      stroke: #222;
+      stroke-width: 0.5;
+    }
+    .browser-frame {
+      fill: #111;
+      stroke: #666;
+      stroke-width: 1;
+      filter: drop-shadow(0 0 10px rgba(0, 0, 0, 0.9));
+    }
+    .browser-top {
+      fill: #1a1a1a;
+    }
+    .loading-text {
+      font-family: Haettenschweiler, sans-serif;
+      font-size: 14px;
+      fill: #e4e4e4;
+    }
+    .skeleton {
+      fill: #2d2d2d;
+      rx: 4;
+      ry: 4;
+      animation: pulse 1.8s ease-in-out infinite;
+      filter: drop-shadow(0 0 3px rgba(255, 255, 255, 0.02));
+    }
+    @keyframes pulse {
+      0% { fill: #2d2d2d; }
+      50% { fill: #505050; }
+      100% { fill: #2d2d2d; }
+    }
+    .trace-flow {
+      stroke-width: 1;
+      fill: none;
+      stroke-dasharray: 120 600;
+      stroke-dashoffset: 720;
+      animation: flow 5s linear infinite;
+      opacity: 0.95;
+      stroke-linejoin: round;
+      filter: drop-shadow(0 0 8px currentColor) blur(0.5px);
+      color: #00ccff;
+    }
+    .trace-flow:nth-of-type(1) { stroke: url(#traceGradient1); }
+    .trace-flow:nth-of-type(2) { stroke: url(#traceGradient2); }
+    .trace-flow:nth-of-type(3) { stroke: url(#traceGradient3); }
+    .trace-flow:nth-of-type(4) { stroke: url(#traceGradient4); }
+    @keyframes flow {
+      from { stroke-dashoffset: 720; }
+      to { stroke-dashoffset: 0; }
+    }
     .btn {
       width: 100%;
       padding: 10px 16px;
@@ -142,20 +194,7 @@
       text-transform: uppercase;
       letter-spacing: 0.5px;
     }
-    .progress {
-      width: 100%;
-      height: 4px;
-      background: #e5e7eb;
-      border-radius: 2px;
-      overflow: hidden;
-      margin-top: 8px;
-    }
-    .progress-bar {
-      height: 100%;
-      background: #6366f1;
-      width: 0%;
-      transition: width 0.3s ease;
-    }
+
     .file-input { display: none; }
     .file-label {
       display: flex;
@@ -495,8 +534,8 @@
 </head>
 <body>
   <h1>
-    <div class="icon">W→F</div>
-    Web to Figma
+    <div class="icon">Fi</div>
+    figmafi
     <div id="puppeteer-indicator" class="puppeteer-indicator">🤖</div>
   </h1>
 
@@ -585,13 +624,76 @@ Initializing...
     </div>
 
     <div id="status-loading" class="status loading hidden">
-      <div class="spinner"></div>
-      <div>
-        <div id="loading-message">Processing...</div>
-        <div class="progress">
-          <div class="progress-bar" id="progress-bar"></div>
-        </div>
+      <div class="loader-container">
+        <svg class="loader-svg" viewBox="0 0 900 900" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+            <defs>
+              <linearGradient id="traceGradient1" x1="250" y1="120" x2="100" y2="200" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#00ccff" stop-opacity="1" />
+                <stop offset="100%" stop-color="#00ccff" stop-opacity="0.5" />
+              </linearGradient>
+              <linearGradient id="traceGradient2" x1="650" y1="120" x2="800" y2="300" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#00ccff" stop-opacity="1" />
+                <stop offset="100%" stop-color="#00ccff" stop-opacity="0.5" />
+              </linearGradient>
+              <linearGradient id="traceGradient3" x1="250" y1="380" x2="400" y2="400" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#00ccff" stop-opacity="1" />
+                <stop offset="100%" stop-color="#00ccff" stop-opacity="0.5" />
+              </linearGradient>
+              <linearGradient id="traceGradient4" x1="650" y1="120" x2="500" y2="100" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#00ccff" stop-opacity="1" />
+                <stop offset="100%" stop-color="#00ccff" stop-opacity="0.5" />
+              </linearGradient>
+            </defs>
+            <g id="grid">
+              <g>
+                <line x1="0" y1="0" x2="0" y2="100%" class="grid-line" />
+                <line x1="100" y1="0" x2="100" y2="100%" class="grid-line" />
+                <line x1="200" y1="0" x2="200" y2="100%" class="grid-line" />
+                <line x1="300" y1="0" x2="300" y2="100%" class="grid-line" />
+                <line x1="400" y1="0" x2="400" y2="100%" class="grid-line" />
+                <line x1="500" y1="0" x2="500" y2="100%" class="grid-line" />
+                <line x1="600" y1="0" x2="600" y2="100%" class="grid-line" />
+                <line x1="700" y1="0" x2="700" y2="100%" class="grid-line" />
+                <line x1="800" y1="0" x2="800" y2="100%" class="grid-line" />
+                <line x1="900" y1="0" x2="900" y2="100%" class="grid-line" />
+                <line x1="1000" y1="0" x2="1000" y2="100%" class="grid-line" />
+                <line x1="1100" y1="0" x2="1100" y2="100%" class="grid-line" />
+                <line x1="1200" y1="0" x2="1200" y2="100%" class="grid-line" />
+                <line x1="1300" y1="0" x2="1300" y2="100%" class="grid-line" />
+                <line x1="1400" y1="0" x2="1400" y2="100%" class="grid-line" />
+                <line x1="1500" y1="0" x2="1500" y2="100%" class="grid-line" />
+                <line x1="1600" y1="0" x2="1600" y2="100%" class="grid-line" />
+              </g>
+              <g>
+                <line x1="0" y1="100" x2="100%" y2="100" class="grid-line" />
+                <line x1="0" y1="200" x2="100%" y2="200" class="grid-line" />
+                <line x1="0" y1="300" x2="100%" y2="300" class="grid-line" />
+                <line x1="0" y1="400" x2="100%" y2="400" class="grid-line" />
+                <line x1="0" y1="500" x2="100%" y2="500" class="grid-line" />
+                <line x1="0" y1="600" x2="100%" y2="600" class="grid-line" />
+                <line x1="0" y1="700" x2="100%" y2="700" class="grid-line" />
+                <line x1="0" y1="800" x2="100%" y2="800" class="grid-line" />
+              </g>
+            </g>
+            <g id="browser" transform="translate(0, 200)">
+              <rect x="250" y="120" width="400" height="260" rx="8" ry="8" class="browser-frame" />
+              <rect x="250" y="120" width="400" height="30" rx="8" ry="8" class="browser-top" />
+              <text x="294" y="140" text-anchor="middle" class="loading-text" id="loading-message">Loading...</text>
+              <rect x="270" y="160" width="360" height="20" class="skeleton" />
+              <rect x="270" y="190" width="200" height="15" class="skeleton" />
+              <rect x="270" y="215" width="300" height="15" class="skeleton" />
+              <rect x="270" y="240" width="360" height="90" class="skeleton" />
+              <rect x="270" y="340" width="180" height="20" class="skeleton" />
+            </g>
+            <g id="traces" transform="translate(0, 200)">
+              <path d="M100 300 H250 V120" class="trace-flow" />
+              <path d="M800 200 H650 V380" class="trace-flow" />
+              <path d="M400 520 V380 H250" class="trace-flow" />
+              <path d="M500 50 V120 H650" class="trace-flow" />
+            </g>
+        </svg>
       </div>
+      <div id="progress-bar" style="display:none;"></div>
     </div>
 
     <div id="status-success" class="status success hidden">
@@ -611,7 +713,7 @@ Initializing...
       <label for="opt-main-frame">Main page frame</label>
     </div>
     <div class="checkbox-item">
-      <input type="checkbox" id="opt-auto-layout" checked>
+      <input type="checkbox" id="opt-auto-layout">
       <label for="opt-auto-layout">Apply Auto Layout</label>
     </div>
   </div>
@@ -1063,11 +1165,105 @@ Initializing...
           }
           break;
 
-        case 'import-busy':
+      case 'import-busy':
           showStatus('loading', msg.message || 'Waiting for current import to finish…');
+          break;
+
+        // TRANSCODING SUPPORT (Added to fix WebP timeouts)
+        case 'transcode-webp':
+          handleTranscodeRequest(msg.id, msg.base64, 'image/webp', 'webp-transcoded');
+          break;
+
+        case 'transcode-image':
+          handleTranscodeRequest(msg.id, msg.base64, msg.mimeType, 'image-transcoded', msg.targetWidth, msg.targetHeight);
+          break;
+
+        case 'upload-debug-artifact':
+          uploadDebugArtifact(msg.jobId, msg.pngBytes, msg.stats);
           break;
       }
     };
+
+    async function uploadDebugArtifact(jobId, pngBytes, stats) {
+      try {
+        const HANDOFF_BASE = 'http://localhost:4411';
+        
+        // Handle Uint8Array -> Blob conversion
+        // When passed via postMessage, Uint8Array might arrive as an object {0: x, 1: y...} or array
+        let bytes;
+        if (pngBytes instanceof Uint8Array) {
+          bytes = pngBytes;
+        } else if (Array.isArray(pngBytes)) {
+          bytes = new Uint8Array(pngBytes);
+        } else {
+          bytes = new Uint8Array(Object.values(pngBytes));
+        }
+        
+        const blob = new Blob([bytes], { type: 'image/png' });
+        
+        // Upload PNG
+        console.log(`📤 Uploading render for job ${jobId}...`);
+        await fetch(`${HANDOFF_BASE}/api/debug/${jobId}/import_render.png`, {
+          method: 'POST',
+          body: blob
+        });
+        
+        // Upload Stats
+        if (stats) {
+           await fetch(`${HANDOFF_BASE}/api/debug/${jobId}/import_report.json`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(stats)
+          });
+        }
+        console.log(`✅ Uploaded debug artifacts for ${jobId}`);
+        updateDebugStatus(`✅ Uploaded debug artifacts for ${jobId}`);
+      } catch (e) {
+        console.error("Failed to upload debug artifact", e);
+        updateDebugStatus(`❌ Failed to upload artifact: ${e.message}`);
+      }
+    }
+
+    // Helper for image transcoding via Canvas
+    function handleTranscodeRequest(id, base64Data, mimeType, responseType, targetWidth, targetHeight) {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          
+          // Apply target dimensions if provided, otherwise use natural size
+          // This allows on-the-fly resizing to rendered dimensions
+          canvas.width = targetWidth || img.width;
+          canvas.height = targetHeight || img.height;
+          
+          const ctx = canvas.getContext('2d');
+          
+          // High-quality image smoothing
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const pngData = canvas.toDataURL('image/png');
+          parent.postMessage({ pluginMessage: { id, pngBase64: pngData, type: responseType } }, '*');
+        } catch (e) {
+          console.error('Transcode canvas error:', e);
+          parent.postMessage({ pluginMessage: { id, error: 'Canvas encoding failed', type: responseType } }, '*');
+        }
+      };
+      
+      img.onerror = (e) => {
+        console.error('Transcode image load error:', e);
+        parent.postMessage({ pluginMessage: { id, error: 'Image load failed', type: responseType } }, '*');
+      };
+      
+      // Ensure data URI format
+      if (base64Data.startsWith('data:')) {
+          img.src = base64Data;
+      } else {
+        // Default to provided mimeType or png if missing
+        img.src = `data:${mimeType || 'image/png'};base64,${base64Data}`;
+      }
+    }
     
     // Expose functions for Puppeteer control
     window.figmaPluginAPI = {
@@ -1089,6 +1285,107 @@ Initializing...
         }
       }
       return count;
+    }
+
+
+
+    // ==========================================
+    // HANDOFF POLLING (UI Thread)
+    // ==========================================
+    {
+      const HANDOFF_CANDIDATES = ['http://127.0.0.1:4411', 'http://localhost:4411'];
+      let currentApiUrl = HANDOFF_CANDIDATES[0];
+      let isPolling = true;
+      let consecutiveErrors = 0;
+
+      async function pollHandoffServer() {
+      if (!isPolling) return;
+
+      let success = false;
+
+      // Try current URL first, then others if it fails
+      const candidates = [currentApiUrl, ...HANDOFF_CANDIDATES.filter(c => c !== currentApiUrl)];
+
+      for (const url of candidates) {
+        try {
+          // 1. Health/Telemetry check (optional, but good for status)
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 1000); // 1s timeout for fast failover
+          
+          const res = await fetch(`${url}/api/jobs/next`, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          
+          if (res.ok) {
+            success = true;
+            consecutiveErrors = 0;
+            
+            if (currentApiUrl !== url) {
+              updateDebugStatus(`🔌 Connected to ${url}`);
+              currentApiUrl = url;
+            }
+
+            // Connected
+            setStatusLight('server-connection-light', 'green');
+            document.getElementById('detail-server-status').textContent = 'Connected';
+            
+            // Only update "Waiting" message if we weren't already connected/processing
+            if (document.getElementById('handoff-status-message').className.includes('disconnected')) {
+                 updateHandoffMessage('waiting');
+            }
+
+            const body = await res.json();
+            
+            // Update telemetry if provided
+            if (body.telemetry) {
+               updateTelemetryDetails(body.telemetry);
+               parent.postMessage({ pluginMessage: { type: 'handoff-telemetry', telemetry: body.telemetry } }, '*');
+            }
+
+            if (body.job) {
+              updateDebugStatus(`📥 Job received: ${body.job.id}`);
+              console.log('📥 Job received:', body.job.id);
+              updateHandoffMessage('job-ready', `Importing job ${body.job.id}`);
+              setStatusLight('data-reception-light', 'green');
+              
+              // Send to Sandbox
+              parent.postMessage({ 
+                pluginMessage: { 
+                  type: 'auto-import', 
+                  data: body.job.payload, 
+                  options: { jobId: body.job.id }
+                } 
+              }, '*');
+            }
+            break; // Success! Stop trying other candidates
+          } else {
+            // Server reachable but error (e.g. 500)
+            console.warn(`Server error at ${url}: ${res.status}`);
+          }
+        } catch (e) {
+          // Network error (server down or CORS) or Timeout
+          // console.warn(`Poll failed at ${url}:`, e);
+          // Continue to next candidate
+        }
+      }
+
+      if (!success) {
+        consecutiveErrors++;
+        setStatusLight('server-connection-light', 'red');
+        document.getElementById('detail-server-status').textContent = 'Disconnected';
+        
+        if (consecutiveErrors % 5 === 0) { // Log every 5th error to avoid spam
+            updateDebugStatus(`⚠️ Handoff disconnected. Ensuring server is running on port 4411.`);
+        }
+        updateHandoffMessage('disconnected');
+      }
+
+      // Schedule next poll - FAST polling if connected (500ms), SLOW if disconnected (2s)
+      // This ensures snappier response when the server is alive
+      setTimeout(pollHandoffServer, success ? 500 : 2000);
+    }
+
+    // Start polling
+    pollHandoffServer();
     }
   </script>
 </body>

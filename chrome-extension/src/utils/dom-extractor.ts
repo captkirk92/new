@@ -31,6 +31,8 @@ import {
   NodeValidation,
   FigmaNodeType,
 } from "../types/schema";
+import { parseColorToRGBA, type RGBA } from "../../../shared/color-utils";
+
 // ============================================================================
 // VALIDATION UTILITIES
 // ============================================================================
@@ -84,7 +86,7 @@ class ExtractionValidation {
 
   static safeGetComputedStyle(
     element: Element,
-    pseudoElement?: string
+    pseudoElement?: string,
   ): CSSStyleDeclaration | null {
     try {
       return window.getComputedStyle(element, pseudoElement);
@@ -115,7 +117,7 @@ class ErrorTracker {
   // Map location strings to diagnostic codes
   private locationToCode(
     location: string,
-    message: string
+    message: string,
   ): import("./diagnostics-bus").DiagnosticCode {
     const loc = location.toLowerCase();
     const msg = message.toLowerCase();
@@ -150,7 +152,7 @@ class ErrorTracker {
     location: string,
     message: string,
     element?: Element,
-    severity: "warning" | "error" | "critical" = "error"
+    severity: "warning" | "error" | "critical" = "error",
   ): void {
     // ENHANCED: Defensive error handling to prevent undefined.toString() errors
     try {
@@ -182,8 +184,8 @@ class ErrorTracker {
         severity === "critical"
           ? "fatal"
           : severity === "error"
-          ? "error"
-          : "warn";
+            ? "error"
+            : "warn";
       const diagCode = this.locationToCode(location, safeMessage);
 
       diagnostics.emit({
@@ -209,7 +211,7 @@ class ErrorTracker {
       console.error(
         `[ERROR TRACKER] Failed to record error: ${
           error instanceof Error ? error.message : String(error)
-        }`
+        }`,
       );
     }
   }
@@ -271,7 +273,7 @@ function parseFirstCssUrl(cssValue: string | null | undefined): string | null {
 
 function bestElementImageUrl(
   el: Element,
-  computed?: CSSStyleDeclaration
+  computed?: CSSStyleDeclaration,
 ): string | null {
   // <img>
   if (el instanceof HTMLImageElement) {
@@ -309,7 +311,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   const timeout = new Promise<T>((_, reject) => {
     t = window.setTimeout(
       () => reject(new Error(`Timeout(${label}): ${ms}ms`)),
-      ms
+      ms,
     );
   });
   return Promise.race([p, timeout]).finally(() => {
@@ -321,48 +323,12 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
  * Probe intrinsic size from a URL by loading it into an Image element.
  * This works cross-origin for width/height (does not read pixels).
  */
-async function probeImageUrlIntrinsicSize(
-  url: string
-): Promise<IntrinsicSize | null> {
-  const cached = __intrinsicSizeCache.get(url);
-  if (cached) return cached;
-
-  // data URLs can be huge; still ok but guard with a shorter timeout
-  // data URLs can be huge; still ok but guard with a shorter timeout
-  // PERFORMANCE FIX: Reduced from 4000ms to 1000ms to prevent extraction timeouts
-  const timeoutMs = url.startsWith("data:") ? 500 : 1000;
-
-  const size = await withTimeout(
-    new Promise<IntrinsicSize | null>((resolve) => {
-      const img = new Image();
-      // Setting crossOrigin is fine; width/height works either way. Keep it to reduce surprises.
-      img.crossOrigin = "anonymous";
-      img.decoding = "async";
-      img.onload = () => {
-        const w = clampPositiveInt(img.naturalWidth);
-        const h = clampPositiveInt(img.naturalHeight);
-        if (w && h) {
-          const out = { width: w, height: h };
-          __intrinsicSizeCache.set(url, out);
-          resolve(out);
-        } else {
-          resolve(null);
-        }
-      };
-      img.onerror = () => resolve(null);
-
-      // Some sites return protocol-relative or relative URLs; normalize again.
-      try {
-        img.src = new URL(url, window.location.href).toString();
-      } catch {
-        img.src = url;
-      }
-    }),
-    timeoutMs,
-    "probeImageUrlIntrinsicSize"
-  ).catch(() => null);
-
-  return size;
+/**
+ * Probe intrinsic size from a URL - SYNCHRONOUS ONLY (Cache check)
+ * We no longer fetch images here to prevent capture blocking.
+ */
+function probeImageUrlIntrinsicSize(url: string): IntrinsicSize | null {
+  return __intrinsicSizeCache.get(url) || null;
 }
 
 /**
@@ -370,24 +336,23 @@ async function probeImageUrlIntrinsicSize(
  */
 async function extractIntrinsicSize(
   el: Element,
-  computed?: CSSStyleDeclaration
+  computed?: CSSStyleDeclaration,
 ): Promise<IntrinsicSize | null> {
   // <img>
   if (el instanceof HTMLImageElement) {
-    // If not decoded yet, naturalWidth may be 0. decode() helps when available.
-    try {
-      // decode() may throw for SVG/data URLs; ignore.
-      if (typeof el.decode === "function")
-        await withTimeout(el.decode(), 2000, "img.decode");
-    } catch {
-      // ignore
-    }
     const w = clampPositiveInt(el.naturalWidth);
     const h = clampPositiveInt(el.naturalHeight);
-    if (w && h) return { width: w, height: h };
 
-    const url = el.currentSrc || el.src;
-    if (url) return await probeImageUrlIntrinsicSize(url);
+    // If we have natural dimensions, use them
+    if (w && h) {
+      // Cache for future lookups by URL
+      const url = el.currentSrc || el.src;
+      if (url) __intrinsicSizeCache.set(url, { width: w, height: h });
+      return { width: w, height: h };
+    }
+
+    // If no natural dimensions yet (not loaded), fail fast
+    // We will fall back to computed CSS dimensions below
     return null;
   }
 
@@ -396,7 +361,6 @@ async function extractIntrinsicSize(
     const w = clampPositiveInt(el.videoWidth);
     const h = clampPositiveInt(el.videoHeight);
     if (w && h) return { width: w, height: h };
-    if (el.poster) return await probeImageUrlIntrinsicSize(el.poster);
     return null;
   }
 
@@ -416,8 +380,13 @@ async function extractIntrinsicSize(
   if (svgW && svgH) return { width: svgW, height: svgH };
 
   // CSS background-image
+  // We don't probe URLs anymore to avoid blocking.
+  // If the image isn't in cache (from an <img> tag elsewhere), we fallback to CSS dimensions.
   const url = bestElementImageUrl(el, computed);
-  if (url) return await probeImageUrlIntrinsicSize(url);
+  if (url) {
+    const cached = probeImageUrlIntrinsicSize(url);
+    if (cached) return cached;
+  }
 
   // FIX 2: Fallback to CSS computed dimensions as last resort
   // CRITICAL: When natural dimensions and URL probing fail, use computed CSS dimensions
@@ -431,9 +400,7 @@ async function extractIntrinsicSize(
       Number.isFinite(cssWidth) &&
       Number.isFinite(cssHeight)
     ) {
-      console.log(
-        `📐 [INTRINSIC SIZE FALLBACK] Using CSS dimensions: ${cssWidth}x${cssHeight}`
-      );
+      // Use CSS dimensions but don't log every time to reduce noise
       return { width: Math.round(cssWidth), height: Math.round(cssHeight) };
     }
   }
@@ -446,6 +413,12 @@ async function extractIntrinsicSize(
 // ============================================================================
 
 export class DOMExtractor {
+  // CONFIGURATION CONSTANTS
+  private static readonly IMAGE_PROCESS_BATCH_SIZE = 5;
+  private static readonly IMAGE_PROCESS_MAX_RETRIES = 3;
+  private static readonly CHILD_PROCESS_BATCH_SIZE = 50;
+  private static readonly MAX_ACTIVE_IMAGE_FETCHES = 8;
+
   private currentCaptureId: string | null = null;
   private nodeId = 0;
   private extractionStartTime = 0;
@@ -466,14 +439,23 @@ export class DOMExtractor {
     rejectionReasons: new Map<string, number>(),
   };
 
+  private screenshotQueue: Array<{
+    element: Element;
+    onComplete: (dataUrl: string) => void;
+  }> = [];
+  private activeScreenshots = 0;
+  private readonly MAX_CONCURRENT_SCREENSHOTS = 2; // Keep low to avoid CDP congestion
+  private suspectRootsCount = 0;
+  private nodeSignatureCache = new Map<string, number>();
+
   // PERFORMANCE CONFIGURATION - Emergency circuit breakers for timeouts
   private performanceConfig = {
-    maxNodesPerCapture: 200000, // Increased cap for YouTube/infinite feeds
-    maxChildrenForValidation: 20, // Increased from 10 to allow better structure on complex sites
-    maxValidationSamples: 5, // Only validate first 5 children for large containers to save time
-    validationTimeoutMs: 100, // Max 100ms per validation
+    maxNodesPerCapture: 10000000, // Effectively unlimited (10M) to allow full page capture
+    maxChildrenForValidation: 50, // Increased from 20 to allow better structure on complex sites
+    maxValidationSamples: 10, // Only validate first 10 children for large containers to save time
+    validationTimeoutMs: 200, // Max 200ms per validation
     yieldIntervalMs: 50, // Yield to event loop every 50ms
-    yieldNodeCount: 50, // Yield every 50 nodes (increased from 20 for speed)
+    yieldNodeCount: 10, // Yield/Report every 10 nodes (decreased from 50 for more responsiveness)
     heartbeatIntervalMs: 500, // Heartbeat every 500ms
     performanceMode: false, // Fallback to skip all validation
     circuitBreakerThreshold: 5, // Increased threshold for performance mode
@@ -493,6 +475,8 @@ export class DOMExtractor {
     phaseStartTime: 0,
     currentPhase: "initialization",
     currentDetail: "",
+    // MONOTONIC PROGRESS FIX: Track highest progress value to prevent jumps
+    currentProgress: 0,
   };
 
   // DIAGNOSTICS: Counters for debugging blank frame issues
@@ -506,7 +490,15 @@ export class DOMExtractor {
     skippedNonElement: 0,
     skippedPhantomContainer: 0,
     maxDepthReached: 0,
+    // [OPTIMIZATION] SVG Rasterization instrumentation
+    svgRasterizeCandidates: 0,
+    svgRasterizeExecuted: 0,
+    svgRasterizeReasons: new Map<string, number>(),
+    // [OPTIMIZATION] Memory pressure tracking
+    estimatedPayloadBytes: 0,
   };
+  private totalOnPage = 0; // [OPTIMIZATION] Cache total elements at start
+  private nodesSinceLastYield = 0;
   private errorTracker = new ErrorTracker();
   private svgSpriteCache = new Map<string, Document>();
   private lineHeightCache = new Map<string, number>();
@@ -550,13 +542,16 @@ export class DOMExtractor {
   // This enables pixel-capture fallback when network fetch fails (Facebook, auth-protected CDNs)
   private imageElementByHash = new Map<string, Element>();
 
+  // ASSET DEDUPLICATION: Cache for rasterized content
+  private rasterCache = new Map<string, string>();
+
   /**
    * Register a DOM element for a given imageHash.
    * Used by AssetCompletenessValidator for Tier B raster fallback.
    */
   private registerImageElement(
     imageHash: string,
-    element: Element | null | undefined
+    element: Element | null | undefined,
   ): void {
     if (!imageHash || !element) return;
     // Only store the first element for each hash (usually the most visible one)
@@ -577,6 +572,82 @@ export class DOMExtractor {
     return String(className || "");
   }
 
+  /**
+   * Check if chrome.runtime is available (content script context)
+   * Returns false when running in MAIN world (injected script)
+   */
+  private hasChromeRuntime(): boolean {
+    return (
+      typeof chrome !== "undefined" &&
+      !!chrome.runtime &&
+      !!chrome.runtime.sendMessage
+    );
+  }
+
+  /**
+   * Safely send a message to the background script.
+   * Uses chrome.runtime.sendMessage if available, otherwise uses postMessage bridge.
+   * When using postMessage, we send FETCH_ASSET_PROXY and wait for FETCH_ASSET_PROXY_RESPONSE.
+   */
+  private sendMessageToBackground(
+    message: { type: string; [key: string]: any },
+    timeoutMs: number = 20000,
+  ): Promise<any> {
+    return new Promise((resolve) => {
+      if (this.hasChromeRuntime()) {
+        // Direct call in content script context
+        try {
+          chrome.runtime.sendMessage(message, (response) => {
+            if (chrome.runtime.lastError) {
+              resolve({ ok: false, error: chrome.runtime.lastError.message });
+            } else {
+              resolve(response);
+            }
+          });
+        } catch (error) {
+          resolve({
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else {
+        // Use postMessage bridge in MAIN world (injected script)
+        const requestId = `bg_${Date.now()}_${Math.random()
+          .toString(36)
+          .substring(2, 9)}`;
+
+        const handler = (event: MessageEvent) => {
+          if (event.source !== window) return;
+          if (
+            event.data?.type === "FETCH_ASSET_PROXY_RESPONSE" &&
+            event.data?.requestId === requestId
+          ) {
+            window.removeEventListener("message", handler);
+            resolve(event.data.response || { ok: false, error: "No response" });
+          }
+        };
+
+        window.addEventListener("message", handler);
+
+        // Send request to content script for proxying
+        window.postMessage(
+          {
+            type: "FETCH_ASSET_PROXY",
+            requestId,
+            message,
+          },
+          "*",
+        );
+
+        // Timeout fallback
+        setTimeout(() => {
+          window.removeEventListener("message", handler);
+          resolve({ ok: false, error: "Message proxy timeout" });
+        }, timeoutMs);
+      }
+    });
+  }
+
   private assets = {
     images: new Map<
       string,
@@ -590,6 +661,8 @@ export class DOMExtractor {
         hash?: string;
         width?: number;
         height?: number;
+        maxRenderedWidth?: number; // MAX rendered width across all usages
+        maxRenderedHeight?: number; // MAX rendered height across all usages
         error?: string;
       }
     >(),
@@ -627,7 +700,7 @@ export class DOMExtractor {
 
   constructor() {
     console.log(
-      "🎯 [DOM EXTRACTOR v2.0] Production-grade extractor initialized"
+      "🎯 [DOM EXTRACTOR v2.0] Production-grade extractor initialized",
     );
   }
 
@@ -741,13 +814,18 @@ export class DOMExtractor {
     console.log("🔄 [PRE-CAPTURE] Starting content triggering...");
     const startTime = Date.now();
 
+    // Emit early progress so UI doesn't appear stuck
+    this.postProgress("Preparing page for capture...", 2);
+
     try {
       // Best-effort scroll normalization for stable capture (do not treat failure as fatal)
       const before = this.getScrollOffsetNow();
 
+      this.postProgress("Normalizing scroll position...", 3);
+
       if (before.left !== 0 || before.top !== 0) {
         console.warn(
-          `⚠️ [PRE-CAPTURE] Page not at (0,0) - at (${before.left}, ${before.top}). Attempting stabilized scroll reset...`
+          `⚠️ [PRE-CAPTURE] Page not at (0,0) - at (${before.left}, ${before.top}). Attempting stabilized scroll reset...`,
         );
 
         const result = await this.normalizeScrollToOrigin({
@@ -757,38 +835,44 @@ export class DOMExtractor {
 
         if (result.normalized) {
           console.log(
-            `✅ [PRE-CAPTURE] Scroll reset successful (0,0) in ${result.elapsedMs}ms`
+            `✅ [PRE-CAPTURE] Scroll reset successful (0,0) in ${result.elapsedMs}ms`,
           );
         } else {
           console.warn(
-            `⚠️ [PRE-CAPTURE] Scroll reset could not stabilize at (0,0) (ended at (${result.left}, ${result.top}) after ${result.elapsedMs}ms). Proceeding with scroll-invariant coordinates.`
+            `⚠️ [PRE-CAPTURE] Scroll reset could not stabilize at (0,0) (ended at (${result.left}, ${result.top}) after ${result.elapsedMs}ms). Proceeding with scroll-invariant coordinates.`,
           );
         }
       } else {
         console.log(
-          "✅ [PRE-CAPTURE] Page already at (0,0) - coordinates will be stable"
+          "✅ [PRE-CAPTURE] Page already at (0,0) - coordinates will be stable",
         );
       }
 
       // Trigger viewport resize to fire resize handlers
+      this.postProgress("Triggering resize handlers...", 5);
       this.triggerResizeEvent();
 
-      // CRITICAL: Auto-scroll to trigger lazy loading (was previously missing)
+      // Auto-scroll to trigger lazy loading before capture
+      this.postProgress("Auto-scrolling to load lazy content...", 6);
       await this.autoScrollPage();
 
       // Wait for animations and dynamic content to settle
+      this.postProgress("Waiting for animations to settle...", 17);
       await this.waitForAnimationSettle();
 
+      this.postProgress("Pre-capture complete, starting extraction...", 19);
       console.log(
         `✅ [PRE-CAPTURE] Content triggering complete in ${
           Date.now() - startTime
-        }ms`
+        }ms`,
       );
     } catch (e) {
       console.warn(
         "⚠️ [PRE-CAPTURE] Error during content triggering (continuing anyway):",
-        e
+        e,
       );
+      // Still emit progress even on error so we don't appear stuck
+      this.postProgress("Pre-capture completed with warnings...", 19);
     }
   }
 
@@ -806,7 +890,7 @@ export class DOMExtractor {
     let scrollTarget: Element | Window = window;
     let maxScrollHeight = Math.max(
       document.body.scrollHeight,
-      document.documentElement.scrollHeight
+      document.documentElement.scrollHeight,
     );
     let viewHeight = window.innerHeight;
 
@@ -815,13 +899,13 @@ export class DOMExtractor {
 
     if (!isBodyScrollable) {
       console.log(
-        "📜 [AUTO-SCROLL] Body not scrollable, searching for internal scroll container..."
+        "📜 [AUTO-SCROLL] Body not scrollable, searching for internal scroll container...",
       );
       // Search for the largest scrollable element
       const candidates = Array.from(
         document.querySelectorAll(
-          "div, main, section, article, [role='main'], ul, ol"
-        )
+          "div, main, section, article, [role='main'], ul, ol",
+        ),
       );
       let bestCandidate: Element | null = null;
       let maxArea = 0;
@@ -856,16 +940,17 @@ export class DOMExtractor {
         viewHeight = bestCandidate.clientHeight;
         console.log(
           "📜 [AUTO-SCROLL] Found internal scroll container:",
-          bestCandidate
+          bestCandidate,
         );
       } else {
         console.log(
-          "📜 [AUTO-SCROLL] No suitable internal container found, defaulting to window"
+          "📜 [AUTO-SCROLL] No suitable internal container found, defaulting to window",
         );
       }
     }
 
-    const scrollStep = Math.floor(viewHeight * 0.4); // Reduced to 40% for thorough capture
+    // Ensure scrollStep is at least 50px to prevent infinite loops if viewHeight is small
+    const scrollStep = Math.max(50, Math.floor(viewHeight * 0.4));
 
     // Dynamic iteration limit based on current height, will be updated if height grows
     let maxIterations =
@@ -885,7 +970,8 @@ export class DOMExtractor {
         : (scrollTarget as Element).scrollTop;
 
     // Use a safety cutoff to prevent infinite loops (Increased to 1000 steps)
-    const ABSOLUTE_MAX_ITERATIONS = 1000;
+    // Use a safety cutoff to prevent infinite loops (Reduced to 25 steps ~ 10 screens)
+    const ABSOLUTE_MAX_ITERATIONS = 25;
 
     while (
       currentScroll < maxScrollHeight &&
@@ -909,7 +995,7 @@ export class DOMExtractor {
       if (scrollTarget === window) {
         newMaxHeight = Math.max(
           document.body.scrollHeight,
-          document.documentElement.scrollHeight
+          document.documentElement.scrollHeight,
         );
       } else {
         newMaxHeight = (scrollTarget as Element).scrollHeight;
@@ -921,21 +1007,28 @@ export class DOMExtractor {
         maxIterations =
           Math.ceil(maxScrollHeight / Math.max(1, scrollStep)) + 20;
         console.log(
-          `📜 [AUTO-SCROLL] Page grew to ${maxScrollHeight}px, extending scroll...`
+          `📜 [AUTO-SCROLL] Page grew to ${maxScrollHeight}px, extending scroll...`,
         );
       }
 
       currentScroll += scrollStep;
       iteration++;
 
+      // Emit progress during auto-scroll (maps 6-16% range)
+      const scrollPercent = Math.min(
+        100,
+        Math.floor((currentScroll / maxScrollHeight) * 100),
+      );
+      // Map scroll progress (0-100%) to extraction progress (6-16%)
+      const mappedProgress = 6 + (scrollPercent / 100) * 10;
+      this.postProgress(
+        `Auto-scrolling to load lazy content... ${scrollPercent}%`,
+        mappedProgress,
+      );
+
       // Log progress every 5 iterations
       if (iteration % 5 === 0) {
-        console.log(
-          `📜 [AUTO-SCROLL] Progress: ${Math.min(
-            100,
-            Math.floor((currentScroll / maxScrollHeight) * 100)
-          )}%`
-        );
+        console.log(`📜 [AUTO-SCROLL] Progress: ${scrollPercent}%`);
       }
     }
 
@@ -952,7 +1045,7 @@ export class DOMExtractor {
     }
 
     console.log(
-      `📜 [AUTO-SCROLL] Complete: scrolled ${iteration} steps, max height: ${maxScrollHeight}px`
+      `📜 [AUTO-SCROLL] Complete: scrolled ${iteration} steps, max height: ${maxScrollHeight}px`,
     );
   }
 
@@ -999,7 +1092,7 @@ export class DOMExtractor {
    * Times out to avoid stalling extraction on pages with hanging font promises.
    */
   private async waitForDocumentFontsReady(
-    timeoutMs: number = 4000
+    timeoutMs: number = 4000,
   ): Promise<void> {
     try {
       if (!(document as any).fonts?.ready) return;
@@ -1008,14 +1101,14 @@ export class DOMExtractor {
       await Promise.race([
         readyPromise,
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("fonts.ready timeout")), timeoutMs)
+          setTimeout(() => reject(new Error("fonts.ready timeout")), timeoutMs),
         ),
       ]);
       console.log("✅ [FONTS] document.fonts.ready resolved");
     } catch (err) {
       console.warn(
         "⚠️ [FONTS] Failed or timed out waiting for document.fonts.ready:",
-        err
+        err,
       );
     }
   }
@@ -1037,7 +1130,7 @@ export class DOMExtractor {
         "extractPageToSchema",
         msg,
         undefined,
-        "critical"
+        "critical",
       );
       return this.returnPartialSchema(`CRITICAL_FAILURE: ${msg}`);
     }
@@ -1056,6 +1149,8 @@ export class DOMExtractor {
     // Clear image dedup cache for fresh capture
     this.failedImageUrls.clear();
     this.successfulImageFetches = 0;
+    // MONOTONIC PROGRESS FIX: Reset progress to 0 for new extraction
+    this.performanceTracker.currentProgress = 0;
 
     console.log("🎯 [EXTRACTION START] Starting DOM extraction...");
     console.log("📍 Location:", window.location.href);
@@ -1081,7 +1176,7 @@ export class DOMExtractor {
     this.capturedScrollOffset = this.getScrollOffsetNow();
 
     console.log(
-      `📐 [SCROLL CAPTURE] Captured extraction scroll offset: (${this.capturedScrollOffset.left}, ${this.capturedScrollOffset.top})`
+      `📐 [SCROLL CAPTURE] Captured extraction scroll offset: (${this.capturedScrollOffset.left}, ${this.capturedScrollOffset.top})`,
     );
 
     if (
@@ -1089,43 +1184,42 @@ export class DOMExtractor {
       this.capturedScrollOffset.top !== 0
     ) {
       console.warn(
-        `⚠️ [SCROLL NOTICE] Capture is starting from a non-zero scroll offset (${this.capturedScrollOffset.left}, ${this.capturedScrollOffset.top}). This is supported (coordinates are scroll-invariant), but the imported design will reflect this scroll position unless the page can be stabilized at (0,0).`
+        `⚠️ [SCROLL NOTICE] Capture is starting from a non-zero scroll offset (${this.capturedScrollOffset.left}, ${this.capturedScrollOffset.top}). This is supported (coordinates are scroll-invariant), but the imported design will reflect this scroll position unless the page can be stabilized at (0,0).`,
       );
     }
 
     // VERIFICATION LOG: Exactly one per capture, confirms offset is applied to all coordinates
     console.log(
-      `📍 [POSITION_OFFSET_APPLIED] {x: ${this.capturedScrollOffset.left}, y: ${this.capturedScrollOffset.top}}`
+      `📍 [POSITION_OFFSET_APPLIED] {x: ${this.capturedScrollOffset.left}, y: ${this.capturedScrollOffset.top}}`,
     );
 
     // ENHANCED: Set up progress heartbeat to prevent watchdog timeout
-    // Use 400ms interval (within 250-500ms range) for more responsive progress
+    // MONOTONIC PROGRESS FIX: Use current progress instead of time-based calculation
+    // This prevents the heartbeat from resetting progress to a lower value
     const progressHeartbeat = setInterval(() => {
       const elapsed = Date.now() - this.extractionStartTime;
-      const percent = Math.min(
-        Math.floor((elapsed / this.MAX_EXTRACTION_TIME) * 100),
-        99
-      );
       const nodesProcessed = this.performanceTracker.nodesProcessed;
       const phase = this.performanceTracker.currentPhase;
       const detail = this.performanceTracker.currentDetail || "";
+      // Use the current monotonic progress instead of calculating from time
+      // This just re-emits the current progress to keep the UI updated without jumping
       this.postProgress(
         `Extracting... (${Math.floor(
-          elapsed / 1000
+          elapsed / 1000,
         )}s, ${nodesProcessed} nodes)\n${phase}${detail ? ": " + detail : ""}`,
-        percent
+        this.performanceTracker.currentProgress,
       );
       this.lastYieldTime = Date.now();
     }, this.performanceConfig.heartbeatIntervalMs); // Post progress every 500ms (configured in performanceConfig)
 
     // CRITICAL: Aggressive navigation prevention for Site SPA
     // Site uses pushState/replaceState for navigation, so we need to intercept those
-    // ENHANCED: Check if navigation is already blocked (prevent duplicate setup)
+    // Reset stale flag from previous failed capture before checking
     if ((window as any).__NAVIGATION_BLOCKED__) {
-      console.warn(
-        "⚠️ [NAVIGATION] Navigation blocking already active, skipping duplicate setup"
+      console.log(
+        "🔄 [NAVIGATION] Clearing stale navigation block from previous capture",
       );
-      // Still proceed with extraction but don't set up blocking again
+      (window as any).__NAVIGATION_BLOCKED__ = false;
     }
 
     const originalUrl = window.location.href;
@@ -1149,7 +1243,7 @@ export class DOMExtractor {
       this: History,
       state: any,
       title: string,
-      url?: string | null
+      url?: string | null,
     ) {
       if (navigationBlocked) {
         if (url) {
@@ -1161,7 +1255,7 @@ export class DOMExtractor {
 
             if (isDifferentPage) {
               console.warn(
-                `🚫 [NAVIGATION BLOCK] Blocked pushState to: ${newUrl} (original: ${originalUrl})`
+                `🚫 [NAVIGATION BLOCK] Blocked pushState to: ${newUrl} (original: ${originalUrl})`,
               );
               // ENHANCED: Immediate restoration with multiple attempts
               let restored = false;
@@ -1171,7 +1265,7 @@ export class DOMExtractor {
                     window.history,
                     null,
                     "",
-                    originalUrl
+                    originalUrl,
                   );
                   // Check immediately
                   if (window.location.href === originalUrl) {
@@ -1189,11 +1283,11 @@ export class DOMExtractor {
                       window.history,
                       null,
                       "",
-                      originalUrl
+                      originalUrl,
                     );
                     if (window.location.href !== originalUrl) {
                       console.error(
-                        `❌ [NAVIGATION] pushState restoration failed. Current: ${window.location.href}`
+                        `❌ [NAVIGATION] pushState restoration failed. Current: ${window.location.href}`,
                       );
                     }
                   } catch {}
@@ -1206,7 +1300,7 @@ export class DOMExtractor {
           } catch (urlError) {
             // If URL parsing fails, block it to be safe
             console.warn(
-              `🚫 [NAVIGATION BLOCK] Blocked pushState with invalid URL: ${url}`
+              `🚫 [NAVIGATION BLOCK] Blocked pushState with invalid URL: ${url}`,
             );
             return;
           }
@@ -1214,7 +1308,7 @@ export class DOMExtractor {
           // For Site, be more lenient with state-only changes (might be needed for player state)
           // But log it for debugging
           console.log(
-            `ℹ️ [NAVIGATION] Allowed pushState without URL (state-only change)`
+            `ℹ️ [NAVIGATION] Allowed pushState without URL (state-only change)`,
           );
         }
       }
@@ -1225,7 +1319,7 @@ export class DOMExtractor {
       this: History,
       state: any,
       title: string,
-      url?: string | null
+      url?: string | null,
     ) {
       if (navigationBlocked) {
         if (url) {
@@ -1234,7 +1328,7 @@ export class DOMExtractor {
             // Block if URL is different
             if (newUrl !== originalUrl) {
               console.warn(
-                `🚫 [NAVIGATION BLOCK] Blocked replaceState to: ${newUrl} (original: ${originalUrl})`
+                `🚫 [NAVIGATION BLOCK] Blocked replaceState to: ${newUrl} (original: ${originalUrl})`,
               );
               // Immediately restore original URL
               try {
@@ -1242,7 +1336,7 @@ export class DOMExtractor {
                   window.history,
                   null,
                   "",
-                  originalUrl
+                  originalUrl,
                 );
                 setTimeout(() => {
                   if (window.location.href !== originalUrl) {
@@ -1250,7 +1344,7 @@ export class DOMExtractor {
                       window.history,
                       null,
                       "",
-                      originalUrl
+                      originalUrl,
                     );
                   }
                 }, 0);
@@ -1261,7 +1355,7 @@ export class DOMExtractor {
           } catch (urlError) {
             // If URL parsing fails, block it to be safe
             console.warn(
-              `🚫 [NAVIGATION BLOCK] Blocked replaceState with invalid URL: ${url}`
+              `🚫 [NAVIGATION BLOCK] Blocked replaceState with invalid URL: ${url}`,
             );
             return;
           }
@@ -1291,7 +1385,7 @@ export class DOMExtractor {
         }
         if (!(window as any).__NAV_LOGGED__[eventType]) {
           console.warn(
-            `🚫 [NAVIGATION BLOCK] Preventing ${eventType} navigation during extraction`
+            `🚫 [NAVIGATION BLOCK] Preventing ${eventType} navigation during extraction`,
           );
           (window as any).__NAV_LOGGED__[eventType] = true;
           // Reset after 1 second to allow new logs if needed
@@ -1319,7 +1413,7 @@ export class DOMExtractor {
           } catch (error) {
             console.warn(
               "⚠️ [NAVIGATION FIX] Could not restore from popstate:",
-              error
+              error,
             );
           }
         }
@@ -1327,49 +1421,40 @@ export class DOMExtractor {
       }
     };
 
-    // CRITICAL FIX: Block all anchor clicks and form submissions on Site
-    // Site uses anchor tags for navigation, so we need to prevent clicks
+    // Block anchor clicks that would navigate away from the current page
+    // SELECTIVE: Only block links that would cause actual page navigation
+    // Allow clicks on non-navigation elements (buttons, form inputs, etc.) to pass through
     const blockAnchorClicks = (e: MouseEvent) => {
       if (!navigationBlocked) return;
 
       const target = e.target as HTMLElement;
       if (!target) return;
 
-      // Find the closest anchor tag
-      const anchor = target.closest("a[href]");
-      if (anchor) {
-        const href = (anchor as HTMLAnchorElement).href;
-        if (href && href !== originalUrl) {
-          // Check if it's a different video or page
-          try {
-            const newUrl = new URL(href, window.location.href).href;
-            const isDifferentVideo =
-              newUrl !== originalUrl ||
-              (newUrl.includes("/watch?v=") &&
-                originalUrl.includes("/watch?v=") &&
-                newUrl.match(/[?&]v=([^&\s#]+)/)?.[1] !==
-                  originalUrl.match(/[?&]v=([^&\s#]+)/)?.[1]);
+      // Find the closest anchor tag with an href attribute
+      const anchor = target.closest("a[href]") as HTMLAnchorElement | null;
+      if (!anchor) return; // Not an anchor click - let it through
 
-            if (isDifferentVideo) {
-              console.warn(
-                `🚫 [NAVIGATION BLOCK] Blocked anchor click to: ${newUrl}`
-              );
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              return false;
-            }
-          } catch (urlError) {
-            // If URL parsing fails, block it to be safe
-            console.warn(
-              `🚫 [NAVIGATION BLOCK] Blocked anchor click with invalid URL: ${href}`
-            );
-            e.preventDefault();
-            e.stopPropagation();
-            e.stopImmediatePropagation();
-            return false;
-          }
-        }
+      const href = anchor.href;
+      // Skip anchors without real hrefs (javascript:, #, empty)
+      if (
+        !href ||
+        href === originalUrl ||
+        href.startsWith("javascript:") ||
+        href === "#" ||
+        anchor.getAttribute("href")?.startsWith("#")
+      ) {
+        return; // Same page or non-navigation link - let it through
+      }
+
+      // Check if this would navigate to a different page
+      const newUrl = new URL(href, window.location.href).href;
+      if (newUrl !== originalUrl) {
+        console.warn(
+          `🚫 [NAVIGATION BLOCK] Blocked anchor navigation to: ${newUrl}`,
+        );
+        // Only preventDefault - do NOT use stopImmediatePropagation
+        // This allows other click handlers (dropdowns, modals, etc.) to still work
+        e.preventDefault();
       }
     };
 
@@ -1390,7 +1475,7 @@ export class DOMExtractor {
         currentSearch !== originalSearch
       ) {
         console.warn(
-          `⚠️ [NAVIGATION DETECTED] URL changed from ${originalUrl} to ${currentUrl}`
+          `⚠️ [NAVIGATION DETECTED] URL changed from ${originalUrl} to ${currentUrl}`,
         );
 
         // ENHANCED: Multiple aggressive restoration attempts
@@ -1411,7 +1496,7 @@ export class DOMExtractor {
                     window.history,
                     null,
                     "",
-                    originalUrl
+                    originalUrl,
                   );
                   if (window.location.href === originalUrl) break;
                 }
@@ -1424,7 +1509,7 @@ export class DOMExtractor {
               console.log(
                 `✅ [NAVIGATION FIX] Restored original URL (attempt ${
                   attempt + 1
-                })`
+                })`,
               );
               break;
             }
@@ -1432,7 +1517,7 @@ export class DOMExtractor {
             if (attempt === maxRestoreAttempts - 1) {
               console.warn(
                 `⚠️ [NAVIGATION FIX] Restore attempt ${attempt + 1} failed:`,
-                error
+                error,
               );
             }
           }
@@ -1448,7 +1533,7 @@ export class DOMExtractor {
         // If still not restored after all attempts, log critical error
         if (!restored && window.location.href !== originalUrl) {
           console.error(
-            `❌ [NAVIGATION FAIL] Could not restore URL after ${maxRestoreAttempts} attempts. Current: ${window.location.href}, Original: ${originalUrl}`
+            `❌ [NAVIGATION FAIL] Could not restore URL after ${maxRestoreAttempts} attempts. Current: ${window.location.href}, Original: ${originalUrl}`,
           );
           // ENHANCED: Last resort - try to prevent further navigation
           try {
@@ -1460,88 +1545,66 @@ export class DOMExtractor {
               return;
             };
             console.warn(
-              "🚫 [NAVIGATION] Disabled history API completely as last resort"
+              "🚫 [NAVIGATION] Disabled history API completely as last resort",
             );
           } catch {}
         }
       }
     };
 
-    // CRITICAL FIX: Enhanced anchor click blocking for Site
-    // Site uses anchor tags extensively for navigation, so we need aggressive blocking
+    // SELECTIVE: Block clicks that would trigger navigation, but allow other clicks through
+    // This is a secondary handler that catches navigation attempts blockAnchorClicks might miss
     const blockNavigationClicks = (e: MouseEvent) => {
       if (!navigationBlocked) return;
 
       const target = e.target as HTMLElement;
       if (!target) return;
 
-      // ENHANCED: Block ALL navigation clicks, not just Site-specific elements
-      // This prevents any link from opening a new page during extraction
-
       // Check for anchor tags with href (most common navigation method)
-      const link =
-        target.closest("a[href]") || (target.tagName === "A" ? target : null);
+      const link = target.closest("a[href]") as HTMLAnchorElement | null;
       if (link) {
-        const href = (link as HTMLAnchorElement).href;
-        if (href) {
-          try {
-            // Block ALL external navigation (different URL)
-            const currentUrlObj = new URL(window.location.href);
-            const targetUrlObj = new URL(href, window.location.href);
+        const href = link.href;
+        const hrefAttr = link.getAttribute("href") || "";
 
-            // Generic: Check if it's a different page (different origin or path)
-            const isDifferentPage = targetUrlObj.href !== currentUrlObj.href;
-
-            // Removed site-specific video ID checks in favor of strict URL equality
-            const isDifferentVideo = false;
-
-            // Block if it's a different page or video (not just hash/anchor)
-            if (
-              (isDifferentPage || isDifferentVideo) &&
-              !href.startsWith("#") &&
-              !href.startsWith("javascript:")
-            ) {
-              console.warn(
-                `🚫 [NAVIGATION BLOCK] Blocked click on navigation link: ${href} (original: ${originalUrl})`
-              );
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              return false;
-            }
-          } catch (urlError) {
-            // If URL parsing fails, block it to be safe
-            console.warn(
-              `🚫 [NAVIGATION BLOCK] Blocked click on link with unparseable URL: ${href}`
-            );
-            e.preventDefault();
-            e.stopPropagation();
-            e.stopImmediatePropagation();
-            return false;
-          }
+        // Allow same-page links, hash links, and javascript: links
+        if (
+          !href ||
+          href === originalUrl ||
+          hrefAttr.startsWith("#") ||
+          hrefAttr.startsWith("javascript:")
+        ) {
+          return; // Not actual navigation - let it through
         }
+
+        // Block navigation to different pages
+        const targetUrl = new URL(href, window.location.href).href;
+        if (targetUrl !== originalUrl) {
+          console.warn(
+            `🚫 [NAVIGATION BLOCK] Blocked navigation click to: ${href}`,
+          );
+          // Only preventDefault - allow event to continue for non-navigation handlers
+          e.preventDefault();
+        }
+        return;
       }
 
-      // Block elements with onclick handlers that might trigger navigation
-      if (
-        (target as any).onclick ||
-        target.hasAttribute("onclick") ||
-        target.getAttribute("data-navigation") === "true"
-      ) {
-        // Only block if it's likely to cause navigation
-        const onclickStr = target.getAttribute("onclick") || "";
-        if (
-          onclickStr.includes("location") ||
-          onclickStr.includes("window.open") ||
-          onclickStr.includes("href")
-        ) {
+      // Block elements with onclick attributes that explicitly navigate
+      // Only block if the onclick string clearly indicates navigation
+      const onclickAttr = target.getAttribute("onclick");
+      if (onclickAttr) {
+        // Check for explicit navigation patterns in the onclick string
+        const isNavigationOnclick =
+          onclickAttr.includes("location.href") ||
+          onclickAttr.includes("location.assign") ||
+          onclickAttr.includes("location.replace") ||
+          onclickAttr.includes("window.location") ||
+          onclickAttr.includes("window.open(");
+
+        if (isNavigationOnclick) {
           console.warn(
-            `🚫 [NAVIGATION BLOCK] Blocked click on element with navigation onclick`
+            `🚫 [NAVIGATION BLOCK] Blocked onclick navigation: ${onclickAttr.substring(0, 50)}...`,
           );
           e.preventDefault();
-          e.stopPropagation();
-          e.stopImmediatePropagation();
-          return false;
         }
       }
     };
@@ -1599,13 +1662,13 @@ export class DOMExtractor {
       this: Window,
       url?: string | URL | null,
       target?: string,
-      features?: string
+      features?: string,
     ): Window | null {
       if (navigationBlocked && url) {
         const urlStr = typeof url === "string" ? url : url.toString();
         if (urlStr) {
           console.warn(
-            `🚫 [NAVIGATION BLOCK] Blocked window.open to: ${urlStr}`
+            `🚫 [NAVIGATION BLOCK] Blocked window.open to: ${urlStr}`,
           );
           return null; // Block opening new windows/tabs
         }
@@ -1620,7 +1683,7 @@ export class DOMExtractor {
     try {
       const locationDescriptor = Object.getOwnPropertyDescriptor(
         window,
-        "location"
+        "location",
       );
       if (locationDescriptor && locationDescriptor.set) {
         const originalLocationSetter = locationDescriptor.set;
@@ -1633,7 +1696,7 @@ export class DOMExtractor {
 
                 if (isDifferentPage) {
                   console.warn(
-                    `🚫 [NAVIGATION BLOCK] Blocked location.href assignment to: ${newUrl}`
+                    `🚫 [NAVIGATION BLOCK] Blocked location.href assignment to: ${newUrl}`,
                   );
                   // ENHANCED: Multiple restoration attempts
                   for (let i = 0; i < 3; i++) {
@@ -1642,7 +1705,7 @@ export class DOMExtractor {
                         window.history,
                         null,
                         "",
-                        originalUrl
+                        originalUrl,
                       );
                       if (window.location.href === originalUrl) break;
                     } catch {}
@@ -1664,7 +1727,7 @@ export class DOMExtractor {
     } catch (locationError) {
       // Location setter interception may not work due to browser security
       console.log(
-        "ℹ️ [NAVIGATION] Could not intercept location.href setter (expected in some browsers)"
+        "ℹ️ [NAVIGATION] Could not intercept location.href setter (expected in some browsers)",
       );
     }
 
@@ -1683,14 +1746,14 @@ export class DOMExtractor {
             const urlStr = typeof url === "string" ? url : url.href;
             if (urlStr && urlStr !== originalUrl && urlStr) {
               console.warn(
-                `🚫 [NAVIGATION BLOCK] Blocked location.assign to: ${urlStr}`
+                `🚫 [NAVIGATION BLOCK] Blocked location.assign to: ${urlStr}`,
               );
               try {
                 originalReplaceState.call(
                   window.history,
                   null,
                   "",
-                  originalUrl
+                  originalUrl,
                 );
               } catch {}
               return;
@@ -1704,14 +1767,14 @@ export class DOMExtractor {
             const urlStr = typeof url === "string" ? url : url.href;
             if (urlStr && urlStr !== originalUrl && urlStr) {
               console.warn(
-                `🚫 [NAVIGATION BLOCK] Blocked location.replace to: ${urlStr}`
+                `🚫 [NAVIGATION BLOCK] Blocked location.replace to: ${urlStr}`,
               );
               try {
                 originalReplaceState.call(
                   window.history,
                   null,
                   "",
-                  originalUrl
+                  originalUrl,
                 );
               } catch {}
               return;
@@ -1721,11 +1784,11 @@ export class DOMExtractor {
         };
 
         console.log(
-          "✅ [NAVIGATION] Intercepted location.assign and location.replace"
+          "✅ [NAVIGATION] Intercepted location.assign and location.replace",
         );
       } catch (assignError) {
         console.log(
-          "ℹ️ [NAVIGATION] Could not intercept location.assign/replace"
+          "ℹ️ [NAVIGATION] Could not intercept location.assign/replace",
         );
       }
     }
@@ -1733,11 +1796,14 @@ export class DOMExtractor {
     // ENHANCED: Track if cleanup has already been called to prevent duplicate cleanup
     let cleanupCalled = false;
 
+    // Safety timeout handle - forces cleanup if capture hangs
+    let safetyTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
     // Cleanup function - defined in scope for use in try/catch
     const cleanupNavigationBlock = () => {
       if (cleanupCalled) {
         console.warn(
-          "⚠️ [NAVIGATION] Cleanup already called, skipping duplicate cleanup"
+          "⚠️ [NAVIGATION] Cleanup already called, skipping duplicate cleanup",
         );
         return;
       }
@@ -1747,7 +1813,28 @@ export class DOMExtractor {
       // Clear global flag
       (window as any).__NAVIGATION_BLOCKED__ = false;
 
-      // CRITICAL FIX: Remove click blocking event listener
+      // Clear safety timeout
+      if (safetyTimeoutId !== null) {
+        clearTimeout(safetyTimeoutId);
+        safetyTimeoutId = null;
+      }
+
+      // CRITICAL FIX: Remove determinism style element that disables animations
+      const determinismStyle = document.getElementById(
+        "__web_to_figma_determinism__",
+      );
+      if (determinismStyle) {
+        determinismStyle.remove();
+        console.log(
+          "🔓 [DETERMINISM] Removed animation-blocking style element",
+        );
+      }
+      // Clear the global flag so it can be re-applied on next capture
+      delete (window as any).__WEB_TO_FIGMA_DETERMINISM_APPLIED__;
+
+      // CRITICAL FIX: Remove BOTH click blocking event listeners
+      // blockAnchorClicks is added at line 1482, blockNavigationClicks at line 1669
+      document.removeEventListener("click", blockAnchorClicks, true);
       if (typeof blockNavigationClicks === "function") {
         document.removeEventListener("click", blockNavigationClicks, true);
       }
@@ -1772,7 +1859,7 @@ export class DOMExtractor {
         // Try to restore original location descriptor
         const locationDescriptor = Object.getOwnPropertyDescriptor(
           window,
-          "location"
+          "location",
         );
         if (locationDescriptor && locationDescriptor.set) {
           // Location setter was intercepted, but we can't easily restore it
@@ -1822,6 +1909,18 @@ export class DOMExtractor {
       clearInterval(urlCheckInterval);
     };
 
+    // SAFETY TIMEOUT: Force cleanup if capture hangs for more than 30 seconds
+    // This prevents permanent page breakage if extraction fails catastrophically
+    const SAFETY_TIMEOUT_MS = 30000;
+    safetyTimeoutId = setTimeout(() => {
+      if (!cleanupCalled) {
+        console.error(
+          `⚠️ [SAFETY TIMEOUT] Capture exceeded ${SAFETY_TIMEOUT_MS / 1000}s - forcing cleanup to restore page functionality`,
+        );
+        cleanupNavigationBlock();
+      }
+    }, SAFETY_TIMEOUT_MS);
+
     // CRITICAL FIX: Ensure page is scrolled to top before extraction
     // This prevents headers and top-level elements from having incorrect positions
     const currentScrollTop =
@@ -1834,7 +1933,7 @@ export class DOMExtractor {
     if (currentScrollTop > 1 || currentScrollLeft > 1) {
       console.log(
         `🔄 [POSITION FIX] Page is scrolled (top: ${currentScrollTop}, left: ${currentScrollLeft}). ` +
-          `Scrolling to top to ensure accurate positioning...`
+          `Scrolling to top to ensure accurate positioning...`,
       );
 
       // Multiple scroll attempts for stubborn pages like Site
@@ -1862,7 +1961,7 @@ export class DOMExtractor {
                   () => {
                     resolve(undefined);
                   },
-                  scrollAttempts > 0 ? 100 : 50
+                  scrollAttempts > 0 ? 100 : 50,
                 ); // Longer delay on retries
               });
             });
@@ -1879,7 +1978,7 @@ export class DOMExtractor {
           console.log(
             `✅ [POSITION FIX] Scroll reset complete after ${
               scrollAttempts + 1
-            } attempt(s)`
+            } attempt(s)`,
           );
           break;
         }
@@ -1891,7 +1990,7 @@ export class DOMExtractor {
         ) {
           console.warn(
             `⚠️ [POSITION FIX] Scroll appears stuck (top: ${newScrollTop}, left: ${newScrollLeft}). ` +
-              `This may be due to Site's scroll restoration. Continuing with current position...`
+              `This may be due to Site's scroll restoration. Continuing with current position...`,
           );
           // CRITICAL FIX: Disable scroll restoration for Site to prevent interference
           try {
@@ -1899,7 +1998,7 @@ export class DOMExtractor {
               if ("scrollRestoration" in history) {
                 (history as any).scrollRestoration = "manual";
                 console.log(
-                  "🔧 [SITE] Disabled scroll restoration to prevent interference"
+                  "🔧 [SITE] Disabled scroll restoration to prevent interference",
                 );
               }
             }
@@ -1918,7 +2017,7 @@ export class DOMExtractor {
           console.log(
             `🔄 [POSITION FIX] Retry ${
               scrollAttempts + 1
-            }/${maxAttempts} - current scroll: top=${newScrollTop}, left=${newScrollLeft}`
+            }/${maxAttempts} - current scroll: top=${newScrollTop}, left=${newScrollLeft}`,
           );
         }
       }
@@ -1932,7 +2031,7 @@ export class DOMExtractor {
       if (finalScrollTop > 1 || finalScrollLeft > 1) {
         console.warn(
           `⚠️ [POSITION FIX] Could not fully reset scroll (top: ${finalScrollTop}, left: ${finalScrollLeft}). ` +
-            `Position calculations will account for this offset.`
+            `Position calculations will account for this offset.`,
         );
       }
     }
@@ -1955,7 +2054,7 @@ export class DOMExtractor {
       ) {
         documentBackgroundColor = bgColor;
         console.log(
-          `🎨 [BACKGROUND] Document background color detected: ${bgColor}`
+          `🎨 [BACKGROUND] Document background color detected: ${bgColor}`,
         );
       } else {
         // Check if html has a background
@@ -1966,14 +2065,14 @@ export class DOMExtractor {
         ) {
           documentBackgroundColor = htmlStyle.backgroundColor;
           console.log(
-            `🎨 [BACKGROUND] HTML background color detected: ${htmlStyle.backgroundColor}`
+            `🎨 [BACKGROUND] HTML background color detected: ${htmlStyle.backgroundColor}`,
           );
         }
       }
     } catch (error) {
       console.warn(
         "⚠️ [BACKGROUND] Failed to extract document background color:",
-        error
+        error,
       );
     }
 
@@ -2025,10 +2124,12 @@ export class DOMExtractor {
       const fontCollectionTime =
         Date.now() - this.performanceTracker.phaseStartTime;
       console.log(
-        `⏱️ [PHASE] Font collection completed in ${fontCollectionTime}ms`
+        `⏱️ [PHASE] Font collection completed in ${fontCollectionTime}ms`,
       );
 
       // Extract root node
+      this.totalOnPage = document.querySelectorAll("*").length;
+      console.log(`📊 [EXTRACTOR] Total nodes on page: ${this.totalOnPage}`);
       this.postProgress("Traversing DOM tree...", 35);
 
       // ENHANCED: Check for timeout before starting extraction
@@ -2041,23 +2142,23 @@ export class DOMExtractor {
       // This ensures we capture headers, navigation bars, fixed/sticky elements, and overlays
       // that may be positioned outside of document.body
       console.log(
-        "🔧 [ROOT FIX] Capturing document.documentElement instead of document.body to include headers and positioned elements"
+        "🔧 [ROOT FIX] Capturing document.documentElement instead of document.body to include headers and positioned elements",
       );
       const rootNode = await this.extractNodeSafe(
         document.documentElement,
-        null
+        null,
       );
 
       const nodeExtractionTime =
         Date.now() - this.performanceTracker.phaseStartTime;
       console.log(
-        `⏱️ [PHASE] Node extraction completed in ${nodeExtractionTime}ms`
+        `⏱️ [PHASE] Node extraction completed in ${nodeExtractionTime}ms`,
       );
 
       if (rootNode) {
         // Clean body/html backgrounds
         if (rootNode.htmlTag === "body" || rootNode.htmlTag === "html") {
-          console.log("🔄 [SCHEMA] Clearing body/html backgrounds");
+          // console.log("🔄 [SCHEMA] Clearing body/html backgrounds"); // DISABLED: Preserving background fidelity
           // CRITICAL FIX: Enforce FRAME type for root node to satisfy strict importer validation
           rootNode.type = "FRAME";
           const beforeFills = Array.isArray((rootNode as any).fills)
@@ -2066,10 +2167,10 @@ export class DOMExtractor {
           const beforeBgs = Array.isArray((rootNode as any).backgrounds)
             ? (rootNode as any).backgrounds.length
             : 0;
-          rootNode.fills = [];
-          if ((rootNode as any).backgrounds) {
-            (rootNode as any).backgrounds = [];
-          }
+          // rootNode.fills = []; // FIXED: Do not clear fills
+          // if ((rootNode as any).backgrounds) {
+          //   (rootNode as any).backgrounds = [];
+          // }
         }
         schema.root = rootNode;
 
@@ -2077,7 +2178,7 @@ export class DOMExtractor {
         const childCount = rootNode.children?.length || 0;
         if (childCount === 0) {
           console.error(
-            "❌ [CAPTURE_EMPTY_TREE] Root extracted but has 0 children"
+            "❌ [CAPTURE_EMPTY_TREE] Root extracted but has 0 children",
           );
           console.error("📊 [DIAGNOSTICS]", {
             nodesVisited: this.performanceTracker.nodesProcessed,
@@ -2134,17 +2235,17 @@ export class DOMExtractor {
                 hidden: this.diagnostics.skippedHidden,
                 zeroSize: this.diagnostics.skippedZeroSize,
               },
-            }
+            },
           );
 
           throw new Error(
-            "CAPTURE_EMPTY_TREE: Root extracted but contains zero children. Check diagnostics for skip reasons."
+            "CAPTURE_EMPTY_TREE: Root extracted but contains zero children. Check diagnostics for skip reasons.",
           );
         }
       } else {
         // Do NOT create fallback - if root extraction fails, the capture should fail
         console.error(
-          "❌ [EXTRACT] Root node extraction returned null - document.documentElement extraction failed"
+          "❌ [EXTRACT] Root node extraction returned null - document.documentElement extraction failed",
         );
         console.error("📊 [DIAGNOSTICS]", {
           nodesVisited: this.performanceTracker.nodesProcessed,
@@ -2172,8 +2273,36 @@ export class DOMExtractor {
         };
 
         throw new Error(
-          "Failed to extract page content - document.documentElement returned null"
+          "Failed to extract page content - document.documentElement returned null",
         );
+      }
+
+      // LAYOUT_PREVIEW: Emit early layout preview for skeleton animation
+      // This must happen BEFORE image processing so popup can start building skeleton
+      try {
+        const previewBlocks = this.generateLayoutPreviewBlocks(schema);
+        if (previewBlocks.length > 0) {
+          window.postMessage(
+            {
+              type: "LAYOUT_PREVIEW",
+              blocks: previewBlocks,
+              viewport: schema.metadata?.viewport || {
+                width: window.innerWidth,
+                height: window.innerHeight,
+              },
+              page: {
+                width: document.documentElement.scrollWidth,
+                height: document.documentElement.scrollHeight,
+              },
+            },
+            "*",
+          );
+          console.log(
+            `📐 [LAYOUT_PREVIEW] Sent ${previewBlocks.length} preview blocks to skeleton`,
+          );
+        }
+      } catch (error) {
+        console.warn("⚠️ [LAYOUT_PREVIEW] Failed to generate preview:", error);
       }
 
       // Phase tracking: Process images
@@ -2184,14 +2313,14 @@ export class DOMExtractor {
       const imageProcessingTime =
         Date.now() - this.performanceTracker.phaseStartTime;
       console.log(
-        `⏱️ [PHASE] Image processing completed in ${imageProcessingTime}ms`
+        `⏱️ [PHASE] Image processing completed in ${imageProcessingTime}ms`,
       );
 
       // Track image download failures in metadata
       if (imageResults.failed.length > 0) {
         (schema.metadata as any).imageDownloadFailures = imageResults.failed;
         console.warn(
-          `⚠️ [IMAGE] ${imageResults.failed.length} images failed to download`
+          `⚠️ [IMAGE] ${imageResults.failed.length} images failed to download`,
         );
       }
 
@@ -2199,21 +2328,26 @@ export class DOMExtractor {
       // PERFORMANCE FIX: Disabled by default to prevent timeouts (adds 10+ seconds)
       // TODO: Make this opt-in via capture options
       const ENABLE_HOVER_CAPTURE = false; // Disabled for performance
-      const isSite = false || false;
-      if (ENABLE_HOVER_CAPTURE && !isSite) {
+      if (ENABLE_HOVER_CAPTURE) {
         this.postProgress("Capturing hover states for buttons...", 68);
         try {
           await this.captureButtonHoverStates(schema);
         } catch (error) {
           console.warn(
             "⚠️ [HOVER] Hover state capture failed, continuing without hover states:",
-            error
+            error,
           );
           // Don't fail the entire extraction if hover capture fails
         }
       } else {
         console.log("ℹ️ [HOVER] Hover state capture disabled for performance");
       }
+
+      // Finalize assets (CRITICAL: Must be BEFORE validation so validator has data to check)
+      // DRAIN OPPORTUNISTIC ASSET QUEUE
+      await this.drainScreenshotQueue();
+
+      this.finalizeAssets(schema);
 
       // CRITICAL: Asset Completeness Validation
       // Ensure every imageHash in the schema has embedded bytes
@@ -2255,7 +2389,7 @@ export class DOMExtractor {
 
         // Create fetch via background helper
         const fetchViaBackground = async (
-          url: string
+          url: string,
         ): Promise<{ base64: string; mimeType?: string } | null> => {
           try {
             const result = await this.fetchImageViaBackgroundSafe(url);
@@ -2272,7 +2406,7 @@ export class DOMExtractor {
         const validationResult = await assetValidator.validate(
           schema,
           nodeHashMap,
-          fetchViaBackground
+          fetchViaBackground,
         );
 
         // Store validation metrics in schema metadata
@@ -2294,15 +2428,15 @@ export class DOMExtractor {
         console.log(
           `⏱️ [PHASE] Asset validation completed in ${
             Date.now() - this.performanceTracker.phaseStartTime
-          }ms`
+          }ms`,
         );
       } catch (error) {
         console.error("❌ [ASSET_VALIDATION] Validator failed:", error);
         // Non-blocking: continue with extraction even if validation fails
       }
 
-      // Finalize assets
-      this.finalizeAssets(schema);
+      // Finalize assets - MOVED TO BEFORE VALIDATION
+      // this.finalizeAssets(schema);
 
       // CRITICAL FIX: Remove DOM element references before serialization
       // This prevents "DataCloneError" when sending via postMessage
@@ -2352,6 +2486,7 @@ export class DOMExtractor {
 
       // Add Auto Layout metrics to schema
       if (!schema.metadata.extractionSummary) {
+        schema.metadata.extractedNodes = this.nodeId; // FIX: Ensure injected-script can read node count
         schema.metadata.extractionSummary = {
           scrollComplete: true,
           tokensExtracted: true,
@@ -2380,7 +2515,7 @@ export class DOMExtractor {
 
       // Convert rejection reasons map to array format
       const topRejectReasons = Array.from(
-        this.autoLayoutMetrics.rejectionReasons.entries()
+        this.autoLayoutMetrics.rejectionReasons.entries(),
       )
         .map(([reason, count]) => ({ reason, count }))
         .sort((a, b) => b.count - a.count)
@@ -2414,7 +2549,7 @@ export class DOMExtractor {
         this.autoLayoutMetrics.autoLayoutAppliedSafe === 0
       ) {
         console.warn(
-          "⚠️ [AUTO_LAYOUT REGRESSION] Found layout candidates but applied none - this may be a regression"
+          "⚠️ [AUTO_LAYOUT REGRESSION] Found layout candidates but applied none - this may be a regression",
         );
       }
 
@@ -2430,8 +2565,37 @@ export class DOMExtractor {
 
       // IMAGE PIPELINE SUMMARY: Verify deduplication and success counts
       console.log(
-        `🖼️ [IMAGE_PIPELINE_SUMMARY] Successful: ${this.successfulImageFetches}, Failed: ${this.imageDownloadFailures.length}, Deduped URLs: ${this.failedImageUrls.size}`
+        `🖼️ [IMAGE_PIPELINE_SUMMARY] Successful: ${this.successfulImageFetches}, Failed: ${this.imageDownloadFailures.length}, Deduped URLs: ${this.failedImageUrls.size}`,
       );
+
+      // CRITICAL PARANOID CHECK: Ensure assets.images exists before return
+      if (
+        !schema.assets?.images ||
+        Object.keys(schema.assets.images).length === 0
+      ) {
+        if (this.assets.images.size > 0) {
+          console.error(
+            `❌ [CRITICAL] schema.assets.images is EMPTY but this.assets.images has ${this.assets.images.size} items! RE-POPULATING.`,
+          );
+          this.finalizeAssets(schema);
+
+          // Re-validate count
+          const newCount = schema.assets?.images
+            ? Object.keys(schema.assets.images).length
+            : 0;
+          console.log(
+            `✅ [CRITICAL] Re-populated assets.images. New count: ${newCount}`,
+          );
+        } else {
+          console.warn(
+            "⚠️ [CRITICAL] schema.assets.images is empty and this.assets.images is also empty. No images captured?",
+          );
+        }
+      } else {
+        console.log(
+          `✅ [CRITICAL] schema.assets.images verification passed. Count: ${Object.keys(schema.assets.images).length}`,
+        );
+      }
 
       return schema;
     } catch (error) {
@@ -2439,7 +2603,7 @@ export class DOMExtractor {
         "extractPageToSchema",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "critical"
+        "critical",
       );
 
       // Cleanup navigation blocking even on error
@@ -2484,7 +2648,7 @@ export class DOMExtractor {
       }
 
       const medias = Array.from(
-        document.querySelectorAll("video, audio")
+        document.querySelectorAll("video, audio"),
       ) as Array<HTMLMediaElement>;
       for (const m of medias) {
         try {
@@ -2496,7 +2660,7 @@ export class DOMExtractor {
     } catch (err) {
       console.warn(
         "⚠️ [DETERMINISM] Failed to apply deterministic overrides:",
-        err
+        err,
       );
     }
   }
@@ -2509,7 +2673,7 @@ export class DOMExtractor {
     element: Element,
     parentId: string | null,
     depth: number = 0,
-    parentAbsoluteLayout: { x: number; y: number } = { x: 0, y: 0 }
+    parentAbsoluteLayout: { x: number; y: number } = { x: 0, y: 0 },
   ): Promise<ElementNode | null> {
     // TIMEOUT CHECK - DISABLED: MAX_EXTRACTION_TIME is set to 24 hours (effectively infinite)
     // The content-script has its own 20-minute timeout which is the authoritative limit.
@@ -2527,7 +2691,7 @@ export class DOMExtractor {
     ) {
       const cap = this.performanceConfig.maxNodesPerCapture;
       console.error(
-        `❌ [NODE CAP] Extraction exceeded ${cap} nodes. Aborting to prevent hang.`
+        `❌ [NODE CAP] Extraction exceeded ${cap} nodes. Aborting to prevent hang.`,
       );
       throw new Error(`DOM extraction exceeded node cap (${cap})`);
     }
@@ -2538,7 +2702,7 @@ export class DOMExtractor {
         "extractNodeSafe",
         `Max depth ${MAX_DEPTH} exceeded`,
         element,
-        "warning"
+        "warning",
       );
       return null;
     }
@@ -2554,7 +2718,7 @@ export class DOMExtractor {
           element?.nodeType ?? "null"
         }, constructor=${element?.constructor?.name ?? "unknown"}`,
         undefined,
-        "warning"
+        "warning",
       );
       return null;
     }
@@ -2567,7 +2731,7 @@ export class DOMExtractor {
         element,
         parentId,
         depth,
-        parentAbsoluteLayout
+        parentAbsoluteLayout,
       );
     } catch (error) {
       // ENHANCED: Better error handling to prevent undefined.toString() errors
@@ -2596,7 +2760,7 @@ export class DOMExtractor {
         "extractNodeSafe",
         errorMessage,
         element,
-        "error"
+        "error",
       );
       return null;
     }
@@ -2606,7 +2770,7 @@ export class DOMExtractor {
     element: Element,
     parentId: string | null,
     depth: number = 0,
-    parentAbsoluteLayout: { x: number; y: number } = { x: 0, y: 0 }
+    parentAbsoluteLayout: { x: number; y: number } = { x: 0, y: 0 },
   ): Promise<ElementNode | null> {
     // Update current detail for heartbeat
     const tagDisplay = element.tagName
@@ -2615,36 +2779,104 @@ export class DOMExtractor {
     const idDisplay = element.id ? `#${element.id}` : "";
     this.performanceTracker.currentDetail = `${tagDisplay}${idDisplay}`;
 
-    // Cooperative yielding: yield to event loop every N nodes
+    // Memory Guardrail: Estimated payload size
+    // Each node roughly adds 500-2000 bytes to the final JSON
+    this.diagnostics.estimatedPayloadBytes += 1000;
+    if (
+      this.diagnostics.estimatedPayloadBytes > 80 * 1024 * 1024 &&
+      this.performanceTracker.nodesProcessed % 1000 === 0
+    ) {
+      console.warn(
+        `🚨 [MEMORY] High estimated payload size: ${(
+          this.diagnostics.estimatedPayloadBytes /
+          1024 /
+          1024
+        ).toFixed(1)}MB`,
+      );
+    }
+
+    // Traversal Signature Guard (detect repeated patterns/loops)
+    const signature = this.getNodeSignature(element);
+    const sigCount = (this.nodeSignatureCache.get(signature) || 0) + 1;
+    this.nodeSignatureCache.set(signature, sigCount);
+    if (sigCount > 2000) {
+      // Pathological repeat detected
+      console.warn(`🛑 [SIGNATURE] Pathological repeat detected: ${signature}`);
+      return null;
+    }
+
+    // Cooperative yielding: yield to event loop if we've processed N nodes OR time threshold met
     this.diagnostics.totalElements++;
     this.performanceTracker.nodesProcessed++;
-    if (
-      this.performanceTracker.nodesProcessed %
-        this.performanceConfig.yieldNodeCount ===
-      0
-    ) {
-      const timeSinceLastYield =
-        Date.now() - this.performanceTracker.lastYieldTime;
-      if (timeSinceLastYield >= this.performanceConfig.yieldIntervalMs) {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        this.performanceTracker.lastYieldTime = Date.now();
-      }
+    this.nodesSinceLastYield++;
+
+    const timeSinceLastYield =
+      Date.now() - this.performanceTracker.lastYieldTime;
+    const shouldYield =
+      this.nodesSinceLastYield >= this.performanceConfig.yieldNodeCount ||
+      timeSinceLastYield >= this.performanceConfig.yieldIntervalMs;
+
+    if (shouldYield) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      this.performanceTracker.lastYieldTime = Date.now();
+      this.nodesSinceLastYield = 0;
 
       // Force progress update for granular feedback
-      // Scale progress from 35% to 65% based on node count (assuming ~5000 nodes typical max)
+      // Scale progress from 35% to 65% based on node count
       const percent = Math.min(
-        35 + Math.floor((this.performanceTracker.nodesProcessed / 5000) * 30),
-        65
+        35 +
+          Math.floor(
+            (this.performanceTracker.nodesProcessed /
+              Math.max(5000, this.totalOnPage)) *
+              30,
+          ),
+        65,
       );
       this.postProgress(
         `Extracting... (${this.performanceTracker.nodesProcessed} nodes)\n${this.performanceTracker.currentPhase}: ${this.performanceTracker.currentDetail}`,
-        percent
+        percent,
+        {
+          nodesProcessed: this.performanceTracker.nodesProcessed,
+          nodesQueued:
+            this.totalOnPage - this.performanceTracker.nodesProcessed,
+          phase: "extracting",
+        },
       );
+    }
+
+    // Hard safety cap (circuit breaker)
+    if (
+      this.performanceTracker.nodesProcessed >=
+      this.performanceConfig.maxNodesPerCapture
+    ) {
+      const errorContext = {
+        code: "NODE_LIMIT_HIT",
+        nodeCount: this.performanceTracker.nodesProcessed,
+        url: window.location.href,
+        lastDetail: this.performanceTracker.currentDetail,
+      };
+      console.error(
+        `🚨 [CIRCUIT BREAKER] Node limit hit! ${JSON.stringify(errorContext)}`,
+      );
+      throw errorContext;
+    }
+
+    // Max depth guardrail
+    if (depth > 500) {
+      console.warn(
+        `🛑 [MAX DEPTH] Node depth exceeded 500 levels at element:`,
+        element,
+      );
+      this.diagnostics.maxDepthReached = Math.max(
+        this.diagnostics.maxDepthReached,
+        depth,
+      );
+      return null;
     }
 
     if (this.nodeId % 100 === 0 && this.nodeId > 0) {
       console.log(
-        `📊 Extracted ${this.nodeId} nodes (${this.performanceTracker.nodesProcessed} processed)...`
+        `📊 Extracted ${this.nodeId} nodes (${this.performanceTracker.nodesProcessed} processed)...`,
       );
     }
 
@@ -2677,7 +2909,7 @@ export class DOMExtractor {
         "extractNode",
         "Failed to get computed styles",
         element,
-        "warning"
+        "warning",
       );
       return null;
     }
@@ -2693,7 +2925,7 @@ export class DOMExtractor {
         "extractNode",
         "Invalid bounding rect",
         element,
-        "warning"
+        "warning",
       );
       return null;
     }
@@ -2702,11 +2934,11 @@ export class DOMExtractor {
     // This ensures all nodes use consistent coordinates even if page scrolls during extraction
     const scrollTop = ExtractionValidation.safeParseFloat(
       this.capturedScrollOffset.top,
-      0
+      0,
     );
     const scrollLeft = ExtractionValidation.safeParseFloat(
       this.capturedScrollOffset.left,
-      0
+      0,
     );
 
     // Log if using captured scroll offset (only once per extraction would be ideal, but this is fine)
@@ -2757,6 +2989,12 @@ export class DOMExtractor {
     // CRITICAL: Detect interactive elements for prototype frame creation
     const isInteractive = this.isInteractiveElement(element, computed);
 
+    // Track skeleton ratio for content stabilization diagnostics
+    if (this.isSkeletonElement(element) && this.schemaInProgress) {
+      (this.schemaInProgress as any)._skeletonCount =
+        ((this.schemaInProgress as any)._skeletonCount || 0) + 1;
+    }
+
     // Calculate dimensions safely
     let dimensions = this.calculateDimensionsSafe(element, rect, computed);
 
@@ -2804,13 +3042,18 @@ export class DOMExtractor {
     // Validate scroll offset values for coordinate space integrity
     const validScrollLeft = Number.isFinite(scrollLeft) ? scrollLeft : 0;
     const validScrollTop = Number.isFinite(scrollTop) ? scrollTop : 0;
+
+    // FIXED POSITION FIX: Fixed elements are positioned relative to the viewport,
+    // NOT the document. getBoundingClientRect() for fixed elements already gives
+    // the correct viewport-relative position. Adding scroll offset would incorrectly
+    // shift headers/navbars down by the scroll amount.
+    const isFixedPosition = computed.position === "fixed";
+
     // Coordinate System: PAGE_ABSOLUTE_CSS_PX (scroll-invariant)
-    // Store all node positions as page-absolute CSS pixels relative to document origin (scroll 0,0).
-    // This remains correct even if the page cannot be stabilized at (0,0), because we add the
-    // captured scroll offset uniformly for ALL nodes (including fixed/sticky) to keep one
-    // consistent coordinate space for the entire capture.
-    const absoluteX = rectLeft + validScrollLeft;
-    const absoluteY = rectTop + validScrollTop;
+    // For normal elements: add scroll offset to convert viewport coords to document coords
+    // For fixed elements: use viewport coords directly (they stay fixed regardless of scroll)
+    const absoluteX = isFixedPosition ? rectLeft : rectLeft + validScrollLeft;
+    const absoluteY = isFixedPosition ? rectTop : rectTop + validScrollTop;
 
     // CRITICAL FIX: Validate absolute positions with pixel-aligned coordinates
     const validatedAbsoluteX =
@@ -2821,7 +3064,7 @@ export class DOMExtractor {
     // Log coordinate system issues for debugging
     if (!Number.isFinite(absoluteX) || !Number.isFinite(absoluteY)) {
       console.warn(
-        `[COORDINATE] Invalid coordinates for ${element.tagName}: rect(${rectLeft},${rectTop}) + scroll(${validScrollLeft},${validScrollTop}) = abs(${absoluteX},${absoluteY})`
+        `[COORDINATE] Invalid coordinates for ${element.tagName}: rect(${rectLeft},${rectTop}) + scroll(${validScrollLeft},${validScrollTop}) = abs(${absoluteX},${absoluteY})`,
       );
     }
 
@@ -2851,36 +3094,36 @@ export class DOMExtractor {
     // BOX-SIZING DIMENSION CONVERSION: Extract border/padding values for accurate conversion
     const borderTop = ExtractionValidation.safeParseFloat(
       computed.borderTopWidth,
-      0
+      0,
     );
     const borderRight = ExtractionValidation.safeParseFloat(
       computed.borderRightWidth,
-      0
+      0,
     );
     const borderBottom = ExtractionValidation.safeParseFloat(
       computed.borderBottomWidth,
-      0
+      0,
     );
     const borderLeft = ExtractionValidation.safeParseFloat(
       computed.borderLeftWidth,
-      0
+      0,
     );
 
     const paddingTop = ExtractionValidation.safeParseFloat(
       computed.paddingTop,
-      0
+      0,
     );
     const paddingRight = ExtractionValidation.safeParseFloat(
       computed.paddingRight,
-      0
+      0,
     );
     const paddingBottom = ExtractionValidation.safeParseFloat(
       computed.paddingBottom,
-      0
+      0,
     );
     const paddingLeft = ExtractionValidation.safeParseFloat(
       computed.paddingLeft,
-      0
+      0,
     );
 
     // CRITICAL: Calculate content dimensions for Figma
@@ -2894,11 +3137,11 @@ export class DOMExtractor {
     // Calculate content area dimensions (excluding padding and borders)
     const contentWidth = Math.max(
       0,
-      dimensions.width - totalHorizontalBorder - totalHorizontalPadding
+      dimensions.width - totalHorizontalBorder - totalHorizontalPadding,
     );
     const contentHeight = Math.max(
       0,
-      dimensions.height - totalVerticalBorder - totalVerticalPadding
+      dimensions.height - totalVerticalBorder - totalVerticalPadding,
     );
 
     // Store both visual (total rendered size) and content (inner area) dimensions
@@ -2932,11 +3175,23 @@ export class DOMExtractor {
     const nodeName = isText
       ? textContent?.substring(0, 20) || "Text"
       : tagName.toLowerCase() === "div"
-      ? this.generateDescriptiveName(element, tagName)
-      : tagName;
+        ? this.generateDescriptiveName(element, tagName)
+        : tagName;
+
+    // DIAGNOSTIC: Validate parentId before creating node
+    if (parentId !== null && typeof parentId !== "string") {
+      console.error(
+        `[EXTRACT] WARNING: Invalid parentId type for ${nodeId}: ${typeof parentId}`,
+        parentId,
+      );
+    }
+
+    // EXTRACT GRID LAYOUT DATA (FIDELITY FIX)
+    // Capture computed grid tracks and placement for accurate Auto Layout conversion
+    const gridData = extractGridLayoutData(element, computed, rect);
 
     // Create node
-    const node: any = {
+    const node: ElementNode = {
       id: nodeId,
       parentId: parentId,
       type: isText ? "TEXT" : "FRAME",
@@ -2970,7 +3225,7 @@ export class DOMExtractor {
         flexBasis: computed.flexBasis,
         alignSelf: computed.alignSelf,
         boxSizing: boxSizing,
-        // Grid properties
+        // Grid properties (Raw)
         gridTemplateColumns: computed.gridTemplateColumns,
         gridTemplateRows: computed.gridTemplateRows,
         gridTemplateAreas: computed.gridTemplateAreas,
@@ -2982,6 +3237,9 @@ export class DOMExtractor {
         gridRowStart: computed.gridRowStart,
         gridRowEnd: computed.gridRowEnd,
         gridArea: computed.gridArea,
+        // Grid properties (Computed/Structured)
+        ...(gridData.gridLayout || {}),
+        ...(gridData.gridChild || {}),
         // CRITICAL FIX: Include position for LayoutSolver to detect absolute/fixed elements
         position: computed.position,
       },
@@ -3000,6 +3258,9 @@ export class DOMExtractor {
       },
       // Parse transform matrix for pixel-perfect positioning
       transform: this.parseTransformMatrix(computed.transform),
+      // STACKING CONTEXT MATCHING: Web standard is "Last on Top" (later siblings cover earlier).
+      // Figma default is "First on Top". We reverse this to match Web.
+      itemReverseZIndex: true,
       // RASTERIZATION POLICY: Mark transforms and SVG elements for rasterization
       // PIXEL-PERFECT FIX: SVG elements cannot be reliably vectorized via schema
       // Always mark them for rasterization to ensure visual fidelity
@@ -3058,7 +3319,7 @@ export class DOMExtractor {
         "unnamed";
       console.log(
         `  🖼️ [SVG] Marked for rasterization: ${svgId} ` +
-          `(width: ${computed.width}, height: ${computed.height})`
+          `(width: ${computed.width}, height: ${computed.height})`,
       );
     }
 
@@ -3121,7 +3382,7 @@ export class DOMExtractor {
       } catch (e) {
         console.warn(
           `[PHASE 5] Rasterization capture failed for ${element.tagName}:`,
-          e
+          e,
         );
       }
     }
@@ -3153,6 +3414,46 @@ export class DOMExtractor {
       // This helps match elements to nodes during hover state capture
       if (!(node as any).__elementRef) {
         (node as any).__elementRef = element;
+      }
+    }
+
+    // EXPLICIT HYPERLINK EXTRACTION
+    // Always capture links even if not deemed "interactive" by other logic
+    if (tagName === "a" || element.hasAttribute("href")) {
+      const href =
+        (element as HTMLAnchorElement).href || element.getAttribute("href");
+      if (href) {
+        // Normalize relative URLs to absolute
+        try {
+          // If it's already absolute (http/https), use as is.
+          // If relative, make absolute against current page.
+          // Handle 'javascript:' or '#' separate if needed, but URL constructor handles most.
+          if (
+            !href.startsWith("javascript:") &&
+            !href.startsWith("mailto:") &&
+            !href.startsWith("tel:")
+          ) {
+            const absoluteHref = new URL(href, window.location.href).href;
+            node.href = absoluteHref;
+            node.hyperlink = absoluteHref;
+          } else {
+            // Keep special protocols as-is
+            node.href = href;
+            node.hyperlink = href;
+          }
+
+          // Also store simple hash links for internal navigation
+          if (href.startsWith("#")) {
+            node.hyperlink = href;
+          }
+        } catch (e) {
+          // Fallback to raw value
+          node.hyperlink = href;
+        }
+
+        console.log(
+          `🔗 [LINK] Extracted hyperlink for ${tagName}: ${node.hyperlink}`,
+        );
       }
     }
 
@@ -3229,7 +3530,7 @@ export class DOMExtractor {
         rect,
         scrollLeft,
         scrollTop,
-        depth
+        depth,
       );
     }
 
@@ -3276,7 +3577,7 @@ export class DOMExtractor {
   private async applyAutoLayoutDetection(
     node: any,
     computed: CSSStyleDeclaration,
-    element: Element
+    element: Element,
   ): Promise<void> {
     this.autoLayoutMetrics.totalNodes++;
 
@@ -3289,7 +3590,7 @@ export class DOMExtractor {
       if (this.performanceTracker.circuitBreakerActivated) {
         this.recordRejection("Circuit breaker activated - performance mode");
         console.log(
-          "⚡ [PERFORMANCE] Auto Layout validation skipped - circuit breaker active"
+          "⚡ [PERFORMANCE] Auto Layout validation skipped - circuit breaker active",
         );
         return;
       }
@@ -3299,10 +3600,10 @@ export class DOMExtractor {
       if (childCount > this.performanceConfig.maxChildrenForValidation) {
         this.performanceTracker.skippedDueToChildCount++;
         this.recordRejection(
-          `Too many children (${childCount} > ${this.performanceConfig.maxChildrenForValidation})`
+          `Too many children (${childCount} > ${this.performanceConfig.maxChildrenForValidation})`,
         );
         console.log(
-          `⚡ [PERFORMANCE] Auto Layout validation skipped - too many children: ${childCount}`
+          `⚡ [PERFORMANCE] Auto Layout validation skipped - too many children: ${childCount}`,
         );
         return;
       }
@@ -3323,7 +3624,7 @@ export class DOMExtractor {
       const layoutConfig = this.detectLayoutConfiguration(
         computed,
         element,
-        node
+        node,
       );
       if (!layoutConfig) {
         this.recordRejection("No valid layout configuration detected");
@@ -3336,7 +3637,7 @@ export class DOMExtractor {
         node,
         layoutConfig,
         computed,
-        element
+        element,
       );
 
       // Create complete auto layout schema
@@ -3369,7 +3670,7 @@ export class DOMExtractor {
         console.log(
           `✅ [AUTO_LAYOUT] Applied safe Auto Layout to ${element.tagName}#${
             element.id || ""
-          } (delta: ${validationResult.maxChildDeltaPx.toFixed(2)}px)`
+          } (delta: ${validationResult.maxChildDeltaPx.toFixed(2)}px)`,
         );
       } else {
         this.autoLayoutMetrics.autoLayoutRejected++;
@@ -3377,13 +3678,13 @@ export class DOMExtractor {
         console.log(
           `❌ [AUTO_LAYOUT] Rejected Auto Layout for ${element.tagName}#${
             element.id || ""
-          }: ${validationResult.reasons.join(", ")}`
+          }: ${validationResult.reasons.join(", ")}`,
         );
       }
     } catch (error) {
       console.warn(
         `[AUTO_LAYOUT] Detection error for ${element.tagName}:`,
-        error
+        error,
       );
       this.recordRejection("Detection error: " + (error as Error).message);
     }
@@ -3395,11 +3696,11 @@ export class DOMExtractor {
   private isAutoLayoutCandidate(
     node: any,
     computed: CSSStyleDeclaration,
-    element: Element
+    element: Element,
   ): { valid: boolean; reason: string } {
     // Must have children
-    if (!node.children || node.children.length < 2) {
-      return { valid: false, reason: "Insufficient children (need ≥2)" };
+    if (!node.children || node.children.length < 1) {
+      return { valid: false, reason: "No children" };
     }
 
     // PERFORMANCE: Skip if too many children (circuit breaker)
@@ -3412,29 +3713,48 @@ export class DOMExtractor {
 
     // Must be a container with layout system
     const display = computed.display;
-    if (!["flex", "inline-flex", "grid", "inline-grid"].includes(display)) {
+    if (
+      ![
+        "flex",
+        "inline-flex",
+        "grid",
+        "inline-grid",
+        "block",
+        "inline-block",
+      ].includes(display)
+    ) {
       // Check for inferred patterns
       const hasDirectionalLayout = this.inferLayoutPattern(
         node,
         computed,
-        element
+        element,
       );
       if (!hasDirectionalLayout) {
         return { valid: false, reason: `Unsupported display: ${display}` };
       }
     }
 
-    // Skip elements with absolute positioning children (complex)
-    const hasAbsoluteChildren = node.children.some(
+    // Filter out absolutely positioned children for layout inference
+    // We only want to analyze the "flow" content
+    const flowChildren = node.children.filter(
       (child: any) =>
-        child.layout?.position === "absolute" ||
-        child.layout?.position === "fixed"
+        child.layout?.position !== "absolute" &&
+        child.layout?.position !== "fixed",
     );
-    if (hasAbsoluteChildren) {
+
+    // If NO flow children (all absolute), we can't do auto-layout (unless empty container?)
+    if (flowChildren.length === 0 && node.children.length > 0) {
       return {
         valid: false,
-        reason: "Contains absolutely positioned children",
+        reason: "All children are absolutely positioned",
       };
+    }
+
+    // If we have flow children, check if we have enough to form a pattern
+    // Allow single flow child if it's a container (might be a wrapper)
+    if (flowChildren.length < 1) {
+      // Should have been caught above, but safety check
+      return { valid: false, reason: "No flow children" };
     }
 
     return { valid: true, reason: "" };
@@ -3446,7 +3766,7 @@ export class DOMExtractor {
   private inferLayoutPattern(
     node: any,
     computed: CSSStyleDeclaration,
-    element: Element
+    element: Element,
   ): boolean {
     // Check if children are naturally stacked (list pattern)
     if (this.isStackedList(node)) return true;
@@ -3461,15 +3781,31 @@ export class DOMExtractor {
     if (!node.children || node.children.length < 2) return false;
 
     // Check if children are vertically stacked with consistent alignment
-    const children = node.children;
+    // Use filtered flow children
+    const children = node.children.filter(
+      (child: any) =>
+        child.layout?.position !== "absolute" &&
+        child.layout?.position !== "fixed",
+    );
+
+    if (children.length < 1) return false;
+    if (children.length === 1) return true; // Single child is trivially a stack (if we accept it)
+
     let prevBottom = children[0].layout.y + children[0].layout.height;
 
     for (let i = 1; i < children.length; i++) {
       const child = children[i];
       const gap = child.layout.y - prevBottom;
 
-      // Allow small gaps (up to 20px) but not overlaps
-      if (gap < 0 || gap > 20) return false;
+      // Allow proportional gap tolerance
+      // 32px or 10% of height, whichever is larger (capped at 100px)
+      // This handles large landing pages with big sections
+      const gapTolerance = Math.min(
+        100,
+        Math.max(32, node.layout.height * 0.1),
+      );
+
+      if (gap < 0 || gap > gapTolerance) return false;
 
       prevBottom = child.layout.y + child.layout.height;
     }
@@ -3481,15 +3817,26 @@ export class DOMExtractor {
     if (!node.children || node.children.length < 2) return false;
 
     // Check if children are horizontally aligned
-    const children = node.children;
+    // Use filtered flow children
+    const children = node.children.filter(
+      (child: any) =>
+        child.layout?.position !== "absolute" &&
+        child.layout?.position !== "fixed",
+    );
+
+    if (children.length < 1) return false;
+    if (children.length === 1) return true;
+
     let prevRight = children[0].layout.x + children[0].layout.width;
 
     for (let i = 1; i < children.length; i++) {
       const child = children[i];
       const gap = child.layout.x - prevRight;
 
-      // Allow small gaps (up to 20px) but not overlaps
-      if (gap < 0 || gap > 20) return false;
+      // Allow proportional gap tolerance
+      const gapTolerance = Math.min(100, Math.max(32, node.layout.width * 0.1));
+
+      if (gap < 0 || gap > gapTolerance) return false;
 
       prevRight = child.layout.x + child.layout.width;
     }
@@ -3503,7 +3850,7 @@ export class DOMExtractor {
   private detectLayoutConfiguration(
     computed: CSSStyleDeclaration,
     element: Element,
-    node: any
+    node: any,
   ): {
     mode: "HORIZONTAL" | "VERTICAL";
     wrap: boolean;
@@ -3525,7 +3872,7 @@ export class DOMExtractor {
 
   private detectFlexConfiguration(
     computed: CSSStyleDeclaration,
-    node: any
+    node: any,
   ): {
     mode: "HORIZONTAL" | "VERTICAL";
     wrap: boolean;
@@ -3548,14 +3895,14 @@ export class DOMExtractor {
       mode: flexDirection.includes("column") ? "VERTICAL" : "HORIZONTAL",
       wrap: false,
       itemSpacing: this.parsePixelValue(gap),
-      alignItems: this.mapAlignItemsToSchemaFormat(alignItems),
-      justifyContent: this.mapJustifyContentToSchemaFormat(justifyContent),
+      alignItems: this.mapAlignItemsToFigma(alignItems),
+      justifyContent: this.mapJustifyContentToFigma(justifyContent),
     };
   }
 
   private detectGridConfiguration(
     computed: CSSStyleDeclaration,
-    node: any
+    node: any,
   ): {
     mode: "HORIZONTAL" | "VERTICAL";
     wrap: boolean;
@@ -3676,7 +4023,7 @@ export class DOMExtractor {
    * Timeout-protected version of validateAutoLayoutSafety
    */
   private async validateAutoLayoutSafetyWithTimeout(
-    node: any,
+    node: ElementNode,
     layoutConfig: {
       mode: "HORIZONTAL" | "VERTICAL";
       wrap: boolean;
@@ -3685,7 +4032,7 @@ export class DOMExtractor {
       justifyContent: "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN";
     },
     computed: CSSStyleDeclaration,
-    element: Element
+    element: Element,
   ): Promise<{
     safe: boolean;
     tolerancePx: number;
@@ -3707,8 +4054,8 @@ export class DOMExtractor {
       }>((_, reject) =>
         setTimeout(
           () => reject(new Error("Validation timeout")),
-          this.performanceConfig.validationTimeoutMs
-        )
+          this.performanceConfig.validationTimeoutMs,
+        ),
       );
 
       // Race between validation and timeout
@@ -3724,7 +4071,7 @@ export class DOMExtractor {
 
       console.warn(
         `⚡ [PERFORMANCE] Auto Layout validation timeout for element with ${childCount} children:`,
-        error
+        error,
       );
 
       // Check if we should activate circuit breaker
@@ -3734,7 +4081,7 @@ export class DOMExtractor {
       ) {
         this.performanceTracker.circuitBreakerActivated = true;
         console.warn(
-          `🔴 [CIRCUIT BREAKER] Performance mode activated after ${this.performanceTracker.validationTimeouts} timeouts`
+          `🔴 [CIRCUIT BREAKER] Performance mode activated after ${this.performanceTracker.validationTimeouts} timeouts`,
         );
       }
 
@@ -3764,7 +4111,7 @@ export class DOMExtractor {
       justifyContent: "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN";
     },
     computed: CSSStyleDeclaration,
-    element: Element
+    element: Element,
   ): Promise<{
     safe: boolean;
     tolerancePx: number;
@@ -3793,7 +4140,7 @@ export class DOMExtractor {
       const simulatedPositions = this.simulateAutoLayoutPositions(
         node,
         layoutConfig,
-        computed
+        computed,
       );
 
       // PERFORMANCE: Limit validation to a sample of children for large containers
@@ -3829,7 +4176,7 @@ export class DOMExtractor {
 
         if (childDelta > tolerancePx) {
           reasons.push(
-            `Child ${i} delta ${childDelta.toFixed(2)}px > tolerance`
+            `Child ${i} delta ${childDelta.toFixed(2)}px > tolerance`,
           );
         }
       });
@@ -3880,7 +4227,7 @@ export class DOMExtractor {
       alignItems: "MIN" | "CENTER" | "MAX" | "BASELINE" | "SPACE_BETWEEN";
       justifyContent: "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN";
     },
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): Array<{ x: number; y: number; width: number; height: number }> {
     const children = node.children || [];
     const parentLayout = node.layout;
@@ -3923,7 +4270,7 @@ export class DOMExtractor {
       // Calculate total child width and spacing
       const totalChildWidth = children.reduce(
         (sum: number, child: any) => sum + child.layout.width,
-        0
+        0,
       );
       const totalSpacing = (children.length - 1) * layoutConfig.itemSpacing;
       const remainingSpace = contentWidth - totalChildWidth - totalSpacing;
@@ -3967,7 +4314,7 @@ export class DOMExtractor {
       // VERTICAL
       const totalChildHeight = children.reduce(
         (sum: number, child: any) => sum + child.layout.height,
-        0
+        0,
       );
       const totalSpacing = (children.length - 1) * layoutConfig.itemSpacing;
       const remainingSpace = contentHeight - totalChildHeight - totalSpacing;
@@ -4017,7 +4364,7 @@ export class DOMExtractor {
   }
 
   private hasOverlappingChildren(
-    positions: Array<{ x: number; y: number; width: number; height: number }>
+    positions: Array<{ x: number; y: number; width: number; height: number }>,
   ): boolean {
     for (let i = 0; i < positions.length; i++) {
       for (let j = i + 1; j < positions.length; j++) {
@@ -4041,7 +4388,7 @@ export class DOMExtractor {
 
   private hasNonUniformGaps(
     node: any,
-    layoutConfig: { mode: "HORIZONTAL" | "VERTICAL"; itemSpacing: number }
+    layoutConfig: { mode: "HORIZONTAL" | "VERTICAL"; itemSpacing: number },
   ): boolean {
     const children = node.children || [];
     if (children.length < 3) return false; // Need at least 3 children to detect non-uniform gaps
@@ -4069,7 +4416,7 @@ export class DOMExtractor {
     // Check if all gaps are within tolerance of the expected itemSpacing
     const tolerance = 2; // 2px tolerance for gap uniformity
     return gaps.some(
-      (gap) => Math.abs(gap - layoutConfig.itemSpacing) > tolerance
+      (gap) => Math.abs(gap - layoutConfig.itemSpacing) > tolerance,
     );
   }
 
@@ -4084,8 +4431,8 @@ export class DOMExtractor {
   /**
    * Map CSS align-items to schema format
    */
-  private mapAlignItemsToSchemaFormat(
-    alignItems: string
+  private mapAlignItemsToFigma(
+    alignItems: string,
   ): "MIN" | "CENTER" | "MAX" | "BASELINE" | "SPACE_BETWEEN" {
     switch (alignItems) {
       case "flex-start":
@@ -4106,30 +4453,8 @@ export class DOMExtractor {
   /**
    * Map CSS justify-content to schema format
    */
-  private mapJustifyContentToSchemaFormat(
-    justifyContent: string
-  ): "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" {
-    switch (justifyContent) {
-      case "flex-start":
-      case "start":
-        return "MIN";
-      case "center":
-        return "CENTER";
-      case "flex-end":
-      case "end":
-        return "MAX";
-      case "space-between":
-        return "SPACE_BETWEEN";
-      default:
-        return "MIN";
-    }
-  }
-
-  /**
-   * Map CSS justify-content to Figma primary axis alignment
-   */
   private mapJustifyContentToFigma(
-    justifyContent: string
+    justifyContent: string,
   ): "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" {
     switch (justifyContent) {
       case "flex-start":
@@ -4144,28 +4469,6 @@ export class DOMExtractor {
         return "SPACE_BETWEEN";
       default:
         return "MIN";
-    }
-  }
-
-  /**
-   * Map CSS align-items to Figma counter axis alignment
-   */
-  private mapAlignItemsToFigma(
-    alignItems: string
-  ): "MIN" | "CENTER" | "MAX" | "STRETCH" {
-    switch (alignItems) {
-      case "flex-start":
-      case "start":
-        return "MIN";
-      case "center":
-        return "CENTER";
-      case "flex-end":
-      case "end":
-        return "MAX";
-      case "stretch":
-        return "STRETCH";
-      default:
-        return "STRETCH";
     }
   }
 
@@ -4210,13 +4513,13 @@ export class DOMExtractor {
       const finalMimeType = mimeType || "text/plain";
 
       // Enforce size cap to prevent memory issues
-      const maxDataUriSize = 2 * 1024 * 1024; // 2MB limit
+      const maxDataUriSize = 50 * 1024 * 1024; // 50MB limit
       if (dataUri.length > maxDataUriSize) {
         return {
           success: false,
           error: `Data URI too large: ${(dataUri.length / 1024 / 1024).toFixed(
-            1
-          )}MB > 2MB limit`,
+            1,
+          )}MB > 50MB limit`,
         };
       }
 
@@ -4305,7 +4608,7 @@ export class DOMExtractor {
 
       // Parse rgba(r, g, b, a) or rgb(r, g, b)
       const rgbaMatch = bgColor.match(
-        /rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*(?:,\s*([\d.]+))?\s*\)/
+        /rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*(?:,\s*([\d.]+))?\s*\)/,
       );
 
       if (rgbaMatch) {
@@ -4386,7 +4689,7 @@ export class DOMExtractor {
    */
   private isInteractiveElement(
     element: Element,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): boolean {
     if (!(element instanceof HTMLElement)) return false;
 
@@ -4492,7 +4795,7 @@ export class DOMExtractor {
    */
   private detectInteractionType(
     element: Element,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): string {
     const tagName = element.tagName.toLowerCase();
     const role = element.getAttribute("role");
@@ -4554,7 +4857,7 @@ export class DOMExtractor {
       const computed = ExtractionValidation.safeGetComputedStyle(element);
       if (computed && this.doesNotPaint(computed)) {
         console.warn(
-          `🛡️ [ROOT_PRUNING_GUARD] Prevented pruning of <${tagName}> (doesNotPaint=true).`
+          `🛡️ [ROOT_PRUNING_GUARD] Prevented pruning of <${tagName}> (doesNotPaint=true).`,
         );
       }
       return false;
@@ -4568,8 +4871,10 @@ export class DOMExtractor {
     const nodeName = element.nodeName?.toLowerCase() || "";
 
     if (
-      element.id === "web-to-figma-capture-overlay" ||
-      element.classList?.contains?.("web-to-figma-overlay") ||
+      element.id === "figma-capture-overlay" || // Progress overlay (Authoritative ID)
+      element.id === "web-to-figma-capture-glow" || // Capture mode glow
+      element.id === "web-to-figma-cursor-style" || // Injected cursor styles
+      element.hasAttribute("data-web-to-figma-overlay") || // Selection overlay
       id.includes("plasmo") ||
       className.includes("plasmo") ||
       name.toLowerCase().includes("plasmo") ||
@@ -4669,7 +4974,7 @@ export class DOMExtractor {
   private calculateDimensionsSafe(
     element: Element,
     rect: DOMRect,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): { width: number; height: number } {
     const tagUpper = element.tagName.toUpperCase();
     const isDocumentRoot = tagUpper === "BODY" || tagUpper === "HTML";
@@ -4692,25 +4997,25 @@ export class DOMExtractor {
     if (isDocumentRoot || (height === 0 && element.children.length > 0)) {
       const elementScrollHeight = ExtractionValidation.safeParseFloat(
         (htmlEl as any)?.scrollHeight,
-        0
+        0,
       );
       const elementScrollWidth = ExtractionValidation.safeParseFloat(
         (htmlEl as any)?.scrollWidth,
-        0
+        0,
       );
       const docScrollHeight = Math.max(
         ExtractionValidation.safeParseFloat(
           document.documentElement?.scrollHeight,
-          0
+          0,
         ),
-        ExtractionValidation.safeParseFloat(document.body?.scrollHeight, 0)
+        ExtractionValidation.safeParseFloat(document.body?.scrollHeight, 0),
       );
       const docScrollWidth = Math.max(
         ExtractionValidation.safeParseFloat(
           document.documentElement?.scrollWidth,
-          0
+          0,
         ),
-        ExtractionValidation.safeParseFloat(document.body?.scrollWidth, 0)
+        ExtractionValidation.safeParseFloat(document.body?.scrollWidth, 0),
       );
 
       height = Math.max(height, docScrollHeight, elementScrollHeight);
@@ -4733,11 +5038,11 @@ export class DOMExtractor {
 
       const elementScrollHeight = ExtractionValidation.safeParseFloat(
         (htmlEl as any)?.scrollHeight,
-        0
+        0,
       );
       const elementScrollWidth = ExtractionValidation.safeParseFloat(
         (htmlEl as any)?.scrollWidth,
-        0
+        0,
       );
 
       if (isHiddenY && elementScrollHeight > height + 1) {
@@ -4759,21 +5064,6 @@ export class DOMExtractor {
     try {
       // ENHANCED: Special handling for Site comments to extract actual content
       const tagName = element.tagName.toLowerCase();
-      if (false) {
-        // For Site comment elements, use innerText to get rendered content
-        const innerText = (element as HTMLElement).innerText;
-        if (innerText && innerText.trim().length > 0) {
-          // Filter out placeholder text patterns
-          const text = innerText.trim();
-          if (
-            !text.toLowerCase().includes("lorem ipsum") &&
-            !text.toLowerCase().includes("placeholder") &&
-            text.length > 3
-          ) {
-            return text;
-          }
-        }
-      }
 
       // CRITICAL: Use innerText for better text extraction (respects CSS visibility)
       // innerText gives us the rendered text as the user sees it
@@ -4788,6 +5078,7 @@ export class DOMExtractor {
         element.tagName === "A" ||
         element.tagName === "LABEL" ||
         element.tagName === "BUTTON" ||
+        /^H[1-6]$/.test(element.tagName) ||
         element.getAttribute("role") === "text" ||
         computed.display === "inline" ||
         computed.display === "inline-block";
@@ -4834,7 +5125,7 @@ export class DOMExtractor {
         "extractTextContentSafe",
         "Failed to extract text content",
         element,
-        "warning"
+        "warning",
       );
       return null;
     }
@@ -4851,7 +5142,7 @@ export class DOMExtractor {
         "extractAttributesSafe",
         "Failed to extract attributes",
         element,
-        "warning"
+        "warning",
       );
     }
     return attrs;
@@ -4863,7 +5154,7 @@ export class DOMExtractor {
     rect: DOMRect,
     scrollLeft: number,
     scrollTop: number,
-    depth: number
+    depth: number,
   ): Promise<void> {
     try {
       const tagName = element.tagName.toLowerCase();
@@ -4891,12 +5182,17 @@ export class DOMExtractor {
       const childNodes = isSlotProjection
         ? Array.from(assignedNodes)
         : shadowNodes.length > 0
-        ? shadowNodes
-        : Array.from(element.childNodes);
-      // CHILD CAP: deterministic bound for unbounded / infinite DOM regions.
-      // This prevents pathological pages from stalling extraction indefinitely.
-      const boundedChildNodes =
-        childNodes.length > 2000 ? childNodes.slice(0, 2000) : childNodes;
+          ? shadowNodes
+          : Array.from(element.childNodes);
+      // CHILD CAP REMOVED: Optimize for completeness
+      // We rely on cooperative yielding (process in batches) to keep the browser responsive
+      const boundedChildNodes = childNodes;
+
+      if (childNodes.length > 2000) {
+        console.warn(
+          `⚠️ [LARGE CONTAINER] Processing ${childNodes.length} children for <${tagName}> (optimization active)`,
+        );
+      }
 
       // CRITICAL FIX #4: Use already-calculated absoluteX/absoluteY for consistency
       // This ensures parentAbsoluteLayout matches the node's absoluteLayout exactly
@@ -4910,7 +5206,7 @@ export class DOMExtractor {
         y: currentAbsoluteY, // Use the calculated absoluteY from rect + scroll
       };
 
-      const BATCH_SIZE = 50;
+      const BATCH_SIZE = DOMExtractor.CHILD_PROCESS_BATCH_SIZE;
       let processedInBatch = 0;
 
       if (boundedChildNodes.length > BATCH_SIZE) {
@@ -4924,7 +5220,7 @@ export class DOMExtractor {
                 child as Element,
                 node.id,
                 depth + 1,
-                currentAbsoluteLayout
+                currentAbsoluteLayout,
               );
               if (childNode) {
                 if (isSlotProjection && childNode.layout) {
@@ -4940,7 +5236,7 @@ export class DOMExtractor {
                 element,
                 rect,
                 scrollLeft,
-                scrollTop
+                scrollTop,
               );
             }
             processedInBatch++;
@@ -4966,9 +5262,9 @@ export class DOMExtractor {
             this.postProgress(
               `Processing children (${Math.min(
                 i + batch.length,
-                childNodes.length
+                childNodes.length,
               )}/${childNodes.length})...`,
-              progress
+              progress,
             );
           }
         }
@@ -4980,7 +5276,7 @@ export class DOMExtractor {
               child as Element,
               node.id,
               depth + 1,
-              currentAbsoluteLayout
+              currentAbsoluteLayout,
             );
             if (childNode) {
               if (isSlotProjection && childNode.layout) {
@@ -4996,7 +5292,7 @@ export class DOMExtractor {
               element,
               rect,
               scrollLeft,
-              scrollTop
+              scrollTop,
             );
           }
           processedInBatch++;
@@ -5029,7 +5325,7 @@ export class DOMExtractor {
         "processChildrenSafe",
         msg,
         element,
-        "error"
+        "error",
       );
     }
   }
@@ -5040,7 +5336,7 @@ export class DOMExtractor {
     element: Element,
     rect: DOMRect,
     scrollLeft: number,
-    scrollTop: number
+    scrollTop: number,
   ): Promise<void> {
     try {
       const computed = this.getCachedComputedStyle(element);
@@ -5083,10 +5379,19 @@ export class DOMExtractor {
 
       const range = document.createRange();
       range.selectNode(child);
-      const textRect = range.getBoundingClientRect();
+      const rawTextRect = range.getBoundingClientRect();
 
-      if (!ExtractionValidation.isValidRect(textRect)) {
-        return;
+      // CRITICAL FIX: Fallback to element rect if text range returns 0/invalid
+      // This ensures text metrics are captured even when Range.getClientRects() fails (fixing "Gray Block" text)
+      let textRect = rawTextRect;
+      const isZeroRect = rawTextRect.width === 0 && rawTextRect.height === 0;
+
+      if (!ExtractionValidation.isValidRect(rawTextRect) || isZeroRect) {
+        if (rect.width > 0 || rect.height > 0) {
+          textRect = rect;
+        } else if (!ExtractionValidation.isValidRect(rawTextRect)) {
+          return;
+        }
       }
 
       const isTextVisible =
@@ -5095,14 +5400,15 @@ export class DOMExtractor {
         computed.opacity !== "0";
 
       if (textRect.width > 0 || textRect.height > 0 || isTextVisible) {
-        const textAbsoluteX = ExtractionValidation.safeParseFloat(
-          textRect.left + scrollLeft,
-          0
-        );
-        const textAbsoluteY = ExtractionValidation.safeParseFloat(
-          textRect.top + scrollTop,
-          0
-        );
+        // FIXED POSITION TEXT FIX: Text inside position:fixed parents should not have scroll offset added
+        // (Same logic as element nodes - see extractNode around line 3024)
+        const isParentFixed = computed.position === "fixed";
+        const textAbsoluteX = isParentFixed
+          ? ExtractionValidation.safeParseFloat(textRect.left, 0)
+          : ExtractionValidation.safeParseFloat(textRect.left + scrollLeft, 0);
+        const textAbsoluteY = isParentFixed
+          ? ExtractionValidation.safeParseFloat(textRect.top, 0)
+          : ExtractionValidation.safeParseFloat(textRect.top + scrollTop, 0);
 
         const textAbsoluteLayout = {
           left: textAbsoluteX,
@@ -5145,7 +5451,7 @@ export class DOMExtractor {
         if (computed.opacity && computed.opacity !== "1") {
           const elementOpacity = ExtractionValidation.safeParseFloat(
             computed.opacity,
-            1
+            1,
           );
           // Calculate cumulative opacity from parent chain
           let cumulativeOpacity = elementOpacity;
@@ -5155,7 +5461,7 @@ export class DOMExtractor {
             const parentComputed = window.getComputedStyle(parent);
             const parentOpacity = ExtractionValidation.safeParseFloat(
               parentComputed.opacity,
-              1
+              1,
             );
             cumulativeOpacity *= parentOpacity;
             parent = parent.parentElement;
@@ -5164,7 +5470,7 @@ export class DOMExtractor {
           syntheticNode.opacity = ExtractionValidation.clampNumber(
             cumulativeOpacity,
             0,
-            1
+            1,
           );
           // Store original element opacity for reference
           syntheticNode.computedStyle = syntheticNode.computedStyle || {};
@@ -5178,7 +5484,7 @@ export class DOMExtractor {
         "processTextNodeSafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "warning"
+        "warning",
       );
     }
   }
@@ -5221,7 +5527,7 @@ export class DOMExtractor {
         "sortChildrenByZIndex",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "warning"
+        "warning",
       );
     }
   }
@@ -5238,7 +5544,7 @@ export class DOMExtractor {
         const computed = window.getComputedStyle(current);
         const elementOpacity = ExtractionValidation.safeParseFloat(
           computed.opacity,
-          1
+          1,
         );
         opacity *= elementOpacity;
         current = current.parentElement;
@@ -5433,7 +5739,7 @@ export class DOMExtractor {
     ];
 
     return containerPatterns.some(
-      (pattern) => className.includes(pattern) || id.includes(pattern)
+      (pattern) => className.includes(pattern) || id.includes(pattern),
     );
   }
 
@@ -5482,13 +5788,14 @@ export class DOMExtractor {
       element.children.length <= 2 &&
       Array.from(element.children).some(
         (c) =>
-          c.tagName.toLowerCase() === "svg" || c.tagName.toLowerCase() === "img"
+          c.tagName.toLowerCase() === "svg" ||
+          c.tagName.toLowerCase() === "img",
       );
 
     // If it's a container with only text or single image/icon, inherit
     return Boolean(
       (hasDirectText && (!hasChildren || element.children.length <= 2)) ||
-        isIconWrapper
+      isIconWrapper,
     );
   }
 
@@ -5626,12 +5933,12 @@ export class DOMExtractor {
   private async extractStylesSafe(
     computed: CSSStyleDeclaration,
     element: Element,
-    node: any
+    node: ElementNode,
   ): Promise<void> {
     try {
       // Background color with validation
       const bgColor = ExtractionValidation.sanitizeColorString(
-        computed.backgroundColor
+        computed.backgroundColor,
       );
 
       if (bgColor) {
@@ -5653,7 +5960,7 @@ export class DOMExtractor {
             node.inheritanceFlags.backgroundColorInherited = true;
 
             console.log(
-              `🔗 [INHERITANCE] Found inherited background for ${element.tagName}: ${inheritedBg}`
+              `🔗 [INHERITANCE] Found inherited background for ${element.tagName}: ${inheritedBg}`,
             );
           }
         }
@@ -5667,7 +5974,7 @@ export class DOMExtractor {
         // Create fill if we have a visible background color (inherited OR explicit)
         if (effectiveColorParsed && effectiveColorParsed.a > 0.001) {
           console.log(
-            `  🎨 [FILL] Creating fill for ${element.tagName}#${element.id}: ${effectiveBgColor} (inherited: ${isBackgroundInherited})`
+            `  🎨 [FILL] Creating fill for ${element.tagName}#${element.id}: ${effectiveBgColor} (inherited: ${isBackgroundInherited})`,
           );
 
           if (!node.fills) node.fills = [];
@@ -5697,7 +6004,7 @@ export class DOMExtractor {
           this.assets.colors.add(effectiveBgColor);
         } else {
           console.log(
-            `  ⚪ [FILL] Skipping fill for ${element.tagName}#${element.id}: no visible background (bgColor: ${bgColor}, effectiveBgColor: ${effectiveBgColor})`
+            `  ⚪ [FILL] Skipping fill for ${element.tagName}#${element.id}: no visible background (bgColor: ${bgColor}, effectiveBgColor: ${effectiveBgColor})`,
           );
         }
 
@@ -5713,7 +6020,7 @@ export class DOMExtractor {
           // Store effective color for reference but don't paint it
           node.colorInheritance.effectiveBackground = effectiveBgColor;
           console.log(
-            `⚪ [INHERITANCE] Skipping fill for inherited background on ${element.tagName}: computed=${bgColor}, inherited=${effectiveBgColor}`
+            `⚪ [INHERITANCE] Skipping fill for inherited background on ${element.tagName}: computed=${bgColor}, inherited=${effectiveBgColor}`,
           );
         } else {
           // For body/html, still store the color for fallback use even if we don't add it as a fill
@@ -5805,16 +6112,16 @@ export class DOMExtractor {
           type: clipPath.startsWith("circle")
             ? "circle"
             : clipPath.startsWith("ellipse")
-            ? "ellipse"
-            : clipPath.startsWith("inset")
-            ? "inset"
-            : clipPath.startsWith("polygon")
-            ? "polygon"
-            : clipPath.startsWith("path")
-            ? "path"
-            : clipPath.startsWith("url")
-            ? "url"
-            : "none",
+              ? "ellipse"
+              : clipPath.startsWith("inset")
+                ? "inset"
+                : clipPath.startsWith("polygon")
+                  ? "polygon"
+                  : clipPath.startsWith("path")
+                    ? "path"
+                    : clipPath.startsWith("url")
+                      ? "url"
+                      : "none",
           value: clipPath,
         };
         // Strict clone: clip-path cannot be reconstructed natively in Figma
@@ -5841,7 +6148,7 @@ export class DOMExtractor {
             "center",
         };
         console.log(
-          `🎭 [MASK] Captured mask on ${element.tagName}: ${maskImage}`
+          `🎭 [MASK] Captured mask on ${element.tagName}: ${maskImage}`,
         );
         // Strict clone: CSS masks are not representable in Figma -> rasterize
         node.rasterize = node.rasterize || { reason: "MASK" };
@@ -5852,12 +6159,49 @@ export class DOMExtractor {
       const filter = computed.filter;
       if (filter && filter !== "none") {
         console.log(
-          `🎨 [CSS FILTER] Captured filter on ${element.tagName}: ${filter}`
+          `🎨 [CSS FILTER] Captured filter on ${element.tagName}: ${filter}`,
         );
         node.cssFilter = filter;
         // Mark for rasterization if complex filters that Figma can't natively render
         if (!node.rasterize && this.shouldRasterizeForFilter(filter)) {
           node.rasterize = { reason: "FILTER" };
+        }
+      }
+
+      // FIDELITY FIX #1: backdrop-filter detection (P0 - HIGH IMPACT)
+      // backdrop-filter is NOT supported by Figma and must be rasterized
+      const backdropFilter =
+        computed.backdropFilter || (computed as any).webkitBackdropFilter;
+      if (backdropFilter && backdropFilter !== "none") {
+        console.log(
+          `🔄 [RASTERIZE] backdrop-filter detected on ${element.tagName}: ${backdropFilter}`,
+        );
+        node.backdropFilter = backdropFilter;
+        if (!node.rasterize) {
+          node.rasterize = { reason: "BACKDROP_FILTER" };
+        }
+      }
+
+      // ENHANCED: Extract SVG Stroke properties for high fidelity
+      // These properties apply to SVG elements and are valid CSS
+      const strokeLinecap =
+        computed.strokeLinecap || (computed as any)["stroke-linecap"];
+      if (strokeLinecap) {
+        node.strokeCap = strokeLinecap; // 'butt' | 'round' | 'square'
+      }
+
+      const strokeLinejoin =
+        computed.strokeLinejoin || (computed as any)["stroke-linejoin"];
+      if (strokeLinejoin) {
+        node.strokeJoin = strokeLinejoin; // 'miter' | 'round' | 'bevel'
+      }
+
+      const strokeMiterlimit =
+        computed.strokeMiterlimit || (computed as any)["stroke-miterlimit"];
+      if (strokeMiterlimit) {
+        const miterLimit = parseFloat(String(strokeMiterlimit));
+        if (Number.isFinite(miterLimit)) {
+          node.strokeMiterLimit = miterLimit;
         }
       }
 
@@ -5871,7 +6215,7 @@ export class DOMExtractor {
       node.borderDetails.right = {
         width: ExtractionValidation.safeParseFloat(
           computed.borderRightWidth,
-          0
+          0,
         ),
         style: computed.borderRightStyle || "none",
         color: computed.borderRightColor || "",
@@ -5879,7 +6223,7 @@ export class DOMExtractor {
       node.borderDetails.bottom = {
         width: ExtractionValidation.safeParseFloat(
           computed.borderBottomWidth,
-          0
+          0,
         ),
         style: computed.borderBottomStyle || "none",
         color: computed.borderBottomColor || "",
@@ -5940,19 +6284,19 @@ export class DOMExtractor {
 
       const marginTop = ExtractionValidation.safeParseFloat(
         computed.marginTop,
-        0
+        0,
       );
       const marginRight = ExtractionValidation.safeParseFloat(
         computed.marginRight,
-        0
+        0,
       );
       const marginBottom = ExtractionValidation.safeParseFloat(
         computed.marginBottom,
-        0
+        0,
       );
       const marginLeft = ExtractionValidation.safeParseFloat(
         computed.marginLeft,
-        0
+        0,
       );
 
       // Store padding/margin for use in positioning calculations
@@ -6000,17 +6344,17 @@ export class DOMExtractor {
             (computed as any)[`border${side}Width`] ||
               (computed as any).borderWidth ||
               "0",
-            0
+            0,
           );
           const style = String(
             (computed as any)[`border${side}Style`] ||
               (computed as any).borderStyle ||
-              "none"
+              "none",
           );
           const colorStr = String(
             (computed as any)[`border${side}Color`] ||
               (computed as any).borderColor ||
-              ""
+              "",
           );
           const color = this.parseColorSafe(colorStr);
           const active =
@@ -6031,7 +6375,7 @@ export class DOMExtractor {
           top.width,
           right.width,
           bottom.width,
-          left.width
+          left.width,
         );
         if (maxWidth > 0) {
           node.borderSides = { top, right, bottom, left };
@@ -6084,7 +6428,7 @@ export class DOMExtractor {
       ) {
         const effects = this.parseFilterEffectsSafe(
           backdropValue,
-          "BACKGROUND"
+          "BACKGROUND",
         );
         effects.forEach((e) => node.effects.push(e));
       }
@@ -6093,7 +6437,7 @@ export class DOMExtractor {
       if (computed.opacity && computed.opacity !== "1") {
         const opacity = ExtractionValidation.safeParseFloat(
           computed.opacity,
-          1
+          1,
         );
         node.opacity = ExtractionValidation.clampNumber(opacity, 0, 1);
       }
@@ -6106,7 +6450,7 @@ export class DOMExtractor {
         "extractStylesSafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "error"
+        "error",
       );
     }
   }
@@ -6118,7 +6462,7 @@ export class DOMExtractor {
   private async extractTypographySafe(
     computed: CSSStyleDeclaration,
     element: Element,
-    node: any
+    node: any,
   ): Promise<void> {
     try {
       // Font family with validation
@@ -6144,14 +6488,14 @@ export class DOMExtractor {
       const fontWeight = ExtractionValidation.clampNumber(
         weightParsed,
         100,
-        900
+        900,
       );
 
       // Font size with validation
       const fontSize = ExtractionValidation.clampNumber(
         ExtractionValidation.safeParseFloat(computed.fontSize, 16),
         1,
-        500
+        500,
       );
 
       // Most-accurate line-height in px (handles CSS `normal`)
@@ -6159,19 +6503,19 @@ export class DOMExtractor {
         computed,
         fontFamily,
         fontSize,
-        fontWeight
+        fontWeight,
       );
 
       // Line height parsing
       const lineHeightValue = this.parseLineHeightSafe(
         computed.lineHeight,
-        fontSize
+        fontSize,
       );
 
       // Letter spacing parsing
       const letterSpacingValue = this.parseLetterSpacingSafe(
         computed.letterSpacing,
-        fontSize
+        fontSize,
       );
 
       // Text alignment
@@ -6180,10 +6524,10 @@ export class DOMExtractor {
         textAlign === "center"
           ? "CENTER"
           : textAlign === "right"
-          ? "RIGHT"
-          : textAlign === "justify"
-          ? "JUSTIFY"
-          : "LEFT";
+            ? "RIGHT"
+            : textAlign === "justify"
+              ? "JUSTIFY"
+              : "LEFT";
 
       // Vertical alignment
       let textAlignVertical: "TOP" | "CENTER" | "BOTTOM" = "TOP";
@@ -6313,7 +6657,7 @@ export class DOMExtractor {
         width:
           domRectWidth > 0
             ? domRectWidth
-            : canvasMetrics?.width ?? domRectWidth,
+            : (canvasMetrics?.width ?? domRectWidth),
         height: domRectHeight,
         lineHeightPx: measuredLineHeightPx || lineHeightValue,
         baselineOffset: baselineOffset, // ✅ Stored for Figma importer
@@ -6399,56 +6743,21 @@ export class DOMExtractor {
       }
       this.assets.fonts.get(fontFamily)?.add(fontWeight);
 
-      // STRICT CLONE (fonts): Figma cannot load arbitrary webfont bytes.
-      // To preserve pixel-perfect fidelity when a custom @font-face font isn't available in Figma,
-      // capture a pixel screenshot of the rendered TEXT node and reference it via screenshotAssetId.
+      // STRICT CLONE (fonts): DISABLED for now.
+      // Previously attempted to capture screenshots of text with custom fonts.
+      // However, this often resulted in "Gray Blocks" or placeholders being captured instead of text,
+      // likely due to timing or rendering issues during the screenshot process.
+      // We prefer actual text (even with fallback fonts) over unreadable images.
+
+      /* 
       if (
         node.type === "TEXT" &&
         this.fontFaceFamilies.has(fontFamily) &&
         !node.screenshotAssetId
       ) {
-        const MAX_TEXT_SCREENSHOTS = 80;
-        if (this.textScreenshotCaptured < MAX_TEXT_SCREENSHOTS) {
-          try {
-            const dataUrl = await captureElementScreenshot(element);
-            if (
-              typeof dataUrl === "string" &&
-              dataUrl.startsWith("data:image/")
-            ) {
-              const comma = dataUrl.indexOf(",");
-              const header = comma !== -1 ? dataUrl.slice(0, comma) : "";
-              const base64 = comma !== -1 ? dataUrl.slice(comma + 1) : "";
-              const mimeType =
-                header.split(":")[1]?.split(";")[0] || "image/png";
-              if (base64 && base64.length > 0) {
-                const pseudoUrl = `text-screenshot:${node.id}`;
-                const key = this.hashString(pseudoUrl);
-
-                // Store as an image asset (already base64) so it's fully self-contained.
-                this.assets.images.set(pseudoUrl, {
-                  originalUrl: pseudoUrl,
-                  absoluteUrl: pseudoUrl,
-                  url: pseudoUrl,
-                  base64,
-                  mimeType,
-                  hash: (await this.sha256Base64Safe(base64)) || undefined,
-                  width: node.layout?.width,
-                  height: node.layout?.height,
-                });
-
-                node.screenshotAssetId = key;
-                this.textScreenshotCaptured++;
-              }
-            }
-          } catch (e) {
-            // Best-effort: strict clone can still proceed; importer may rasterize higher-level containers.
-            console.warn(
-              "⚠️ [STRICT CLONE] Failed to capture text screenshot fallback",
-              e
-            );
-          }
-        }
+         // ... implementation commented out ...
       }
+      */
 
       // Text auto resize detection
       const isFixedWidth =
@@ -6469,14 +6778,30 @@ export class DOMExtractor {
         overflowX === "hidden" ||
         overflowX === "clip";
 
+      // NEW: Detect if text is single-line (no actual wrapping occurs in browser)
+      // This prevents Figma from forcing character-level breaks when width is constrained
+      const lineHeight =
+        parseFloat(computed.lineHeight) ||
+        parseFloat(computed.fontSize) * 1.2 ||
+        16;
+      const textHeight =
+        (element as HTMLElement).scrollHeight ||
+        (element as HTMLElement).offsetHeight ||
+        0;
+      // Allow some tolerance for padding/borders
+      const isSingleLine = textHeight <= lineHeight * 1.5;
+
       if (isNoWrap) {
         // If the browser is truncating/clipping within a fixed width, keep a fixed-width text box.
         node.textAutoResize =
           isFixedWidth && hasTruncation ? "NONE" : "WIDTH_AND_HEIGHT";
-      } else if (isFixedWidth) {
-        // For pixel-perfect fidelity, keep the text box width/height fixed to the DOM box.
+      } else if (isFixedWidth && !isSingleLine) {
+        // Multi-line text with fixed width - use NONE to preserve wrapping behavior
         // Wrapping still occurs in Figma when textAutoResize is NONE and width is constrained.
         node.textAutoResize = "NONE";
+      } else if (isSingleLine) {
+        // Single-line text - let Figma auto-size to prevent character-level breaks
+        node.textAutoResize = "WIDTH_AND_HEIGHT";
       } else {
         node.textAutoResize = "HEIGHT";
       }
@@ -6485,7 +6810,7 @@ export class DOMExtractor {
         "extractTypographySafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "error"
+        "error",
       );
     }
   }
@@ -6493,7 +6818,7 @@ export class DOMExtractor {
   private async extractBackgroundImageFillsSafe(
     computed: CSSStyleDeclaration,
     element: Element,
-    node: any
+    node: any,
   ): Promise<void> {
     try {
       const isDocumentRoot =
@@ -6535,7 +6860,7 @@ export class DOMExtractor {
         const repeat = repeats[i] || repeats[repeats.length - 1] || "";
         const scaleMode = this.mapCssBackgroundToScaleMode(
           (size || "").toLowerCase(),
-          (repeat || "").toLowerCase()
+          (repeat || "").toLowerCase(),
         );
         const objectPosition = this.normalizeBackgroundPosition(position);
 
@@ -6576,18 +6901,18 @@ export class DOMExtractor {
             }
           } else {
             // Handle as raster image (existing logic)
-            await this.captureImageSafe(rawUrl);
-            const key = this.hashString(rawUrl);
+            await this.captureImageSafe(rawUrl, element);
+            const assetId = this.hashString(rawUrl); // hashString already includes "img_" prefix
 
             // ASSET COMPLETENESS FIX: Register element for Tier B raster fallback
-            this.registerImageElement(key, element);
+            this.registerImageElement(assetId, element);
 
             // ENHANCED: Detect if this might be a logo/icon based on URL patterns
             const isLogo = this.detectLogoPattern(rawUrl, element);
 
             const fill = {
               type: "IMAGE",
-              imageHash: key,
+              imageHash: assetId,
               scaleMode,
               ...(objectPosition ? { objectPosition } : {}),
               visible: true,
@@ -6624,7 +6949,7 @@ export class DOMExtractor {
         "extractBackgroundImageFillsSafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "warning"
+        "warning",
       );
     }
   }
@@ -6690,11 +7015,349 @@ export class DOMExtractor {
     }
   }
 
+  /**
+   * Detect if an SVG element is a complex sprite that should be rasterized
+   * instead of serialized. Complex sprites include:
+   * - SVGs with multiple <use> elements referencing external sprites
+   * - SVGs containing <symbol> definitions (sprite sheets)
+   * - SVGs with many child elements that suggest a sprite collection
+   */
+  private isComplexSvgSprite(element: Element): boolean {
+    try {
+      if (element.tagName.toLowerCase() !== "svg") return false;
+
+      // Check for <use> elements that reference external sprites
+      const useElements = element.querySelectorAll("use");
+      if (useElements.length > 0) {
+        // If any <use> references an external file (contains #), it's likely a sprite
+        for (const use of Array.from(useElements)) {
+          const href =
+            use.getAttribute("href") || use.getAttribute("xlink:href") || "";
+          if (href.includes("#") || href.startsWith("#")) {
+            console.log(
+              `🔍 [SVG SPRITE] Detected <use> with sprite reference: ${href}`,
+            );
+            return true;
+          }
+        }
+      }
+
+      // Check for <symbol> elements (indicates a sprite sheet)
+      const symbols = element.querySelectorAll("symbol");
+      if (symbols.length > 1) {
+        console.log(
+          `🔍 [SVG SPRITE] Detected ${symbols.length} <symbol> elements (sprite sheet)`,
+        );
+        return true;
+      }
+
+      // Check for many hidden or clipped child elements (common in sprite sheets)
+      const hiddenChildren = element.querySelectorAll(
+        '[style*="display: none"], [style*="display:none"], [hidden], [aria-hidden="true"]',
+      );
+      if (hiddenChildren.length > 3) {
+        console.log(
+          `🔍 [SVG SPRITE] Detected ${hiddenChildren.length} hidden child elements`,
+        );
+        return true;
+      }
+
+      // Check for many direct child SVG elements (indicates sprite collection)
+      const directSvgChildren = element.querySelectorAll(
+        ":scope > svg, :scope > g > svg",
+      );
+      if (directSvgChildren.length > 2) {
+        console.log(
+          `🔍 [SVG SPRITE] Detected ${directSvgChildren.length} nested SVG elements`,
+        );
+        return true;
+      }
+
+      // Check for i18n/locale-based sprite patterns (common on Amazon, etc.)
+      const allChildren = element.querySelectorAll("*");
+      let localePatternCount = 0;
+      for (const child of Array.from(allChildren).slice(0, 50)) {
+        // Limit check to first 50 children
+        const id = child.id || "";
+        const className = child.className?.toString?.() || "";
+        const dataAttrs = Array.from(child.attributes || [])
+          .filter((a) => a.name.startsWith("data-"))
+          .map((a) => a.value);
+
+        // Look for locale patterns like "en-us", "ar-ae", "i18n", etc.
+        const combinedText = `${id} ${className} ${dataAttrs.join(
+          " ",
+        )}`.toLowerCase();
+        if (
+          combinedText.match(/[a-z]{2}[-_][a-z]{2}/i) || // en-us, ar-ae patterns
+          combinedText.includes("i18n") ||
+          combinedText.includes("locale") ||
+          combinedText.includes("lang-")
+        ) {
+          localePatternCount++;
+        }
+      }
+
+      if (localePatternCount > 2) {
+        console.log(
+          `🔍 [SVG SPRITE] Detected ${localePatternCount} locale/i18n patterns (multi-locale sprite)`,
+        );
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.warn("⚠️ [SVG SPRITE] Error detecting sprite complexity:", error);
+      return false;
+    }
+  }
+
+  /**
+   * Check if an element is in a logo or header area
+   * These areas often contain complex SVG sprites that should be rasterized
+   */
+  private isInLogoOrHeaderArea(element: Element): boolean {
+    try {
+      const tagName = element.tagName.toLowerCase();
+      const className = this.getClassNameSafe(element).toLowerCase();
+      const id = (element.id || "").toLowerCase();
+
+      // 1) Logo semantics heuristic (local attributes)
+      const logoKeywords = [
+        "logo",
+        "brand",
+        "masthead",
+        "markword",
+        "branding",
+        "identity",
+      ];
+      const matchesKeyword = (str: string) =>
+        logoKeywords.some((kw) => str.includes(kw));
+
+      const selfMatch = matchesKeyword(className) || matchesKeyword(id);
+      const ariaMatch =
+        matchesKeyword(
+          (element.getAttribute("aria-label") || "").toLowerCase(),
+        ) ||
+        matchesKeyword((element.getAttribute("title") || "").toLowerCase()) ||
+        matchesKeyword((element.getAttribute("alt") || "").toLowerCase());
+
+      if (selfMatch || ariaMatch) {
+        this.recordRasterizeReason("logo-semantics");
+        return true;
+      }
+
+      // 2) Primary content of home link heuristic
+      const homeLink = element.closest(
+        "a[href='/'], a[href=''], a[href^='" + window.location.origin + "/']",
+      );
+      if (homeLink) {
+        // Is this element dominant in the anchor?
+        const isDominant =
+          tagName === "svg" ||
+          tagName === "img" ||
+          homeLink.querySelectorAll("svg, img").length === 1;
+
+        if (isDominant) {
+          // Additional visual dominance check: relative area
+          const rect = element.getBoundingClientRect();
+          const linkRect = homeLink.getBoundingClientRect();
+          const areaRatio =
+            (rect.width * rect.height) /
+            (linkRect.width * linkRect.height || 1);
+
+          if (areaRatio > 0.4) {
+            this.recordRasterizeReason("home-link-primary");
+            return true;
+          }
+        }
+      }
+
+      return false;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /**
+   * Internal helper to record SVG rasterization reasons for instrumentation
+   */
+  private recordRasterizeReason(reason: string): void {
+    this.diagnostics.svgRasterizeExecuted++;
+    const count = this.diagnostics.svgRasterizeReasons.get(reason) || 0;
+    this.diagnostics.svgRasterizeReasons.set(reason, count + 1);
+  }
+
+  /**
+   * Detect if an element is a loading placeholder / skeleton
+   */
+  private isSkeletonElement(element: Element): boolean {
+    const className = this.getClassNameSafe(element).toLowerCase();
+    const id = (element.id || "").toLowerCase();
+    const ariaBusy = element.getAttribute("aria-busy") === "true";
+    const dataSkeleton = element.hasAttribute("data-skeleton");
+
+    if (ariaBusy || dataSkeleton) return true;
+
+    const skeletonKeywords = [
+      "skeleton",
+      "anim-pulse",
+      "gh-skeleton",
+      "is-loading",
+    ];
+    return skeletonKeywords.some(
+      (kw) => className.includes(kw) || id.includes(kw),
+    );
+  }
+
+  /**
+   * Cheap signature of a node to detect repeats
+   */
+  private getNodeSignature(element: Element): string {
+    const tagName = element.tagName.toLowerCase();
+    const classCount = element.classList.length;
+    const childCount = element.children.length;
+    return `${tagName}:${classCount}:${childCount}`;
+  }
+
+  /**
+   * Enqueue a screenshot task (opportunistic/non-blocking)
+   */
+  private enqueueScreenshot(
+    element: Element,
+    onComplete: (dataUrl: string) => void,
+  ): void {
+    // Attach node reference to element for signature generation (best-effort)
+    // This is safe because it's a transient object during extraction
+    (element as any).__node_ref = (element as any).__node_ref || {};
+    this.screenshotQueue.push({ element, onComplete });
+  }
+
+  /**
+   * Generates a unique visual signature for an element to allow raster deduplication.
+   * Includes tag name, dimensions, and visual styles (filters, transforms, etc.)
+   */
+  private getRasterSignature(element: Element, rect: DOMRect): string {
+    const tagName = element.tagName.toLowerCase();
+    const style = ExtractionValidation.safeGetComputedStyle(element);
+
+    if (!style) return `${tagName}_${rect.width}_${rect.height}`;
+
+    const visualProps = [
+      tagName,
+      Math.round(rect.width),
+      Math.round(rect.height),
+      style.opacity,
+      style.filter,
+      style.backdropFilter,
+      style.background,
+      style.backgroundColor,
+      style.backgroundImage,
+      style.boxShadow,
+      style.borderRadius,
+      style.transform,
+      style.clipPath,
+      style.webkitMaskImage || style.maskImage,
+    ];
+
+    // For SVG, the inner HTML is critical for identity
+    if (tagName === "svg") {
+      visualProps.push(element.innerHTML);
+    }
+
+    // CRITICAL: For images, the source URL is the identity
+    if (tagName === "img") {
+      visualProps.push(
+        (element as HTMLImageElement).currentSrc ||
+          (element as HTMLImageElement).src,
+      );
+    }
+
+    // For other elements, a combination of classes and child IDs helps identity
+    if (tagName !== "svg" && tagName !== "img") {
+      visualProps.push(element.className);
+    }
+
+    return visualProps.join("|");
+  }
+
+  /**
+   * Drain the screenshot queue with concurrency limits
+   */
+  private async drainScreenshotQueue(): Promise<void> {
+    if (this.screenshotQueue.length === 0) return;
+
+    this.performanceTracker.currentPhase = "finalizing_assets";
+    console.log(
+      `📸 [QUEUE] Processing ${this.screenshotQueue.length} screenshots...`,
+    );
+
+    const total = this.screenshotQueue.length;
+    let finished = 0;
+
+    const worker = async () => {
+      while (this.screenshotQueue.length > 0) {
+        const job = this.screenshotQueue.shift()!;
+        try {
+          const rect = job.element.getBoundingClientRect();
+          const signature = this.getRasterSignature(job.element, rect);
+
+          // DEDUPLICATION: Check if we've already rasterized this exact visual state
+          if (this.rasterCache.has(signature)) {
+            const cached = this.rasterCache.get(signature)!;
+            console.log(
+              `♻️ [RASTER CACHE] Reusing raster for ${job.element.tagName} (${
+                cached.length / 1024
+              }KB)`,
+            );
+            job.onComplete(cached);
+            this.diagnostics.estimatedPayloadBytes += cached.length;
+          } else {
+            // CLAMPING: Capture at rendered size to prevent OOM/bloat from massive source assets
+            const result = await captureElementScreenshot(job.element, {
+              timeoutMs: 3500,
+              targetWidth: rect.width,
+              targetHeight: rect.height,
+            });
+
+            if (result) {
+              this.rasterCache.set(signature, result);
+              job.onComplete(result);
+              this.diagnostics.estimatedPayloadBytes += result.length;
+            }
+          }
+        } catch (err) {
+          console.warn("[QUEUE] Screenshot failed:", err);
+        } finally {
+          finished++;
+          if (finished % 10 === 0 || finished === total) {
+            const percent = Math.round((finished / total) * 100);
+            this.postProgress(
+              `Rasterizing assets (${finished}/${total})...`,
+              80 + percent * 0.15,
+              { phase: "finalizing" },
+            );
+          }
+        }
+      }
+    };
+
+    // Run parallel workers
+    const workers = [];
+    for (let i = 0; i < this.MAX_CONCURRENT_SCREENSHOTS; i++) {
+      workers.push(worker());
+    }
+
+    await Promise.all(workers);
+    console.log(`✅ [QUEUE] Finished ${finished} screenshots`);
+  }
   private extractCssUrls(value: string): string[] {
     try {
       const urls: string[] = [];
       const re = /url\(\s*(['"]?)(.*?)\1\s*\)/gi;
-      for (const match of value.matchAll(re)) {
+      // TS Fix: Convert matchAll iterator to array
+      const matches = Array.from(value.matchAll(re));
+      for (const match of matches) {
         const raw = (match[2] || "").trim();
         if (raw) urls.push(raw);
       }
@@ -6731,6 +7394,31 @@ export class DOMExtractor {
     if (!raw) return null;
 
     const lower = raw.toLowerCase();
+
+    // FIDELITY FIX #2: conic-gradient detection (P0 - HIGH IMPACT)
+    // Conic gradients are NOT supported by Figma - must rasterize
+    if (
+      lower.startsWith("conic-gradient(") ||
+      lower.startsWith("repeating-conic-gradient(")
+    ) {
+      console.warn(
+        `🔄 [RASTERIZE] Unsupported conic-gradient detected - will trigger rasterization`,
+      );
+      // Return null to signal unsupported - caller should trigger rasterization
+      return null;
+    }
+
+    // FIDELITY FIX #2.1: repeating gradients detection (P1)
+    if (
+      lower.startsWith("repeating-linear-gradient(") ||
+      lower.startsWith("repeating-radial-gradient(")
+    ) {
+      console.warn(
+        `🔄 [RASTERIZE] Unsupported repeating gradient detected - will trigger rasterization`,
+      );
+      return null;
+    }
+
     if (lower.startsWith("linear-gradient(")) {
       return this.parseLinearGradientFill(raw);
     }
@@ -6858,7 +7546,7 @@ export class DOMExtractor {
   }
 
   private parseGradientStops(
-    stops: string[]
+    stops: string[],
   ): Array<{ position: number; color: any }> {
     const parsed = stops
       .map((s) => this.parseGradientStop(s))
@@ -6894,7 +7582,7 @@ export class DOMExtractor {
   }
 
   private parseGradientStop(
-    stop: string
+    stop: string,
   ): { position?: number; color: any } | null {
     const { colorPart, positions } = this.splitStopColorAndPositions(stop);
     if (!colorPart) return null;
@@ -6914,7 +7602,7 @@ export class DOMExtractor {
     if (!raw) return { colorPart: "", positions: [] };
 
     const match = raw.match(
-      /(.*?)(?:\s+(-?\d*\.?\d+%)(?:\s+(-?\d*\.?\d+%))?)?\s*$/
+      /(.*?)(?:\s+(-?\d*\.?\d+%)(?:\s+(-?\d*\.?\d+%))?)?\s*$/,
     );
     if (!match) return { colorPart: raw, positions: [] };
     const colorPart = (match[1] || "").trim();
@@ -6934,7 +7622,7 @@ export class DOMExtractor {
   }
 
   private linearGradientTransformFromCssDegrees(
-    cssDegrees: number
+    cssDegrees: number,
   ): [[number, number, number], [number, number, number]] {
     // Assume Figma default linear gradient runs left->right.
     // CSS 90deg runs left->right. Rotate about the center to match CSS angles.
@@ -6952,7 +7640,7 @@ export class DOMExtractor {
 
   private mapCssBackgroundToScaleMode(
     backgroundSize: string,
-    backgroundRepeat: string
+    backgroundRepeat: string,
   ): "FILL" | "FIT" | "CROP" | "TILE" {
     if (
       backgroundRepeat.includes("repeat") &&
@@ -7016,7 +7704,7 @@ export class DOMExtractor {
 
   private shouldTreatLeafTextElementAsContainer(
     element: Element,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): boolean {
     // If the element has a visible box model (background/border/padding/shadow/radius),
     // treat it as a FRAME and emit a child TEXT node. This preserves padding and
@@ -7031,7 +7719,7 @@ export class DOMExtractor {
 
       const borderWidth = ExtractionValidation.safeParseFloat(
         computed.borderTopWidth || computed.borderWidth,
-        0
+        0,
       );
       const hasBorder = borderWidth > 0.001;
 
@@ -7044,11 +7732,11 @@ export class DOMExtractor {
           0.001 ||
         ExtractionValidation.safeParseFloat(
           computed.borderBottomRightRadius,
-          0
+          0,
         ) > 0.001 ||
         ExtractionValidation.safeParseFloat(
           computed.borderBottomLeftRadius,
-          0
+          0,
         ) > 0.001;
 
       const padding =
@@ -7060,11 +7748,11 @@ export class DOMExtractor {
 
       const before = ExtractionValidation.safeGetComputedStyle(
         element,
-        "::before"
+        "::before",
       );
       const after = ExtractionValidation.safeGetComputedStyle(
         element,
-        "::after"
+        "::after",
       );
       const hasBeforeAfterContent = [before, after].some((s) => {
         if (!s) return false;
@@ -7096,19 +7784,19 @@ export class DOMExtractor {
     try {
       const topLeft = ExtractionValidation.safeParseFloat(
         computed.borderTopLeftRadius,
-        0
+        0,
       );
       const topRight = ExtractionValidation.safeParseFloat(
         computed.borderTopRightRadius,
-        0
+        0,
       );
       const bottomRight = ExtractionValidation.safeParseFloat(
         computed.borderBottomRightRadius,
-        0
+        0,
       );
       const bottomLeft = ExtractionValidation.safeParseFloat(
         computed.borderBottomLeftRadius,
-        0
+        0,
       );
 
       const values = [topLeft, topRight, bottomRight, bottomLeft];
@@ -7165,14 +7853,14 @@ export class DOMExtractor {
     computed: CSSStyleDeclaration,
     fontFamily: string,
     fontSize: number,
-    fontWeight: number
+    fontWeight: number,
   ): number {
     try {
       // If the browser already computed a px value, trust it.
       if (computed.lineHeight && computed.lineHeight !== "normal") {
         const parsed = ExtractionValidation.safeParseFloat(
           computed.lineHeight,
-          0
+          0,
         );
         if (parsed > 0) return parsed;
       }
@@ -7211,7 +7899,7 @@ export class DOMExtractor {
       const clamped = ExtractionValidation.clampNumber(
         height,
         Math.max(1, Math.round(fontSize * 0.8)),
-        Math.round(fontSize * 5)
+        Math.round(fontSize * 5),
       );
 
       this.lineHeightCache.set(key, clamped);
@@ -7226,7 +7914,7 @@ export class DOMExtractor {
   // ============================================================================
 
   private parseColorSafe(
-    color: string
+    color: string,
   ): { r: number; g: number; b: number; a: number } | null {
     if (!color) return null;
 
@@ -7236,142 +7924,21 @@ export class DOMExtractor {
     }
 
     try {
-      const direct = String(color).trim().toLowerCase();
-      if (!direct) {
-        this.colorCache.set(color, null);
-        return null;
-      }
-      if (direct === "transparent") {
-        const result = { r: 0, g: 0, b: 0, a: 0 };
-        this.colorCache.set(color, result);
-        return result;
-      }
-
       const raw = ExtractionValidation.sanitizeColorString(color);
       if (!raw) {
         this.colorCache.set(color, null);
         return null;
       }
 
-      // ENHANCED RGBA/RGB parsing with better decimal support and precision
-      const rgbaMatch = raw.match(
-        /rgba?\(\s*([\d.]+%?)\s*,?\s*([\d.]+%?)\s*,?\s*([\d.]+%?)\s*(?:,?\s*([\d.]+%?))?\s*\)/
-      );
-      if (rgbaMatch) {
-        // PIXEL-PERFECT COLOR FIX: Handle percentages and improve precision
-        const parseColorValue = (val: string, isAlpha = false) => {
-          if (!val) return isAlpha ? 1 : 0;
-          const isPercent = val.includes("%");
-          const num = parseFloat(val.replace("%", ""));
-          if (isPercent) {
-            return isAlpha ? num / 100 : (num / 100) * 255;
-          }
-          return num;
-        };
-
+      // Optimization: Try shared parser first (handles hex, rgb, rgba, modern syntax)
+      const parsed = parseColorToRGBA(raw);
+      if (parsed) {
         const result = {
-          r:
-            Math.round(
-              ExtractionValidation.clampNumber(
-                parseColorValue(rgbaMatch[1]) / 255,
-                0,
-                1
-              ) * 255
-            ) / 255, // Round to nearest 1/255 for accuracy
-          g:
-            Math.round(
-              ExtractionValidation.clampNumber(
-                parseColorValue(rgbaMatch[2]) / 255,
-                0,
-                1
-              ) * 255
-            ) / 255,
-          b:
-            Math.round(
-              ExtractionValidation.clampNumber(
-                parseColorValue(rgbaMatch[3]) / 255,
-                0,
-                1
-              ) * 255
-            ) / 255,
-          a: rgbaMatch[4]
-            ? ExtractionValidation.clampNumber(
-                parseColorValue(rgbaMatch[4], true),
-                0,
-                1
-              )
-            : 1,
+          r: Math.round(parsed.r * 255) / 255,
+          g: Math.round(parsed.g * 255) / 255,
+          b: Math.round(parsed.b * 255) / 255,
+          a: ExtractionValidation.clampNumber(parsed.a, 0, 1),
         };
-        this.colorCache.set(color, result);
-        return result;
-      }
-
-      // Modern CSS rgb()/rgba() syntax: rgb(0 0 0 / 0.5)
-      const spaceRgbMatch = raw.match(
-        /rgba?\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+%?))?\s*\)/
-      );
-      if (spaceRgbMatch) {
-        const aRaw = spaceRgbMatch[4];
-        const result = {
-          r: ExtractionValidation.clampNumber(
-            parseFloat(spaceRgbMatch[1]) / 255,
-            0,
-            1
-          ),
-          g: ExtractionValidation.clampNumber(
-            parseFloat(spaceRgbMatch[2]) / 255,
-            0,
-            1
-          ),
-          b: ExtractionValidation.clampNumber(
-            parseFloat(spaceRgbMatch[3]) / 255,
-            0,
-            1
-          ),
-          a: aRaw
-            ? aRaw.endsWith("%")
-              ? ExtractionValidation.clampNumber(parseFloat(aRaw) / 100, 0, 1)
-              : ExtractionValidation.clampNumber(parseFloat(aRaw), 0, 1)
-            : 1,
-        };
-        this.colorCache.set(color, result);
-        return result;
-      }
-
-      // Hex
-      const hexMatch = raw.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
-      if (hexMatch) {
-        let hex = hexMatch[1];
-        if (hex.length === 3) {
-          hex = hex
-            .split("")
-            .map((ch) => ch + ch)
-            .join("");
-        }
-        const r = ExtractionValidation.clampNumber(
-          parseInt(hex.substring(0, 2), 16) / 255,
-          0,
-          1
-        );
-        const g = ExtractionValidation.clampNumber(
-          parseInt(hex.substring(2, 4), 16) / 255,
-          0,
-          1
-        );
-        const b = ExtractionValidation.clampNumber(
-          parseInt(hex.substring(4, 6), 16) / 255,
-          0,
-          1
-        );
-        let a = 1;
-        if (hex.length === 8) {
-          a = ExtractionValidation.clampNumber(
-            parseInt(hex.substring(6, 8), 16) / 255,
-            0,
-            1
-          );
-        }
-        const result = { r, g, b, a };
         this.colorCache.set(color, result);
         return result;
       }
@@ -7411,7 +7978,11 @@ export class DOMExtractor {
 
           ctx.fillRect(0, 0, 1, 1);
           const imageData = ctx.getImageData(0, 0, 1, 1);
-          const [r, g, b, a] = imageData.data;
+          // TS Fix: Access data by index instead of destructuring iterator
+          const r = imageData.data[0];
+          const g = imageData.data[1];
+          const b = imageData.data[2];
+          const a = imageData.data[3];
 
           // Verify if the draw actually worked (some browsers might fail silently for invalid colors)
           // Default clear color is transparent (0,0,0,0). If we get that and input wasn't transparent, it might be invalid.
@@ -7438,7 +8009,7 @@ export class DOMExtractor {
       // Modern CSS color formats: oklch(), oklab(), lch(), lab(), color-mix()
       // These formats are supported by modern browsers and can be converted via canvas API
       const modernColorMatch = raw.match(
-        /^(oklch|oklab|lch|lab|color-mix)\([^)]+\)$/i
+        /^(oklch|oklab|lch|lab|color-mix)\([^)]+\)$/i,
       );
       if (modernColorMatch) {
         const result = extractFromCanvas(raw);
@@ -7457,7 +8028,7 @@ export class DOMExtractor {
         "parseColorSafe",
         `Failed to parse color: ${color}`,
         undefined,
-        "warning"
+        "warning",
       );
       this.colorCache.set(color, null);
       return null;
@@ -7494,7 +8065,7 @@ export class DOMExtractor {
         } else {
           const parts = working.split(/\s+/);
           const colorPart = parts.find(
-            (p) => p.startsWith("#") || /^[a-z]+$/i.test(p)
+            (p) => p.startsWith("#") || /^[a-z]+$/i.test(p),
           );
           if (colorPart) {
             colorStr = colorPart;
@@ -7507,11 +8078,11 @@ export class DOMExtractor {
         const offsetY = ExtractionValidation.safeParseFloat(dimensions[1], 0);
         const blurRadius = ExtractionValidation.safeParseFloat(
           dimensions[2],
-          0
+          0,
         );
         const spreadRadius = ExtractionValidation.safeParseFloat(
           dimensions[3],
-          0
+          0,
         );
 
         const color = this.parseColorSafe(colorStr) || {
@@ -7521,6 +8092,11 @@ export class DOMExtractor {
           a: 0.25,
         };
 
+        // FIDELITY TODO: Validate CSS blur radius → Figma blur radius mapping
+        // CSS blur-radius and Figma blur radius may have different interpretations
+        // Current: 1:1 mapping (blurRadius passed directly)
+        // Need pixel-diff testing to determine if conversion factor is needed
+        // Hypothesis: May need 0.5x or 2x multiplier for exact visual match
         shadows.push({
           type: isInset ? "INNER_SHADOW" : "DROP_SHADOW",
           color: { r: color.r, g: color.g, b: color.b, a: color.a },
@@ -7535,7 +8111,7 @@ export class DOMExtractor {
         "parseBoxShadowSafe",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "warning"
+        "warning",
       );
     }
 
@@ -7556,7 +8132,7 @@ export class DOMExtractor {
   private async handleInputElement(
     element: HTMLInputElement | HTMLTextAreaElement,
     node: any,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): Promise<void> {
     try {
       const isInput = element.tagName.toLowerCase() === "input";
@@ -7705,7 +8281,7 @@ export class DOMExtractor {
       try {
         const placeholderStyle = window.getComputedStyle(
           element,
-          "::placeholder"
+          "::placeholder",
         );
         if (placeholderStyle) {
           node.placeholderStyle = {
@@ -7755,14 +8331,14 @@ export class DOMExtractor {
         "handleInputElement",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "warning"
+        "warning",
       );
     }
   }
 
   private parseFilterEffectsSafe(
     filter: string,
-    mode: "LAYER" | "BACKGROUND"
+    mode: "LAYER" | "BACKGROUND",
   ): any[] {
     const effects: any[] = [];
     try {
@@ -7788,7 +8364,7 @@ export class DOMExtractor {
           } else {
             const parts = remaining.split(/\s+/);
             const colorPart = parts.find(
-              (p) => p.startsWith("#") || /^[a-z]+$/i.test(p)
+              (p) => p.startsWith("#") || /^[a-z]+$/i.test(p),
             );
             if (colorPart) {
               colorStr = colorPart;
@@ -7838,7 +8414,7 @@ export class DOMExtractor {
         "parseFilterEffectsSafe",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "warning"
+        "warning",
       );
     }
     // CSS filters: filter: blur(5px) grayscale(100%);
@@ -7888,7 +8464,7 @@ export class DOMExtractor {
         } else {
           const parts = trimmed.split(/\s+/);
           const colorPart = parts.find(
-            (p) => p.startsWith("#") || /^[a-z]+$/i.test(p)
+            (p) => p.startsWith("#") || /^[a-z]+$/i.test(p),
           );
           if (colorPart) {
             colorStr = colorPart;
@@ -7901,7 +8477,7 @@ export class DOMExtractor {
         const offsetY = ExtractionValidation.safeParseFloat(dimensions[1], 0);
         const blurRadius = ExtractionValidation.safeParseFloat(
           dimensions[2],
-          0
+          0,
         );
 
         const color = this.parseColorSafe(colorStr) || {
@@ -7925,7 +8501,7 @@ export class DOMExtractor {
         "parseTextShadowSafe",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "warning"
+        "warning",
       );
     }
 
@@ -7938,7 +8514,7 @@ export class DOMExtractor {
 
   private async extractPseudoElementsSafe(
     element: Element,
-    parentNode: any
+    parentNode: any,
   ): Promise<void> {
     try {
       await this.processPseudoElement(element, parentNode, "::before");
@@ -7948,7 +8524,7 @@ export class DOMExtractor {
         "extractPseudoElementsSafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "warning"
+        "warning",
       );
     }
   }
@@ -7956,7 +8532,7 @@ export class DOMExtractor {
   private async processPseudoElement(
     element: Element,
     parentNode: any,
-    type: string
+    type: string,
   ): Promise<void> {
     try {
       // Only capture ::before/::after. Other pseudos (e.g. ::first-letter/::first-line)
@@ -8059,11 +8635,11 @@ export class DOMExtractor {
             if (parentComputed) {
               originX += ExtractionValidation.safeParseFloat(
                 parentComputed.borderLeftWidth,
-                0
+                0,
               );
               originY += ExtractionValidation.safeParseFloat(
                 parentComputed.borderTopWidth,
-                0
+                0,
               );
             }
           }
@@ -8073,11 +8649,11 @@ export class DOMExtractor {
           // CRITICAL FIX: Add host's border width to origin because parentRect is the border box
           originX += ExtractionValidation.safeParseFloat(
             hostStyle.borderLeftWidth,
-            0
+            0,
           );
           originY += ExtractionValidation.safeParseFloat(
             hostStyle.borderTopWidth,
-            0
+            0,
           );
         }
 
@@ -8144,7 +8720,7 @@ export class DOMExtractor {
         "processPseudoElement",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "warning"
+        "warning",
       );
     }
   }
@@ -8156,7 +8732,7 @@ export class DOMExtractor {
   private async extractSpecialPropertiesSafe(
     element: Element,
     node: any,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): Promise<void> {
     const tagName = element.tagName.toLowerCase();
 
@@ -8166,12 +8742,32 @@ export class DOMExtractor {
           await this.handleImageElement(
             element as HTMLImageElement,
             node,
-            computed
+            computed,
           );
           break;
         case "svg":
           node.type = "VECTOR";
           node.name = "SVG";
+
+          // CRITICAL FIX: Detect complex SVG sprites (like Amazon's logo) and rasterize them
+          // Complex sprites use <use> elements, symbols, or hidden sprite sheets that don't
+          // serialize properly - we need to capture the rendered result instead
+          const isComplexSvgSprite = this.isComplexSvgSprite(element);
+          const isInLogoArea = this.isInLogoOrHeaderArea(element);
+
+          if (isComplexSvgSprite || isInLogoArea) {
+            console.log(
+              `🎨 [SVG SPRITE FIX] Rasterizing complex SVG (sprite=${isComplexSvgSprite}, logoArea=${isInLogoArea}): ${
+                element.id || element.className || "anonymous"
+              }`,
+            );
+            node.rasterize = { reason: "COMPLEX_SVG_SPRITE" };
+            node.type = "FRAME"; // Change type to FRAME for rasterized content
+            node.name = isInLogoArea ? "Logo" : "SVG Image";
+            // Leave svgContent empty - the rasterization will be captured later
+            break;
+          }
+
           // Preserve inline SVG markup so the Figma plugin can render it via
           // figma.createNodeFromSvg() instead of losing logos/icons.
           try {
@@ -8260,7 +8856,7 @@ export class DOMExtractor {
                 const bgLuminance = this.calculateLuminance(
                   bgColor.r,
                   bgColor.g,
-                  bgColor.b
+                  bgColor.b,
                 );
                 if (bgLuminance < 0.5) {
                   fillColorToUse = "rgb(255, 255, 255)";
@@ -8309,7 +8905,7 @@ export class DOMExtractor {
                   attrError instanceof Error ? attrError.message : "Unknown"
                 }`,
                 element,
-                "warning"
+                "warning",
               );
             }
 
@@ -8320,7 +8916,7 @@ export class DOMExtractor {
             try {
               node.svgContent = await this.inlineSvgUsesInPage(
                 node.svgContent,
-                window.location.href
+                window.location.href,
               );
             } catch {
               // Keep original svgContent if inlining fails.
@@ -8345,7 +8941,7 @@ export class DOMExtractor {
           await this.handleInputElement(
             element as HTMLInputElement | HTMLTextAreaElement,
             node,
-            computed
+            computed,
           );
           break;
       }
@@ -8354,14 +8950,14 @@ export class DOMExtractor {
         "extractSpecialPropertiesSafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "error"
+        "error",
       );
     }
   }
 
   private async inlineSvgUsesInPage(
     svgMarkup: string,
-    baseUrl: string
+    baseUrl: string,
   ): Promise<string> {
     const markup = (svgMarkup || "").trim();
     if (!markup) return svgMarkup;
@@ -8381,7 +8977,7 @@ export class DOMExtractor {
           parserError.message.includes("TrustedHTML")
         ) {
           console.warn(
-            `⚠️ [CSP] TrustedHTML violation in inlineSvgUsesInPage, returning original markup.`
+            `⚠️ [CSP] TrustedHTML violation in inlineSvgUsesInPage, returning original markup.`,
           );
           return svgMarkup;
         }
@@ -8416,20 +9012,9 @@ export class DOMExtractor {
             } else {
               try {
                 // CRITICAL FIX: Use background fetch for cross-origin SVGs to bypass CORS
-                const response: any = await new Promise((resolve) => {
-                  chrome.runtime.sendMessage(
-                    { type: "FETCH_ASSET", url: absUrl },
-                    (response) => {
-                      if (chrome.runtime.lastError) {
-                        resolve({
-                          ok: false,
-                          error: chrome.runtime.lastError.message,
-                        });
-                      } else {
-                        resolve(response);
-                      }
-                    }
-                  );
+                const response: any = await this.sendMessageToBackground({
+                  type: "FETCH_ASSET",
+                  url: absUrl,
                 });
 
                 if (response && response.ok && response.data) {
@@ -8498,7 +9083,7 @@ export class DOMExtractor {
           ) {
             // TrustedHTML violation - skip this use element and continue
             console.warn(
-              `⚠️ [CSP] TrustedHTML violation while processing <use> element, skipping: ${errorMsg}`
+              `⚠️ [CSP] TrustedHTML violation while processing <use> element, skipping: ${errorMsg}`,
             );
             continue;
           }
@@ -8507,7 +9092,7 @@ export class DOMExtractor {
             "inlineSvgUsesInPage",
             `Error processing <use> element: ${errorMsg}`,
             undefined,
-            "warning"
+            "warning",
           );
         }
       }
@@ -8524,7 +9109,7 @@ export class DOMExtractor {
             "inlineSvgUsesInPage",
             "XMLSerializer returned empty string",
             undefined,
-            "warning"
+            "warning",
           );
           return svgMarkup;
         }
@@ -8540,7 +9125,7 @@ export class DOMExtractor {
           "inlineSvgUsesInPage",
           `XMLSerializer failed: ${errorMsg}. Returning original markup to avoid TrustedHTML violation.`,
           undefined,
-          "warning"
+          "warning",
         );
         return svgMarkup; // Return original on error - safer than outerHTML
       }
@@ -8553,20 +9138,20 @@ export class DOMExtractor {
       ) {
         // Explicitly handle TrustedHTML violations
         console.warn(
-          `⚠️ [CSP] TrustedHTML violation in inlineSvgUsesInPage, returning original markup: ${errorMsg}`
+          `⚠️ [CSP] TrustedHTML violation in inlineSvgUsesInPage, returning original markup: ${errorMsg}`,
         );
         this.errorTracker.recordError(
           "inlineSvgUsesInPage",
           `TrustedHTML violation: ${errorMsg}. Returning original markup.`,
           undefined,
-          "warning"
+          "warning",
         );
       } else {
         this.errorTracker.recordError(
           "inlineSvgUsesInPage",
           `Error during SVG inlining: ${errorMsg}`,
           undefined,
-          "warning"
+          "warning",
         );
       }
       return svgMarkup; // Return original on error
@@ -8576,7 +9161,7 @@ export class DOMExtractor {
   private async handleImageElement(
     img: HTMLImageElement,
     node: any,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): Promise<void> {
     node.type = "IMAGE";
     node.name = "Image";
@@ -8611,11 +9196,11 @@ export class DOMExtractor {
 
       const w = ExtractionValidation.safeParseFloat(
         img.naturalWidth || img.width,
-        0
+        0,
       );
       const h = ExtractionValidation.safeParseFloat(
         img.naturalHeight || img.height,
-        0
+        0,
       );
       // If not loaded yet, treat as placeholder only if name suggests it
       if (
@@ -8656,7 +9241,7 @@ export class DOMExtractor {
       } catch (error) {
         console.warn(
           `⚠️ [IMAGE] Failed to extract source from picture element:`,
-          error
+          error,
         );
         return null;
       }
@@ -8706,7 +9291,11 @@ export class DOMExtractor {
         img.getAttribute("data-original") ||
         img.getAttribute("data-src-retina") ||
         img.getAttribute("data-lazy") ||
-        img.getAttribute("data-delayed-url");
+        img.getAttribute("data-delayed-url") ||
+        img.getAttribute("data-background-image") ||
+        img.getAttribute("data-image") ||
+        img.getAttribute("data-img-src") ||
+        img.getAttribute("data-full-src");
       if (dataSrc && ExtractionValidation.isValidUrl(dataSrc))
         imageUrl = dataSrc;
 
@@ -8714,7 +9303,8 @@ export class DOMExtractor {
       const dataSrcset =
         img.getAttribute("data-srcset") ||
         img.getAttribute("data-lazy-srcset") ||
-        img.getAttribute("data-srcset-retina");
+        img.getAttribute("data-srcset-retina") ||
+        img.getAttribute("data-responsive");
       if (dataSrcset && dataSrcset.trim().length > 0) {
         const bestFromDataSrcset = this.pickBestUrlFromSrcset(dataSrcset);
         if (bestFromDataSrcset) imageUrl = bestFromDataSrcset;
@@ -8733,11 +9323,16 @@ export class DOMExtractor {
             img.getAttribute("data-src") ||
             img.getAttribute("data-lazy-src") ||
             img.getAttribute("data-original") ||
-            img.getAttribute("data-src-retina");
+            img.getAttribute("data-src-retina") ||
+            img.getAttribute("data-background-image") ||
+            img.getAttribute("data-image") ||
+            img.getAttribute("data-img-src") ||
+            img.getAttribute("data-full-src");
           const dataSrcset =
             img.getAttribute("data-srcset") ||
             img.getAttribute("data-lazy-srcset") ||
-            img.getAttribute("data-srcset-retina");
+            img.getAttribute("data-srcset-retina") ||
+            img.getAttribute("data-responsive");
 
           let realUrl: string | null = null;
           if (dataSrc && ExtractionValidation.isValidUrl(dataSrc)) {
@@ -8752,8 +9347,8 @@ export class DOMExtractor {
             console.log(
               `🔄 [LAZY LOAD FIX] Force-loading image: ${realUrl.substring(
                 0,
-                80
-              )}...`
+                80,
+              )}...`,
             );
             try {
               // Temporarily set src to trigger loading
@@ -8769,7 +9364,7 @@ export class DOMExtractor {
               ) {
                 imageUrl = realUrl;
                 console.log(
-                  `✅ [LAZY LOAD FIX] Image force-loaded successfully`
+                  `✅ [LAZY LOAD FIX] Image force-loaded successfully`,
                 );
               } else {
                 // Restore original src if it didn't work
@@ -8808,8 +9403,8 @@ export class DOMExtractor {
                 console.log(
                   `✅ [ETSY FIX] Image loaded after wait: ${imageUrl.substring(
                     0,
-                    80
-                  )}...`
+                    80,
+                  )}...`,
                 );
               }
             }
@@ -8823,15 +9418,15 @@ export class DOMExtractor {
 
     if (imageUrl && ExtractionValidation.isValidUrl(imageUrl)) {
       await this.captureImageSafe(imageUrl, img);
-      const key = this.hashString(imageUrl);
+      const assetId = this.hashString(imageUrl); // hashString already includes "img_" prefix
 
       const naturalWidth = ExtractionValidation.safeParseFloat(
         img.naturalWidth || img.width,
-        0
+        0,
       );
       const naturalHeight = ExtractionValidation.safeParseFloat(
         img.naturalHeight || img.height,
-        0
+        0,
       );
 
       const objectFit = computed.objectFit || "fill";
@@ -8845,13 +9440,13 @@ export class DOMExtractor {
           console.log(
             `🔄 [IMAGE LOAD] Waiting for image to load: ${imageUrl.substring(
               0,
-              80
-            )}...`
+              80,
+            )}...`,
           );
           await new Promise<void>((resolve, reject) => {
             const timeout = setTimeout(() => {
               console.warn(
-                `⏱️ [IMAGE LOAD] Timeout waiting for image size, continuing with URL only`
+                `⏱️ [IMAGE LOAD] Timeout waiting for image size, continuing with URL only`,
               );
               resolve(); // Don't reject, just continue so we don't break extraction
             }, 800); // Reduce to 800ms for responsiveness on large pages
@@ -8892,7 +9487,7 @@ export class DOMExtractor {
         } catch (err) {
           console.warn(
             `⚠️ [IMAGE LOAD] Failed to wait for image load, continuing with extraction:`,
-            err
+            err,
           );
           // Continue with extraction even if load fails - we'll use fallback dimensions
         }
@@ -8921,7 +9516,7 @@ export class DOMExtractor {
             this.performanceConfig.maxImageProbingTimeMs
           ) {
             console.warn(
-              `⚠️ [PERF] Image probing budget exhausted (${this.imageProbingTotalTime}ms), skipping remaining images`
+              `⚠️ [PERF] Image probing budget exhausted (${this.imageProbingTotalTime}ms), skipping remaining images`,
             );
             this.performanceConfig.skipImageIntrinsicSize = true;
           }
@@ -8961,13 +9556,14 @@ export class DOMExtractor {
       node.fills = [
         {
           type: "IMAGE",
-          imageHash: key,
+          imageHash: assetId, // CHANGED: Use prefixed assetId instead of raw key
           scaleMode: scaleMode,
           visible: true,
           url: imageUrl,
         },
       ];
-      node.imageHash = key;
+      node.imageHash = assetId; // CHANGED: Use prefixed assetId
+      node.imageAssetId = assetId; // NEW: Add imageAssetId for Figma plugin compatibility
       // CRITICAL: Add component abstraction for Image elements (Builder.io compatibility)
       // This simplifies the schema by using a component system for common elements
       node.component = {
@@ -8993,7 +9589,7 @@ export class DOMExtractor {
     } else {
       // IMAGE COMPLETENESS FIX: If no valid imageUrl found, mark for rasterization fallback
       console.warn(
-        `⚠️ [IMAGE] No valid URL found for <img>, tagging for rasterization`
+        `⚠️ [IMAGE] No valid URL found for <img>, tagging for rasterization`,
       );
       node.rasterize = { reason: "MISSING_IMAGE_URL" };
 
@@ -9049,7 +9645,7 @@ export class DOMExtractor {
 
   private async handleCanvasElement(
     canvas: HTMLCanvasElement,
-    node: any
+    node: any,
   ): Promise<void> {
     node.type = "RECTANGLE";
     node.name = "Canvas";
@@ -9058,19 +9654,19 @@ export class DOMExtractor {
       const dataUrl = canvas.toDataURL("image/png");
       if (dataUrl && dataUrl.startsWith("data:image")) {
         await this.captureImageSafe(dataUrl);
-        const key = this.hashString(dataUrl);
+        const assetId = this.hashString(dataUrl); // hashString already includes "img_" prefix
         // ASSET COMPLETENESS FIX: Register canvas for Tier B raster fallback
-        this.registerImageElement(key, canvas);
+        this.registerImageElement(assetId, canvas);
         node.fills = [
           {
             type: "IMAGE",
-            imageHash: key,
+            imageHash: assetId,
             scaleMode: "FILL",
             visible: true,
             url: dataUrl,
           },
         ];
-        node.imageHash = key;
+        node.imageHash = assetId;
       }
     } catch (error) {
       // ENHANCED: Better error handling for canvas extraction
@@ -9078,10 +9674,10 @@ export class DOMExtractor {
         error instanceof Error
           ? error.message
           : error && typeof error === "object" && "message" in error
-          ? String(error.message)
-          : error != null
-          ? String(error)
-          : "Canvas toDataURL failed (tainted or unsupported)";
+            ? String(error.message)
+            : error != null
+              ? String(error)
+              : "Canvas toDataURL failed (tainted or unsupported)";
 
       // ENHANCED: Check if it's a tainted canvas error (CORS issue) - this is expected and not critical
       // Check both the error message and the error name/type
@@ -9111,7 +9707,7 @@ export class DOMExtractor {
         // Log as info, not warning - this is expected for cross-origin canvas content
         // Use console.log instead of console.warn to avoid showing as warning
         console.log(
-          `ℹ️ [CANVAS] Canvas is tainted (CORS) - cannot export. Marking for rasterization fallback.`
+          `ℹ️ [CANVAS] Canvas is tainted (CORS) - cannot export. Marking for rasterization fallback.`,
         );
         // ASSET COMPLETENESS FIX: Use Tier B rasterization fallback for tainted canvases
         node.rasterize = { reason: "TAINTED_CANVAS" };
@@ -9125,14 +9721,14 @@ export class DOMExtractor {
         "handleCanvasElement",
         errorMessage,
         canvas,
-        "warning"
+        "warning",
       );
     }
   }
 
   private async handleVideoElement(
     video: HTMLVideoElement,
-    node: any
+    node: any,
   ): Promise<void> {
     node.type = "FRAME";
     node.name = "Video";
@@ -9144,13 +9740,13 @@ export class DOMExtractor {
 
     if (video.poster && ExtractionValidation.isValidUrl(video.poster)) {
       await this.captureImageSafe(video.poster);
-      const key = this.hashString(video.poster);
+      const assetId = this.hashString(video.poster); // hashString already includes "img_" prefix
       // ASSET COMPLETENESS FIX: Register video for Tier B raster fallback
-      this.registerImageElement(key, video);
+      this.registerImageElement(assetId, video);
       node.fills = [
         {
           type: "IMAGE",
-          imageHash: key,
+          imageHash: assetId,
           scaleMode: "FILL",
           visible: true,
           url: video.poster,
@@ -9159,7 +9755,7 @@ export class DOMExtractor {
     } else {
       // ASSET COMPLETENESS FIX: If no poster, mark for rasterization fallback
       console.log(
-        `ℹ️ [VIDEO] No poster for video, marking for rasterization fallback.`
+        `ℹ️ [VIDEO] No poster for video, marking for rasterization fallback.`,
       );
       node.rasterize = { reason: "VIDEO_POSTER_MISSING" };
       this.registerImageElement(node.id, video);
@@ -9213,7 +9809,7 @@ export class DOMExtractor {
           "captureSVGSafe",
           `Invalid URL: ${url}`,
           undefined,
-          "warning"
+          "warning",
         );
         return;
       }
@@ -9227,17 +9823,9 @@ export class DOMExtractor {
       let svgContent = "";
 
       try {
-        const response: any = await new Promise((resolve) => {
-          chrome.runtime.sendMessage(
-            { type: "FETCH_ASSET", url },
-            (response) => {
-              if (chrome.runtime.lastError) {
-                resolve({ ok: false, error: chrome.runtime.lastError.message });
-              } else {
-                resolve(response);
-              }
-            }
-          );
+        const response: any = await this.sendMessageToBackground({
+          type: "FETCH_ASSET",
+          url,
         });
 
         if (!response || !response.ok) {
@@ -9257,7 +9845,7 @@ export class DOMExtractor {
         throw new Error(
           `SVG background fetch failed: ${
             err instanceof Error ? err.message : String(err)
-          }`
+          }`,
         );
       }
       const hash = this.hashSvgKey(url);
@@ -9271,10 +9859,10 @@ export class DOMExtractor {
         if (svgMatch) {
           const widthMatch = svgMatch[0].match(/width\s*=\s*["']?([^"'\s>]+)/i);
           const heightMatch = svgMatch[0].match(
-            /height\s*=\s*["']?([^"'\s>]+)/i
+            /height\s*=\s*["']?([^"'\s>]+)/i,
           );
           const viewBoxMatch = svgMatch[0].match(
-            /viewBox\s*=\s*["']?([^"'>]+)/i
+            /viewBox\s*=\s*["']?([^"'>]+)/i,
           );
 
           if (widthMatch && heightMatch) {
@@ -9309,14 +9897,14 @@ export class DOMExtractor {
         "captureSVGSafe",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "warning"
+        "warning",
       );
     }
   }
 
   private async captureImageSafe(
     url: string,
-    element?: HTMLImageElement
+    element?: Element,
   ): Promise<void> {
     try {
       if (!ExtractionValidation.isValidUrl(url)) {
@@ -9324,7 +9912,7 @@ export class DOMExtractor {
           "captureImageSafe",
           `Invalid URL: ${url}`,
           element,
-          "warning"
+          "warning",
         );
         return;
       }
@@ -9345,13 +9933,13 @@ export class DOMExtractor {
           dataUriMimeType = dataUriResult.mimeType || null;
           processedLocally = true;
           console.log(
-            `✅ [DATA_URI] Processed locally: ${url.substring(0, 50)}...`
+            `✅ [DATA_URI] Processed locally: ${url.substring(0, 50)}...`,
           );
         } else {
           // CRITICAL FIX: Don't return early! Still register the asset with the data URI
           // so the plugin can attempt to process it or use fallback
           console.warn(
-            `⚠️ [DATA_URI] Local processing failed: ${dataUriResult.error} - registering URL anyway`
+            `⚠️ [DATA_URI] Local processing failed: ${dataUriResult.error} - registering URL anyway`,
           );
           absoluteUrl = url; // Keep the data URI as-is
           dataUriMimeType = "image/png"; // Default fallback
@@ -9360,21 +9948,48 @@ export class DOMExtractor {
         absoluteUrl = new URL(url, window.location.href).href;
       }
 
-      if (!this.assets.images.has(url)) {
-        let width = 0;
-        let height = 0;
+      // Calculate rendered dimensions
+      let renderedWidth = 0;
+      let renderedHeight = 0;
+      let naturalWidth = 0;
+      let naturalHeight = 0;
 
-        if (element && element instanceof HTMLImageElement) {
-          width = ExtractionValidation.safeParseFloat(
+      if (element) {
+        const rect = element.getBoundingClientRect();
+        renderedWidth = Math.round(rect.width);
+        renderedHeight = Math.round(rect.height);
+
+        if (element instanceof HTMLImageElement) {
+          naturalWidth = ExtractionValidation.safeParseFloat(
             element.naturalWidth || element.width,
-            0
+            0,
           );
-          height = ExtractionValidation.safeParseFloat(
+          naturalHeight = ExtractionValidation.safeParseFloat(
             element.naturalHeight || element.height,
-            0
+            0,
           );
         }
+      }
 
+      const existingAsset = this.assets.images.get(url);
+
+      if (existingAsset) {
+        // Update existing asset with max dimensions
+        existingAsset.maxRenderedWidth = Math.max(
+          existingAsset.maxRenderedWidth || 0,
+          renderedWidth,
+        );
+        existingAsset.maxRenderedHeight = Math.max(
+          existingAsset.maxRenderedHeight || 0,
+          renderedHeight,
+        );
+
+        // If we didn't have natural dimensions before but have them now, update them
+        if (!existingAsset.width && naturalWidth)
+          existingAsset.width = naturalWidth;
+        if (!existingAsset.height && naturalHeight)
+          existingAsset.height = naturalHeight;
+      } else {
         this.assets.images.set(url, {
           originalUrl: url,
           absoluteUrl,
@@ -9383,8 +9998,10 @@ export class DOMExtractor {
           mimeType: isDataUri
             ? dataUriMimeType || "application/octet-stream"
             : this.getMimeTypeSafe(url) || "application/octet-stream",
-          width: width,
-          height: height,
+          width: naturalWidth,
+          height: naturalHeight,
+          maxRenderedWidth: renderedWidth,
+          maxRenderedHeight: renderedHeight,
         });
 
         // ASSET COMPLETENESS FIX: Register element for Tier B raster fallback
@@ -9396,7 +10013,7 @@ export class DOMExtractor {
         "captureImageSafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "warning"
+        "warning",
       );
     }
   }
@@ -9407,8 +10024,8 @@ export class DOMExtractor {
     this.postProgress("Processing images...", 55);
 
     const imageUrls = Array.from(this.assets.images.keys());
-    const BATCH_SIZE = 5;
-    const MAX_RETRIES = 3;
+    const BATCH_SIZE = DOMExtractor.IMAGE_PROCESS_BATCH_SIZE;
+    const MAX_RETRIES = DOMExtractor.IMAGE_PROCESS_MAX_RETRIES;
     const failedImages: Array<{ url: string; reason: string }> = [];
 
     // PIXEL-PERFECT FIDELITY: Embed image bytes for deterministic imports.
@@ -9416,25 +10033,36 @@ export class DOMExtractor {
     // If size is a concern, use a separate blob store with content-addressed references.
     // MEMORY OPTIMIZATION: Re-enabled eager base64 embedding for fidelity.
     // The plugin will use these bytes directly.
-    const EMBED_IMAGE_BASE64 = true;
-    const STRICT_MODE = false; // Allow partial capture if some images fail (plugin will try proxy fallback)
+    const EMBED_IMAGE_BASE64 = true; // RE-ENABLED: Chunking is now supported, so we can embed data for fidelity
+    const STRICT_MODE = false; // FIDELITY FIX: Disabled strict mode to prevent blocking capture on individual image failures
 
     if (!EMBED_IMAGE_BASE64) {
       // Ensure URL is set for all assets so plugin can fetch later.
+      console.log(
+        `🖼️ [IMAGE PROCESSING] URL-only mode enabled (EMBED_IMAGE_BASE64=false). Ensuring URLs are populated...`,
+      );
+
       for (const url of imageUrls) {
         const asset = this.assets.images.get(url);
-        if (asset && !asset.url) {
-          asset.url = asset.absoluteUrl || url;
+        if (asset) {
+          // CRITICAL FIX: Ensure all URL fields are populated for robust fallback
+          const finalUrl = asset.absoluteUrl || url;
+          if (!asset.url) asset.url = finalUrl;
+          if (!asset.originalUrl) asset.originalUrl = finalUrl;
+          if (!asset.absoluteUrl) asset.absoluteUrl = finalUrl;
+
+          // Debug log for verification
+          // console.log(`  🔗 Asset ${url.substring(0, 30)}... -> ${finalUrl.substring(0, 30)}...`);
         }
       }
       console.log(
-        `🖼️ [IMAGE PROCESSING] Skipping base64 embedding (URL-only mode). Images tracked: ${imageUrls.length}`
+        `🖼️ [IMAGE PROCESSING] Skipping base64 embedding (URL-only mode). Images tracked: ${imageUrls.length}`,
       );
       return { failed: [] };
     }
 
     console.log(
-      `🖼️ [IMAGE PROCESSING] Processing ${imageUrls.length} images in batches of ${BATCH_SIZE} with ${MAX_RETRIES} retries`
+      `🖼️ [IMAGE PROCESSING] Processing ${imageUrls.length} images in batches of ${BATCH_SIZE} with ${MAX_RETRIES} retries`,
     );
 
     const total = imageUrls.length;
@@ -9452,6 +10080,8 @@ export class DOMExtractor {
             let attempts = 0;
             let success = false;
 
+            let sourceUrl = ""; // Declare outside try block so it's available in catch
+
             while (attempts < MAX_RETRIES && !success) {
               attempts++;
               try {
@@ -9459,24 +10089,38 @@ export class DOMExtractor {
                   console.log(
                     `🔄 [IMAGE PROCESSING] Retry ${attempts}/${MAX_RETRIES} for: ${url.substring(
                       0,
-                      80
-                    )}...`
+                      80,
+                    )}...`,
                   );
                   // Exponential backoff: 1s, 2s, 4s
                   await new Promise((r) =>
-                    setTimeout(r, 1000 * Math.pow(2, attempts - 2))
+                    setTimeout(r, 1000 * Math.pow(2, attempts - 2)),
                   );
                 } else {
                   console.log(
                     `🔄 [IMAGE PROCESSING] Converting to base64: ${url.substring(
                       0,
-                      80
-                    )}...`
+                      80,
+                    )}...`,
                   );
                 }
 
-                const sourceUrl = asset.absoluteUrl || asset.url || url;
-                const result = await this.urlToBase64Safe(sourceUrl);
+                sourceUrl = asset.absoluteUrl || asset.url || url;
+
+                // Calculate target dimensions based on maxRendered size
+                const dpr = window.devicePixelRatio || 1;
+                const targetWidth = asset.maxRenderedWidth
+                  ? Math.ceil(asset.maxRenderedWidth * dpr)
+                  : undefined;
+                const targetHeight = asset.maxRenderedHeight
+                  ? Math.ceil(asset.maxRenderedHeight * dpr)
+                  : undefined;
+
+                const result = await this.urlToBase64Safe(
+                  sourceUrl,
+                  targetWidth,
+                  targetHeight,
+                );
                 if (result.base64 && result.base64.length > 0) {
                   asset.base64 = result.base64;
                   asset.width = result.width || asset.width;
@@ -9490,8 +10134,8 @@ export class DOMExtractor {
                   console.log(
                     `✅ [IMAGE PROCESSING] Successfully converted: ${url.substring(
                       0,
-                      80
-                    )}... (${(result.base64.length / 1024).toFixed(1)}KB)`
+                      80,
+                    )}... (${(result.base64.length / 1024).toFixed(1)}KB)`,
                   );
                   success = true;
                 } else {
@@ -9505,14 +10149,17 @@ export class DOMExtractor {
                       url: asset.absoluteUrl || url,
                       reason: errorMsg,
                     });
-                    console.warn(
-                      `⚠️ [IMAGE PROCESSING] Failed to convert after ${MAX_RETRIES} attempts: ${url.substring(
-                        0,
-                        80
-                      )}...`
-                    );
-                    // CRITICAL: Even if base64 conversion fails, ensure URL is stored for plugin fallback
-                    asset.url = asset.absoluteUrl || asset.url || url;
+                    // CRITICAL FIX: Ensure URL is ALWAYS set for CORS-blocked images
+                    // This is not fallback logic - URL is the PRIMARY payload for CORS images
+                    const finalUrl =
+                      sourceUrl || asset.absoluteUrl || asset.url || url;
+                    if (!finalUrl || finalUrl.length === 0) {
+                      console.error(
+                        `[IMAGE PROCESSING] CRITICAL: No URL available for asset at all! sourceUrl=${sourceUrl}, asset.absoluteUrl=${asset.absoluteUrl}, asset.url=${asset.url}, urlKey=${url}`,
+                      );
+                    }
+                    asset.url = finalUrl;
+                    asset.absoluteUrl = finalUrl;
                   }
                 }
               } catch (error) {
@@ -9528,42 +10175,50 @@ export class DOMExtractor {
                   console.error(
                     `❌ [IMAGE PROCESSING] Error converting after ${MAX_RETRIES} attempts: ${url.substring(
                       0,
-                      80
+                      80,
                     )}...`,
-                    error
+                    error,
                   );
-                  // CRITICAL: Ensure URL is stored
-                  asset.url = asset.absoluteUrl || asset.url || url;
+                  // CRITICAL FIX: Ensure URL is ALWAYS set for on-error case too
+                  const finalUrl =
+                    sourceUrl || asset.absoluteUrl || asset.url || url;
+                  asset.url = finalUrl;
+                  asset.absoluteUrl = finalUrl;
                 }
               }
             }
 
-            // Always ensure URL is set if base64 failed (redundant safety)
-            if (!asset.base64) {
-              asset.url = asset.absoluteUrl || asset.url || url;
+            // CORE FIX: Verify URL is set - this is not defensive, it's verifying the contract
+            if (!asset.url || asset.url.length === 0) {
+              console.error(
+                `❌ [IMAGE PROCESSING] CRITICAL: Asset has empty URL after processing! This will cause validation failure.`,
+              );
+              // Force set from any available source
+              asset.url = asset.absoluteUrl || url || "unknown://image";
+              asset.absoluteUrl = asset.url;
             }
           } else if (asset && asset.error) {
             console.warn(
               `⚠️ [IMAGE PROCESSING] Skipping (has error): ${url.substring(
                 0,
-                80
-              )}... - ${asset.error}`
+                80,
+              )}... - ${asset.error}`,
             );
           } else if (asset && asset.base64) {
             console.log(
               `ℹ️ [IMAGE PROCESSING] Already has base64: ${url.substring(
                 0,
-                80
-              )}...`
+                80,
+              )}...`,
             );
           }
-        })
+        }),
       );
 
       const progress = 60 + Math.floor((i / imageUrls.length) * 30);
       this.postProgress(
         `Processing images (${i + batch.length}/${imageUrls.length})...`,
-        progress
+        progress,
       );
     }
 
@@ -9574,7 +10229,7 @@ export class DOMExtractor {
     const withUrl = allImages.filter((a) => a.url && !a.base64).length;
     const totalBytes = allImages.reduce(
       (sum, a) => sum + (a.base64?.length || 0),
-      0
+      0,
     );
 
     // Count failure reasons
@@ -9601,17 +10256,18 @@ export class DOMExtractor {
     console.log(`   Failed to Embed:          ${failed}`);
     console.log(`   URL-Only (Fallback):      ${withUrl}`);
     console.log(
-      `   Total Embedded Size:      ${(totalBytes / 1024 / 1024).toFixed(2)} MB`
+      `   Total Embedded Size:      ${(totalBytes / 1024 / 1024).toFixed(2)} MB`,
     );
     console.log(
       `   Avg Size per Image:       ${
         successful > 0 ? (totalBytes / successful / 1024).toFixed(1) : 0
-      } KB`
+      } KB`,
     );
 
     if (failureReasons.size > 0) {
       console.log("   Failure Breakdown:");
-      for (const [reason, count] of failureReasons) {
+      // TS Fix: Convert Map entries to array for iteration
+      for (const [reason, count] of Array.from(failureReasons)) {
         console.log(`      ${reason}: ${count}`);
       }
     }
@@ -9638,7 +10294,80 @@ export class DOMExtractor {
     return { failed: failedImages };
   }
 
-  private async urlToBase64Safe(url: string): Promise<{
+  private async resizeBase64(
+    base64: string,
+    mimeType: string = "image/png",
+    maxWidth?: number,
+    maxHeight?: number,
+  ): Promise<{
+    base64: string;
+    width: number;
+    height: number;
+    mimeType: string;
+  }> {
+    if (!maxWidth && !maxHeight) {
+      return { base64, width: 0, height: 0, mimeType }; // Width/height 0 means "unknown/original"
+    }
+
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        let width = img.width;
+        let height = img.height;
+
+        // Calculate new dimensions ensuring we don't upscale
+        if (maxWidth && width > maxWidth) {
+          height = Math.round(height * (maxWidth / width));
+          width = maxWidth;
+        }
+        if (maxHeight && height > maxHeight) {
+          width = Math.round(width * (maxHeight / height));
+          height = maxHeight;
+        }
+
+        // If no resizing needed, return original
+        if (width >= img.width && height >= img.height) {
+          resolve({ base64, width: img.width, height: img.height, mimeType });
+          return;
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve({ base64, width: img.width, height: img.height, mimeType });
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0, width, height);
+        // Use quality 0.9 to save some space without visible artifacting
+        const resized = canvas.toDataURL(mimeType, 0.9);
+        const data = resized.split(",")[1];
+
+        console.log(
+          `📉 [IMAGE RESIZE] Resized ${img.width}x${img.height} -> ${width}x${height} (${(base64.length / 1024).toFixed(0)}KB -> ${(data.length / 1024).toFixed(0)}KB)`,
+        );
+
+        resolve({
+          base64: data,
+          width,
+          height,
+          mimeType,
+        });
+      };
+      img.onerror = () => resolve({ base64, width: 0, height: 0, mimeType });
+      img.src = base64.startsWith("data:")
+        ? base64
+        : `data:${mimeType};base64,${base64}`;
+    });
+  }
+
+  private async urlToBase64Safe(
+    url: string,
+    maxWidth?: number,
+    maxHeight?: number,
+  ): Promise<{
     base64: string;
     width: number;
     height: number;
@@ -9671,7 +10400,7 @@ export class DOMExtractor {
           // Fallback to normal loading if parsing fails
           console.warn(
             "Failed to parse data URI locally, falling back to proxy:",
-            e
+            e,
           );
         }
       }
@@ -9681,6 +10410,15 @@ export class DOMExtractor {
       // than in-page canvas extraction, especially for cross-origin images.
       const viaBackground = await this.fetchImageViaBackgroundSafe(url);
       if (viaBackground.base64 && viaBackground.base64.length > 0) {
+        // Resize if needed
+        if (maxWidth || maxHeight) {
+          return this.resizeBase64(
+            viaBackground.base64,
+            viaBackground.mimeType,
+            maxWidth,
+            maxHeight,
+          );
+        }
         return {
           base64: viaBackground.base64,
           width: viaBackground.width,
@@ -9694,8 +10432,8 @@ export class DOMExtractor {
       console.log(
         `🔄 [IMAGE] Background fetch failed, trying canvas fallback for: ${url.substring(
           0,
-          80
-        )}...`
+          80,
+        )}...`,
       );
       return await new Promise((resolve) => {
         const img = new Image();
@@ -9703,7 +10441,7 @@ export class DOMExtractor {
 
         const timeout = setTimeout(() => {
           console.warn(
-            `⚠️ [IMAGE] Canvas fallback timeout for: ${url.substring(0, 80)}...`
+            `⚠️ [IMAGE] Canvas fallback timeout for: ${url.substring(0, 80)}...`,
           );
           resolve({ base64: "", width: 0, height: 0 });
         }, 10000);
@@ -9711,32 +10449,45 @@ export class DOMExtractor {
         img.onload = () => {
           clearTimeout(timeout);
           try {
+            let width = img.width;
+            let height = img.height;
+
+            // Calculate new dimensions ensuring we don't upscale
+            if (maxWidth && width > maxWidth) {
+              height = Math.round(height * (maxWidth / width));
+              width = maxWidth;
+            }
+            if (maxHeight && height > maxHeight) {
+              width = Math.round(width * (maxHeight / height));
+              height = maxHeight;
+            }
+
             const canvas = document.createElement("canvas");
-            canvas.width = img.width;
-            canvas.height = img.height;
+            canvas.width = width;
+            canvas.height = height;
             const ctx = canvas.getContext("2d");
 
             if (!ctx) {
               console.warn(
                 `⚠️ [IMAGE] Could not get canvas context for: ${url.substring(
                   0,
-                  80
-                )}...`
+                  80,
+                )}...`,
               );
               resolve({ base64: "", width: 0, height: 0 });
               return;
             }
 
             try {
-              ctx.drawImage(img, 0, 0);
+              ctx.drawImage(img, 0, 0, width, height);
               const base64 = canvas.toDataURL("image/png");
               const data = base64.split(",")[1];
               if (data && data.length > 0) {
                 console.log(
                   `✅ [IMAGE] Canvas fallback succeeded for: ${url.substring(
                     0,
-                    80
-                  )}... (${(data.length / 1024).toFixed(1)}KB)`
+                    80,
+                  )}... (${(data.length / 1024).toFixed(1)}KB) [${width}x${height}]`,
                 );
                 resolve({
                   base64: data,
@@ -9748,8 +10499,8 @@ export class DOMExtractor {
                 console.warn(
                   `⚠️ [IMAGE] Canvas toDataURL returned empty for: ${url.substring(
                     0,
-                    80
-                  )}...`
+                    80,
+                  )}...`,
                 );
                 resolve({
                   base64: "",
@@ -9766,8 +10517,8 @@ export class DOMExtractor {
               console.warn(
                 `⚠️ [IMAGE] Canvas drawImage failed (likely CORS): ${errorMsg} for ${url.substring(
                   0,
-                  80
-                )}...`
+                  80,
+                )}...`,
               );
               resolve({ base64: "", width: 0, height: 0, mimeType: undefined });
             }
@@ -9779,8 +10530,8 @@ export class DOMExtractor {
             console.warn(
               `⚠️ [IMAGE] Canvas creation failed: ${errorMsg} for ${url.substring(
                 0,
-                80
-              )}...`
+                80,
+              )}...`,
             );
             resolve({ base64: "", width: 0, height: 0, mimeType: undefined });
           }
@@ -9788,11 +10539,9 @@ export class DOMExtractor {
 
         img.onerror = (error) => {
           clearTimeout(timeout);
-          console.warn(
-            `⚠️ [IMAGE] Image load failed for: ${url.substring(
-              0,
-              80
-            )}... (likely CORS or invalid URL)`
+          // Suppress verbose CORS warnings - expected for cross-origin protected assets
+          console.debug(
+            `[IMAGE] Load failed (CORS/invalid): ${url.substring(0, 60)}...`,
           );
           resolve({ base64: "", width: 0, height: 0, mimeType: undefined });
         };
@@ -9804,14 +10553,14 @@ export class DOMExtractor {
       console.error(
         `❌ [IMAGE] urlToBase64Safe exception: ${errorMsg} for ${url.substring(
           0,
-          80
-        )}...`
+          80,
+        )}...`,
       );
       this.errorTracker.recordError(
         "urlToBase64Safe",
         errorMsg,
         undefined,
-        "warning"
+        "warning",
       );
       return { base64: "", width: 0, height: 0, mimeType: undefined };
     }
@@ -9828,9 +10577,18 @@ export class DOMExtractor {
       return { base64: "", width: 0, height: 0, mimeType: undefined };
     }
 
+    // BLOB URL FIX: Background script cannot access blob: URLs created in page context.
+    // Return empty immediately to trigger the canvas/CDP fallback in processImage().
+    if (url.startsWith("blob:")) {
+      console.log(
+        `ℹ️ [IMAGE] Skipping background fetch for blob URL (using in-page fallback): ${url}`,
+      );
+      return { base64: "", width: 0, height: 0, mimeType: undefined };
+    }
+
     // 1. Concurrency Limiter
     // If we have too many active fetches, wait in queue
-    if (this.activeImageFetches >= 8) {
+    if (this.activeImageFetches >= DOMExtractor.MAX_ACTIVE_IMAGE_FETCHES) {
       await new Promise<void>((resolve) => {
         this.imageFetchQueue.push(resolve);
       });
@@ -9841,15 +10599,9 @@ export class DOMExtractor {
     try {
       // 2. Uses the standard FETCH_ASSET message handled by background.ts
       // This bypasses CORS by running in the background context with <all_urls> permission
-      const response: any = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: "FETCH_ASSET", url }, (response) => {
-          if (chrome.runtime.lastError) {
-            // If extension context invalidated, this will fire
-            resolve({ ok: false, error: chrome.runtime.lastError.message });
-          } else {
-            resolve(response);
-          }
-        });
+      const response: any = await this.sendMessageToBackground({
+        type: "FETCH_ASSET",
+        url,
       });
 
       if (response && response.ok && response.data) {
@@ -9921,13 +10673,13 @@ export class DOMExtractor {
         Math.max(
           document.documentElement.scrollHeight,
           document.body.scrollHeight,
-          window.innerHeight
+          window.innerHeight,
         ),
-        900
+        900,
       ),
       devicePixelRatio: ExtractionValidation.safeParseFloat(
         window.devicePixelRatio || 1,
-        1
+        1,
       ),
     };
   }
@@ -10013,7 +10765,7 @@ export class DOMExtractor {
       console.log(
         `🌓 Color scheme detected: ${
           isDarkMode ? "DARK" : "LIGHT"
-        } mode (luminance: ${rootBackgroundLuminance?.toFixed(2) ?? "N/A"})`
+        } mode (luminance: ${rootBackgroundLuminance?.toFixed(2) ?? "N/A"})`,
       );
 
       return {
@@ -10083,7 +10835,7 @@ export class DOMExtractor {
               "collectFontFacesSafe",
               "Could not access stylesheet rules",
               undefined,
-              "warning"
+              "warning",
             );
             continue;
           }
@@ -10103,7 +10855,7 @@ export class DOMExtractor {
               "collectFontFacesSafe",
               error instanceof Error ? error.message : "Unknown error",
               undefined,
-              "warning"
+              "warning",
             );
           }
           continue;
@@ -10127,12 +10879,12 @@ export class DOMExtractor {
             weight === "bold"
               ? 700
               : weight === "normal"
-              ? 400
-              : ExtractionValidation.clampNumber(
-                  parseInt(String(weight), 10) || 400,
-                  100,
-                  900
-                );
+                ? 400
+                : ExtractionValidation.clampNumber(
+                    parseInt(String(weight), 10) || 400,
+                    100,
+                    900,
+                  );
 
           // Track font usage even if we can't safely record a URL.
           if (!this.assets.fonts.has(family)) {
@@ -10146,7 +10898,7 @@ export class DOMExtractor {
           const rawUrl = urls.find(
             (u) =>
               ExtractionValidation.isValidUrl(u) &&
-              !u.trim().toLowerCase().startsWith("data:")
+              !u.trim().toLowerCase().startsWith("data:"),
           );
           if (!rawUrl) {
             // If the only source is a data: URL, skip recording it (it can be huge).
@@ -10180,7 +10932,7 @@ export class DOMExtractor {
             "collectFontFacesSafe",
             error instanceof Error ? error.message : "Unknown error",
             undefined,
-            "warning"
+            "warning",
           );
         }
       }
@@ -10189,7 +10941,7 @@ export class DOMExtractor {
         "collectFontFacesSafe",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "error"
+        "error",
       );
     }
   }
@@ -10289,7 +11041,7 @@ export class DOMExtractor {
     console.log(
       `🚀 [PERFORMANCE] Sanitization complete: ${nodesProcessed} nodes, ${propertiesRemoved} properties removed in ${
         Date.now() - startTime
-      }ms`
+      }ms`,
     );
   }
 
@@ -10414,6 +11166,7 @@ export class DOMExtractor {
             console.warn("🧹 [SANITIZE] Removed non-cloneable DOM ref", {
               path: path ? `${path}.${key}` : key,
               tag,
+              isAssetsImages: path && path.includes("assets.images"),
             });
             logs++;
           }
@@ -10436,22 +11189,49 @@ export class DOMExtractor {
       // Finalize images
       const imagesObj: Record<string, any> = {};
       this.assets.images.forEach((data, url) => {
-        const key = this.hashString(url);
+        const assetId = this.hashString(url); // hashString already includes "img_" prefix
         // CRITICAL: Always store URL for plugin fallback, even if base64 conversion failed
         const imageUrl = data.url || data.absoluteUrl || url;
+
+        // CORE FIX: Verify imageUrl is non-empty before storing
+        if (!imageUrl || imageUrl.length === 0) {
+          console.error(
+            `❌ [FINALIZE CRITICAL] Image asset has NO URL! assetId=${assetId}, data.url=${data.url}, data.absoluteUrl=${data.absoluteUrl}, mapKey=${url}`,
+          );
+          // Force fallback to map key as last resort
+          const finalUrl = url || "unknown://missing-url";
+          console.error(
+            `❌ [FINALIZE CRITICAL] Using fallback URL: ${finalUrl}`,
+          );
+          imagesObj[assetId] = {
+            id: assetId,
+            url: finalUrl,
+            originalUrl: data.originalUrl || url,
+            absoluteUrl: data.absoluteUrl || finalUrl,
+            hash: data.hash,
+            contentType: data.mimeType,
+            mimeType: data.mimeType,
+            width: data.width ?? 0,
+            height: data.height ?? 0,
+            data: data.base64 ?? null,
+            base64: data.base64 ?? null,
+            error: data.error || "MISSING_URL",
+          };
+          return;
+        }
 
         // P0 FIX: Explicitly ensure URL fallback is ready
         if (imageUrl && !data.base64) {
           console.log(
-            `📸 [ASSET FALLBACK] Asset ${key.substring(
+            `📸 [ASSET FALLBACK] Asset ${assetId.substring(
               0,
-              10
-            )}... will use URL: ${imageUrl.substring(0, 50)}...`
+              15,
+            )}... will use URL: ${imageUrl.substring(0, 50)}...`,
           );
         }
 
-        imagesObj[key] = {
-          id: key,
+        imagesObj[assetId] = {
+          id: assetId,
           url: imageUrl, // Always include URL for plugin fallback
           originalUrl: data.originalUrl || url,
           absoluteUrl: data.absoluteUrl || imageUrl,
@@ -10469,10 +11249,10 @@ export class DOMExtractor {
         // Log if base64 is missing but URL is available (for debugging)
         if (!data.base64 && imageUrl && !data.error) {
           console.log(
-            `⚠️ [FINALIZE] Image ${key.substring(
+            `⚠️ [FINALIZE] Image ${assetId.substring(
               0,
-              20
-            )}... has URL but no base64: ${imageUrl.substring(0, 80)}...`
+              25,
+            )}... has URL but no base64: ${imageUrl.substring(0, 80)}...`,
           );
         }
       });
@@ -10482,7 +11262,7 @@ export class DOMExtractor {
       console.log(
         `📊 [ASSET VALIDATION] Finalized ${
           Object.keys(imagesObj).length
-        } image assets`
+        } image assets`,
       );
 
       if (Object.keys(imagesObj).length > 0) {
@@ -10496,26 +11276,34 @@ export class DOMExtractor {
           console.log(
             `     - url: ${
               asset.url ? asset.url.substring(0, 80) + "..." : "NONE"
-            }`
+            }`,
           );
           console.log(`     - dimensions: ${asset.width}x${asset.height}`);
         });
+
+        // DEBUG: Dump ALL keys if count is small (< 20)
+        if (Object.keys(imagesObj).length < 20) {
+          console.log(
+            "🔑 [DEBUG] All generated asset keys:",
+            Object.keys(imagesObj),
+          );
+        }
       }
 
       // CRITICAL: Warn if ALL assets have no base64 (URL-only mode)
       const assetsWithBase64 = Object.values(imagesObj).filter(
-        (a: any) => a.data || a.base64
+        (a: any) => a.data || a.base64,
       ).length;
       const assetsWithUrl = Object.values(imagesObj).filter(
-        (a: any) => a.url
+        (a: any) => a.url,
       ).length;
 
       if (assetsWithBase64 === 0 && assetsWithUrl > 0) {
         console.warn(
-          `⚠️ [ASSET VALIDATION] ALL ${assetsWithUrl} images are URL-only (no embedded base64)`
+          `⚠️ [ASSET VALIDATION] ALL ${assetsWithUrl} images are URL-only (no embedded base64)`,
         );
         console.warn(
-          `   Plugin MUST fetch via proxy. Ensure handoff server is running at http://localhost:4411`
+          `   Plugin MUST fetch via proxy. Ensure handoff server is running at http://localhost:4411`,
         );
       }
 
@@ -10537,13 +11325,13 @@ export class DOMExtractor {
 
       // Log summary
       const withBase64 = Object.values(imagesObj).filter(
-        (img: any) => img.base64
+        (img: any) => img.base64,
       ).length;
       const withUrlOnly = Object.values(imagesObj).filter(
-        (img: any) => !img.base64 && img.url
+        (img: any) => !img.base64 && img.url,
       ).length;
       console.log(
-        `📊 [FINALIZE] Images: ${withBase64} with base64, ${withUrlOnly} with URL only (for plugin fallback)`
+        `📊 [FINALIZE] Images: ${withBase64} with base64, ${withUrlOnly} with URL only (for plugin fallback)`,
       );
 
       // Finalize fonts
@@ -10564,7 +11352,7 @@ export class DOMExtractor {
           family,
           weights: Array.from(weights),
           source: familiesWithFontFaces.has(family) ? "custom" : "system",
-        })
+        }),
       );
 
       // Design Tokens for Figma style generation
@@ -10574,19 +11362,19 @@ export class DOMExtractor {
           Array.from(designTokens.colors.entries())
             .sort((a, b) => b[1].count - a[1].count)
             .slice(0, 20)
-            .map(([name, data]) => [name, data.value])
+            .map(([name, data]) => [name, data.value]),
         ),
         spacing: Object.fromEntries(
           Array.from(designTokens.spacing.entries())
             .sort((a, b) => b[1].count - a[1].count)
             .slice(0, 10)
-            .map(([name, data]) => [name, data.value])
+            .map(([name, data]) => [name, data.value]),
         ),
         typography: Object.fromEntries(
           Array.from(designTokens.typography.entries())
             .sort((a, b) => b[1].count - a[1].count)
             .slice(0, 10)
-            .map(([name, data]) => [name, data.value])
+            .map(([name, data]) => [name, data.value]),
         ),
         textStyles: {},
         effects: {},
@@ -10596,7 +11384,7 @@ export class DOMExtractor {
         "finalizeAssets",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "error"
+        "error",
       );
     }
   }
@@ -10641,8 +11429,8 @@ export class DOMExtractor {
       // Look for semantic class names (header, footer, nav, main, etc.)
       const semanticClasses = classes.filter((cls) =>
         /^(header|footer|nav|main|sidebar|content|container|wrapper|section|article|card|button|menu|modal|dialog|form|input|search|logo|icon|image|video|player|comment|feed|list|item|grid|row|column|cell)$/i.test(
-          cls
-        )
+          cls,
+        ),
       );
       if (semanticClasses.length > 0) {
         const className = semanticClasses[0]
@@ -10659,7 +11447,7 @@ export class DOMExtractor {
         const elementName = bemClass.split("__")[1]?.split("--")[0];
         if (elementName) {
           return `${this.sanitizeIdToName(blockName)} ${this.sanitizeIdToName(
-            elementName
+            elementName,
           )}`;
         }
         return this.sanitizeIdToName(blockName);
@@ -10724,7 +11512,7 @@ export class DOMExtractor {
     }
 
     const hasVideo = element.querySelector(
-      "video, iframe[src*='site'], iframe[src*='vimeo']"
+      "video, iframe[src*='site'], iframe[src*='vimeo']",
     );
     if (hasVideo) {
       return "Video Container";
@@ -10796,7 +11584,7 @@ export class DOMExtractor {
 
   private returnPartialSchema(reason: string): WebToFigmaSchema {
     console.warn(
-      `⚠️ [PARTIAL_SCHEMA] returning partial schema due to: ${reason}`
+      `⚠️ [PARTIAL_SCHEMA] returning partial schema due to: ${reason}`,
     );
 
     // 1x1 transparent PNG placeholder to satisfy preflight checks if screenshot is missing
@@ -10844,7 +11632,7 @@ export class DOMExtractor {
       // This happens when timeout occurs before DOM extraction is complete
       if (!this.schemaInProgress.root) {
         console.warn(
-          `⚠️ [PARTIAL_SCHEMA] Root was null, creating fallback root node`
+          `⚠️ [PARTIAL_SCHEMA] Root was null, creating fallback root node`,
         );
         this.schemaInProgress.root = this.createFallbackRootNode(reason) as any;
       }
@@ -10956,20 +11744,47 @@ export class DOMExtractor {
   // PROGRESS REPORTING
   // ============================================================================
 
-  private postProgress(message: string, percent: number): void {
+  private postProgress(
+    message: string,
+    percent: number,
+    metrics?: {
+      nodesProcessed?: number;
+      nodesQueued?: number;
+      phase?: string;
+    },
+  ): void {
     try {
+      // MONOTONIC PROGRESS FIX: Only update if progress is higher than current
+      // This prevents the progress bar from jumping backwards
+      const clampedPercent = ExtractionValidation.clampNumber(percent, 0, 100);
+
+      // Only update if the new percentage is higher (or we're at 0 starting fresh)
+      if (clampedPercent > this.performanceTracker.currentProgress) {
+        this.performanceTracker.currentProgress = clampedPercent;
+      }
+
+      // Always use the highest progress value seen so far
       window.postMessage(
         {
           type: "EXTRACTION_PROGRESS",
           message,
-          percent: ExtractionValidation.clampNumber(percent, 0, 100),
+          percent: this.performanceTracker.currentProgress,
+          phase:
+            metrics?.phase || this.performanceTracker.currentPhase || "unknown",
+          ...metrics,
         },
-        "*"
+        "*",
       );
     } catch (error) {
-      // Silently fail - progress reporting is non-critical
+      // Log error but don't throw - progress reporting is non-critical
+      console.warn("[postProgress] Failed to emit progress:", error);
     }
   }
+
+  /**
+   * Emit early layout preview for skeleton animation in popup
+   * Collects major blocks (containers, media, text) and sends bounds
+   */
 
   // ============================================================================
   // MEDIA QUERIES EXTRACTION
@@ -11020,7 +11835,7 @@ export class DOMExtractor {
         "extractMediaQueriesSafe",
         error instanceof Error ? error.message : "Unknown error",
         undefined,
-        "warning"
+        "warning",
       );
     }
 
@@ -11038,7 +11853,7 @@ export class DOMExtractor {
   private async captureResponsiveStylesSafe(
     element: Element,
     node: any,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): Promise<void> {
     try {
       // Determine current breakpoint based on viewport width
@@ -11229,7 +12044,7 @@ export class DOMExtractor {
         "captureResponsiveStylesSafe",
         error instanceof Error ? error.message : "Unknown error",
         element,
-        "warning"
+        "warning",
       );
     }
   }
@@ -11244,7 +12059,7 @@ export class DOMExtractor {
    * CRITICAL FIX: Added timeout and better error handling to prevent breaking extraction
    */
   private async captureButtonHoverStates(
-    schema: WebToFigmaSchema
+    schema: WebToFigmaSchema,
   ): Promise<void> {
     const HOVER_CAPTURE_TIMEOUT = 10000; // 10 seconds max for hover capture
     const startTime = Date.now();
@@ -11270,7 +12085,7 @@ export class DOMExtractor {
           // Check timeout before continuing
           if (Date.now() - startTime > HOVER_CAPTURE_TIMEOUT) {
             console.warn(
-              "⚠️ [HOVER] Timeout reached, stopping button detection"
+              "⚠️ [HOVER] Timeout reached, stopping button detection",
             );
             break;
           }
@@ -11291,7 +12106,7 @@ export class DOMExtractor {
       }
 
       console.log(
-        `🎯 [HOVER] Found ${buttons.length} button-like elements for hover state capture`
+        `🎯 [HOVER] Found ${buttons.length} button-like elements for hover state capture`,
       );
 
       if (buttons.length === 0) {
@@ -11311,7 +12126,7 @@ export class DOMExtractor {
         // Check overall timeout
         if (Date.now() - startTime > HOVER_CAPTURE_TIMEOUT) {
           console.warn(
-            `⚠️ [HOVER] Timeout reached after ${capturedCount} buttons, stopping hover capture`
+            `⚠️ [HOVER] Timeout reached after ${capturedCount} buttons, stopping hover capture`,
           );
           break;
         }
@@ -11323,7 +12138,7 @@ export class DOMExtractor {
           const hoverState = await Promise.race([
             this.captureElementHoverState(button),
             new Promise<null>((resolve) =>
-              setTimeout(() => resolve(null), 500)
+              setTimeout(() => resolve(null), 500),
             ),
           ]);
 
@@ -11342,7 +12157,7 @@ export class DOMExtractor {
         } catch (error) {
           console.warn(
             `⚠️ [HOVER] Failed to capture hover state for button ${i + 1}:`,
-            error
+            error,
           );
           // Continue with next button instead of failing entirely
         }
@@ -11351,12 +12166,12 @@ export class DOMExtractor {
       console.log(
         `✅ [HOVER] Captured hover states for ${capturedCount}/${maxButtons} buttons (time: ${
           Date.now() - startTime
-        }ms)`
+        }ms)`,
       );
     } catch (error) {
       console.warn(
         `⚠️ [HOVER] Error during automatic hover state capture:`,
-        error
+        error,
       );
       // Don't throw - allow extraction to continue
     }
@@ -11369,7 +12184,7 @@ export class DOMExtractor {
   private validateBoxSizingDimensions(
     element: Element,
     node: any,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ): void {
     const boxSizingData = node._boxSizingData;
     if (!boxSizingData) return;
@@ -11394,7 +12209,7 @@ export class DOMExtractor {
           contentDimensions,
           borders,
           paddings,
-        }
+        },
       );
     }
 
@@ -11432,7 +12247,7 @@ export class DOMExtractor {
           visualDimensions,
           borders,
           paddings,
-        }
+        },
       );
     }
 
@@ -11468,7 +12283,7 @@ export class DOMExtractor {
       (tagName === "a" && element.hasAttribute("href")) ||
       (tagName === "input" &&
         ["button", "submit", "reset"].includes(
-          (element as HTMLInputElement).type
+          (element as HTMLInputElement).type,
         ))
     ) {
       return true;
@@ -11540,7 +12355,7 @@ export class DOMExtractor {
 
       // Check if there are meaningful differences
       const hasDifferences = Object.keys(hoverStyles).some(
-        (key) => defaultStyles[key] !== hoverStyles[key]
+        (key) => defaultStyles[key] !== hoverStyles[key],
       );
 
       if (hasDifferences) {
@@ -11610,7 +12425,7 @@ export class DOMExtractor {
         if (nodeClasses.length > 0 && elementClasses.length > 0) {
           // Check if at least one class matches
           const matchingClasses = nodeClasses.filter((cls: string) =>
-            elementClasses.includes(cls)
+            elementClasses.includes(cls),
           );
           if (matchingClasses.length > 0) {
             // Also check position to ensure it's the right element
@@ -11683,11 +12498,12 @@ export class DOMExtractor {
     }
 
     // Use a 64-bit FNV-1a hash to minimize collisions across large pages.
-    let hash = 0xcbf29ce484222325n;
-    const prime = 0x100000001b3n;
+    // TS Fix: Use BigInt constructor instead of literals for lower target compatibility
+    let hash = BigInt("0xcbf29ce484222325");
+    const prime = BigInt("0x100000001b3");
     for (let i = 0; i < str.length; i++) {
       hash ^= BigInt(str.charCodeAt(i));
-      hash = (hash * prime) & 0xffffffffffffffffn;
+      hash = (hash * prime) & BigInt("0xffffffffffffffff");
     }
     return prefix + hash.toString(16).padStart(16, "0");
   }
@@ -11733,7 +12549,7 @@ export class DOMExtractor {
    */
   private extractAbsoluteTransform(
     element: Element,
-    computed: CSSStyleDeclaration
+    computed: CSSStyleDeclaration,
   ):
     | {
         matrix: [number, number, number, number, number, number];
@@ -11774,13 +12590,13 @@ export class DOMExtractor {
       if (values.length === 6) {
         // 2D matrix: [a, b, c, d, e, f]
         console.log(
-          `✅ [TRANSFORM PARSE] Successfully parsed 2D matrix: ${transform}`
+          `✅ [TRANSFORM PARSE] Successfully parsed 2D matrix: ${transform}`,
         );
         return values;
       } else if (values.length === 16) {
         // 3D matrix: extract 2D components [a, b, c, d, e, f] from 4x4 matrix
         console.log(
-          `✅ [TRANSFORM PARSE] Successfully parsed 3D matrix: ${transform}`
+          `✅ [TRANSFORM PARSE] Successfully parsed 3D matrix: ${transform}`,
         );
         return [
           values[0],
@@ -11793,7 +12609,7 @@ export class DOMExtractor {
       } else {
         // FIX 4: Log unexpected matrix value count
         console.warn(
-          `⚠️ [TRANSFORM PARSE] Matrix has unexpected value count (${values.length}): ${transform}`
+          `⚠️ [TRANSFORM PARSE] Matrix has unexpected value count (${values.length}): ${transform}`,
         );
       }
     }
@@ -11802,12 +12618,12 @@ export class DOMExtractor {
     const result = this.composeTransformMatrix(transform);
     if (result) {
       console.log(
-        `✅ [TRANSFORM PARSE] Composed matrix from functions: ${transform}`
+        `✅ [TRANSFORM PARSE] Composed matrix from functions: ${transform}`,
       );
     } else {
       // FIX 4: Log parsing failure to help diagnose the 6 failed nodes
       console.warn(
-        `❌ [TRANSFORM PARSE] Failed to parse transform: ${transform}`
+        `❌ [TRANSFORM PARSE] Failed to parse transform: ${transform}`,
       );
     }
     return result;
@@ -11898,7 +12714,7 @@ export class DOMExtractor {
    */
   private parseTransformOrigin(
     transformOrigin: string,
-    element: Element
+    element: Element,
   ): { x: number; y: number } {
     const parts = transformOrigin.split(" ");
     const rect = element.getBoundingClientRect();
@@ -11948,7 +12764,7 @@ export class DOMExtractor {
    */
   private shouldRasterizeTransform(
     transform: string,
-    element: Element
+    element: Element,
   ): boolean {
     if (!transform || transform === "none") {
       return false;
@@ -11965,7 +12781,7 @@ export class DOMExtractor {
       console.log(
         `🔄 [RASTERIZE] 3D transform detected: ${element.tagName}.${
           element.className || "no-class"
-        }`
+        }`,
       );
       return true;
     }
@@ -11975,7 +12791,7 @@ export class DOMExtractor {
       console.log(
         `🔄 [RASTERIZE] Skew transform detected: ${element.tagName}.${
           element.className || "no-class"
-        }`
+        }`,
       );
       return true;
     }
@@ -11989,7 +12805,7 @@ export class DOMExtractor {
       console.log(
         `🔄 [RASTERIZE] Complex rotation detected: ${element.tagName}.${
           element.className || "no-class"
-        }`
+        }`,
       );
       return true;
     }
@@ -12002,7 +12818,7 @@ export class DOMExtractor {
         console.log(
           `🔄 [RASTERIZE] Perspective ancestor detected: ${element.tagName}.${
             element.className || "no-class"
-          }`
+          }`,
         );
         return true;
       }
@@ -12046,7 +12862,7 @@ export class DOMExtractor {
     const totalTime = Date.now() - this.extractionStartTime;
 
     console.log(
-      "\n🎯 ═══════════════════════════════════════════════════════════"
+      "\n🎯 ═══════════════════════════════════════════════════════════",
     );
     console.log("📊 CAPTURE COMPLETION REPORT");
     console.log("═══════════════════════════════════════════════════════════");
@@ -12056,7 +12872,7 @@ export class DOMExtractor {
     console.log(
       `📏 VIEWPORT: ${window.innerWidth}x${window.innerHeight} (DPR: ${
         window.devicePixelRatio || 1
-      })`
+      })`,
     );
     console.log(`⏱️  TOTAL TIME: ${totalTime}ms`);
 
@@ -12067,15 +12883,15 @@ export class DOMExtractor {
     console.log(`   Max Depth: ${stats.maxDepth} levels`);
     console.log(
       `   Schema Size: ${(JSON.stringify(schema).length / 1024 / 1024).toFixed(
-        2
-      )}MB`
+        2,
+      )}MB`,
     );
 
     // Node Type Breakdown
     console.log("\n🏗️  NODE COMPOSITION:");
     Object.entries(stats.nodesByType).forEach(([type, count]) => {
       const percentage = (((count as number) / stats.totalNodes) * 100).toFixed(
-        1
+        1,
       );
       console.log(`   ${type}: ${count} (${percentage}%)`);
     });
@@ -12086,7 +12902,7 @@ export class DOMExtractor {
       `   Nodes with Transforms: ${stats.transformNodes} (${(
         (stats.transformNodes / stats.totalNodes) *
         100
-      ).toFixed(1)}%)`
+      ).toFixed(1)}%)`,
     );
     console.log(`   Nodes with Local Size: ${stats.localSizeNodes}`);
     console.log(`   Capture Metadata: ${stats.captureMetadataNodes} nodes`);
@@ -12095,10 +12911,10 @@ export class DOMExtractor {
     // Layout & Auto Layout
     console.log("\n📏 LAYOUT ANALYSIS:");
     console.log(
-      `   Auto Layout Applied: ${this.autoLayoutMetrics.autoLayoutAppliedSafe} nodes`
+      `   Auto Layout Applied: ${this.autoLayoutMetrics.autoLayoutAppliedSafe} nodes`,
     );
     console.log(
-      `   Auto Layout Candidates: ${this.autoLayoutMetrics.autoLayoutCandidates} nodes`
+      `   Auto Layout Candidates: ${this.autoLayoutMetrics.autoLayoutCandidates} nodes`,
     );
     console.log(`   Flex Containers: ${stats.flexContainers}`);
     console.log(`   Grid Containers: ${stats.gridContainers}`);
@@ -12120,10 +12936,10 @@ export class DOMExtractor {
     // Performance Metrics
     console.log("\n⚡ PERFORMANCE:");
     console.log(
-      `   Nodes/second: ${Math.round(stats.totalNodes / (totalTime / 1000))}`
+      `   Nodes/second: ${Math.round(stats.totalNodes / (totalTime / 1000))}`,
     );
     console.log(
-      `   Transform Accuracy: ${stats.transformAccuracy.toFixed(1)}%`
+      `   Transform Accuracy: ${stats.transformAccuracy.toFixed(1)}%`,
     );
     console.log(`   Memory Efficiency: ${stats.memoryEfficiency}`);
 
@@ -12132,7 +12948,7 @@ export class DOMExtractor {
     console.log(
       `   Pixel-Perfect Ready: ${
         stats.pixelPerfectReady ? "✅ YES" : "⚠️ PARTIAL"
-      }`
+      }`,
     );
     console.log(`   Layout Fidelity: ${stats.layoutFidelity}%`);
     console.log(`   Transform Coverage: ${stats.transformCoverage}%`);
@@ -12150,10 +12966,10 @@ export class DOMExtractor {
 
     console.log("═══════════════════════════════════════════════════════════");
     console.log(
-      `🎉 CAPTURE COMPLETE: ${stats.totalNodes} nodes processed successfully`
+      `🎉 CAPTURE COMPLETE: ${stats.totalNodes} nodes processed successfully`,
     );
     console.log(
-      "═══════════════════════════════════════════════════════════\n"
+      "═══════════════════════════════════════════════════════════\n",
     );
   }
 
@@ -12277,7 +13093,7 @@ export class DOMExtractor {
       analyzeNode(schema.root);
     } else if (schema.tree) {
       console.warn(
-        "⚠️ [COMPLETION] Using schema.tree instead of schema.root (legacy format)"
+        "⚠️ [COMPLETION] Using schema.tree instead of schema.root (legacy format)",
       );
       analyzeNode(schema.tree);
     } else {
@@ -12287,7 +13103,7 @@ export class DOMExtractor {
           keys: Object.keys(schema),
           hasNodes: !!schema.nodes,
           hasData: !!schema.data,
-        }
+        },
       );
     }
 
@@ -12307,7 +13123,7 @@ export class DOMExtractor {
     // Generate warnings and recommendations
     if (stats.transformNodes === 0) {
       stats.warnings.push(
-        "No CSS transforms captured - check if page has animated elements"
+        "No CSS transforms captured - check if page has animated elements",
       );
     }
 
@@ -12321,29 +13137,29 @@ export class DOMExtractor {
         100 -
           (this.autoLayoutMetrics.autoLayoutCandidates -
             this.autoLayoutMetrics.autoLayoutAppliedSafe) *
-            5
+            5,
       );
     }
 
     if (stats.maxDepth > 20) {
       stats.warnings.push(
-        "Deep nesting detected - may impact import performance"
+        "Deep nesting detected - may impact import performance",
       );
       stats.recommendations.push(
-        "Consider flattening deeply nested structures"
+        "Consider flattening deeply nested structures",
       );
     }
 
     if (stats.totalNodes > 1000) {
       stats.recommendations.push(
-        "Large page detected - consider selective capture for better performance"
+        "Large page detected - consider selective capture for better performance",
       );
       stats.memoryEfficiency = "High Usage";
     }
 
     if (stats.transformCoverage > 20) {
       stats.recommendations.push(
-        "High transform usage detected - excellent for animated UI"
+        "High transform usage detected - excellent for animated UI",
       );
     }
 
@@ -12412,7 +13228,7 @@ export class DOMExtractor {
    */
   private validateNodeAtCapture(
     node: ElementNode,
-    element: Element
+    element: Element,
   ): NodeValidation {
     const issues: ValidationIssue[] = [];
     const layout = node.layout || {
@@ -12619,37 +13435,56 @@ export class DOMExtractor {
 
   private async captureElementForRasterization(
     element: Element,
-    node: any
+    node: any,
   ): Promise<void> {
     try {
-      // NOTE: Using static import instead of dynamic import to avoid
-      // webpack async chunk loader, which triggers TrustedScriptURL
-      // CSP violations on sites like YouTube that enforce Trusted Types.
-      const dataUrl = await captureElementScreenshot(element);
+      // P0-3 FIX: Enhanced diagnostic logging for rasterization
+      const rect = element.getBoundingClientRect();
+      const rasterReason = node.rasterize?.reason || "UNKNOWN";
+      const elementId = node.id || element.id || "no-id";
 
-      if (dataUrl && node.rasterize) {
-        node.rasterize.dataUrl = dataUrl;
-        console.log(
-          `[PHASE 5] Captured rasterization screenshot for ${element.tagName} (${node.rasterize.reason})`
-        );
-      } else if (
-        node.rasterize &&
-        (node.rasterize.reason === "MASK" ||
-          node.rasterize.reason === "CLIP_PATH")
-      ) {
-        // CRITICAL FIX: If masking fails to rasterize, clear the fills.
-        // Otherwise we render an unmasked opaque rectangle that obscures content ("shade" bug).
-        console.warn(
-          `[PHASE 5] Rasterization failed for ${node.rasterize.reason}. Clearing fills to prevent obstruction.`
-        );
-        node.fills = [];
-        node.backgrounds = [];
-        // Keep children and other properties so text/content might still be visible
-      }
+      console.log(
+        `[PHASE 5 RASTER QUEUE] Enqueuing ${element.tagName}#${elementId.substring(0, 12)} ` +
+          `(${Math.round(rect.width)}x${Math.round(rect.height)}) reason=${rasterReason}`,
+      );
+
+      // ENQUEUE OPPORTUNISTIC RASTERIZATION
+      this.enqueueScreenshot(element, (dataUrl) => {
+        if (dataUrl && node.rasterize) {
+          node.rasterize.dataUrl = dataUrl;
+          // P0-3 FIX: Log success with data size for verification
+          const dataSize = dataUrl.length;
+          console.log(
+            `[PHASE 5 RASTER SUCCESS] ${element.tagName}#${elementId.substring(0, 12)} ` +
+              `captured ${dataSize} bytes (reason=${rasterReason})`,
+          );
+        } else if (node.rasterize) {
+          // P0-3 FIX: Log detailed failure info
+          console.warn(
+            `[PHASE 5 RASTER FAILED] ${element.tagName}#${elementId.substring(0, 12)} ` +
+              `reason=${rasterReason}, dataUrl=${dataUrl ? "invalid" : "null"}`,
+          );
+
+          if (
+            node.rasterize.reason === "MASK" ||
+            node.rasterize.reason === "CLIP_PATH"
+          ) {
+            // CRITICAL FIX: If masking fails to rasterize, clear the fills.
+            // Otherwise we render an unmasked opaque rectangle that obscures content ("shade" bug).
+            console.warn(
+              `[PHASE 5 RASTER] Clearing fills for failed ${node.rasterize.reason} to prevent obstruction.`,
+            );
+            node.fills = [];
+            node.backgrounds = [];
+            // Keep children and other properties so text/content might still be visible
+          }
+        }
+      });
     } catch (err) {
-      console.warn(
-        "[PHASE 5] Failed to capture element for rasterization:",
-        err
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[PHASE 5 RASTER ERROR] Failed to enqueue ${element.tagName} for rasterization:`,
+        errorMsg,
       );
     }
   }
@@ -12671,7 +13506,7 @@ export class DOMExtractor {
     const validate = (
       node: any,
       depth: number,
-      parentId: string | null
+      parentId: string | null,
     ): void => {
       totalNodes++;
       maxDepth = Math.max(maxDepth, depth);
@@ -12679,7 +13514,7 @@ export class DOMExtractor {
       // Check for duplicate IDs
       if (seenIds.has(node.id)) {
         issues.push(
-          `Duplicate ID found: ${node.id} (${node.name || node.tagName})`
+          `Duplicate ID found: ${node.id} (${node.name || node.tagName})`,
         );
       }
       seenIds.add(node.id);
@@ -12687,7 +13522,7 @@ export class DOMExtractor {
       // Check parent reference
       if (parentId !== null && node.parentId !== parentId) {
         issues.push(
-          `Parent ID mismatch for ${node.id}: expected ${parentId}, got ${node.parentId}`
+          `Parent ID mismatch for ${node.id}: expected ${parentId}, got ${node.parentId}`,
         );
       }
 
@@ -12710,7 +13545,7 @@ export class DOMExtractor {
       issues.forEach((issue) => console.error(`  - ${issue}`));
     } else {
       console.log(
-        `✅ [TREE VALIDATION] Tree structure valid: ${totalNodes} nodes, max depth ${maxDepth}`
+        `✅ [TREE VALIDATION] Tree structure valid: ${totalNodes} nodes, max depth ${maxDepth}`,
       );
     }
   }
@@ -12743,5 +13578,120 @@ export class DOMExtractor {
     }
 
     return lines.join("\n");
+  }
+
+  /**
+   * Generate layout preview blocks from the extracted schema for skeleton animation
+   */
+  private generateLayoutPreviewBlocks(schema: any): any[] {
+    const blocks: any[] = [];
+
+    try {
+      const root = schema.root || schema.tree;
+      if (!root) return blocks;
+
+      const viewport = schema.metadata?.viewport || {
+        width: window.innerWidth,
+        height: window.innerHeight,
+      };
+
+      // Recursively collect significant nodes that should appear in preview
+      const collect = (node: any, depth: number = 0): void => {
+        if (!node || blocks.length > 40) return;
+
+        const bounds = node.bounds || {
+          left: 0,
+          top: 0,
+          width: viewport.width,
+          height: 100,
+        };
+
+        const w = Math.max(1, bounds.width || 100);
+        const h = Math.max(1, bounds.height || 50);
+        const area = w * h;
+        const minArea = viewport.width * viewport.height * 0.002; // 0.2% of viewport
+
+        // Include significant blocks based on:
+        // 1. Type/semantic importance
+        // 2. Size (at least 0.2% of viewport)
+        // 3. Depth (prefer high-level structure)
+        const type = node.type?.toLowerCase() || "";
+        const name = node.name?.toLowerCase() || "";
+
+        let hintType = "container";
+        let importance = 0;
+
+        if (
+          type === "heading" ||
+          name.includes("header") ||
+          name.includes("nav")
+        ) {
+          hintType = "header";
+          importance = 9;
+        } else if (
+          name.includes("hero") ||
+          name.includes("banner") ||
+          type === "image"
+        ) {
+          hintType = "hero";
+          importance = 8;
+        } else if (
+          type === "card" ||
+          name.includes("card") ||
+          name.includes("item")
+        ) {
+          hintType = "card";
+          importance = 7;
+        } else if (
+          type === "text" ||
+          type === "paragraph" ||
+          name.includes("text")
+        ) {
+          hintType = "text";
+          importance = 5;
+        } else if (type === "image" || name.includes("image")) {
+          hintType = "media";
+          importance = 6;
+        }
+
+        const shouldInclude =
+          (area >= minArea && depth <= 4) || importance >= 7;
+
+        if (shouldInclude && area > 0) {
+          blocks.push({
+            id: node.id || `block-${blocks.length}`,
+            x: Math.max(0, bounds.left || 0),
+            y: Math.max(0, bounds.top || 0),
+            width: w,
+            height: h,
+            hintType,
+            importance,
+            z: node.zIndex || depth,
+          });
+        }
+
+        // Recurse into children
+        if (node.children && Array.isArray(node.children) && depth < 5) {
+          for (const child of node.children) {
+            collect(child, depth + 1);
+          }
+        }
+      };
+
+      collect(root);
+
+      // Sort by importance (desc) then by vertical position (top to bottom)
+      blocks.sort((a, b) => {
+        if (a.importance !== b.importance) {
+          return b.importance - a.importance;
+        }
+        return a.y - b.y;
+      });
+
+      return blocks.slice(0, 40);
+    } catch (error) {
+      console.error("[generateLayoutPreviewBlocks] Error:", error);
+      return blocks;
+    }
   }
 }

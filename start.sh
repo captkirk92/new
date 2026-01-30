@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# Web to Figma - Unified Start Script
+# figmafi - Unified Start Script
 # ============================================
 # This script starts all required services for the capture flow.
 #
@@ -54,7 +54,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}╔════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║      Web to Figma - Starting Services      ║${NC}"
+echo -e "${BLUE}║          figmafi - Development Mode         ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -109,11 +109,20 @@ echo ""
 if [ "$SKIP_BUILD" = "1" ]; then
   echo -e "${YELLOW}🔨 SKIP_BUILD=1 set; skipping build steps${NC}"
 else
-  echo -e "${YELLOW}🔨 Building Chrome extension...${NC}"
+  echo -e "${YELLOW}🔨 Building Chrome Extension...${NC}"
   cd chrome-extension
   npm run build
   cd ..
-  echo -e "${GREEN}✅ Chrome extension built${NC}"
+  
+  # Verify build artifact
+  if [ ! -f "chrome-extension/dist/manifest.json" ] && [ ! -f "chrome-extension/manifest.json" ]; then
+     # Note: webpack might output to dist or root depending on config, usually dist
+     if [ ! -d "chrome-extension/dist" ]; then
+        echo -e "${RED}❌ Chrome Extension build failed (no dist directory)${NC}"
+        exit 1
+     fi
+  fi
+  echo -e "${GREEN}✅ Chrome extension built successfully${NC}"
   echo ""
 
   # Build Figma Plugin
@@ -122,7 +131,13 @@ else
     cd figma-plugin
     npm run build
     cd ..
-    echo -e "${GREEN}✅ Figma Plugin built${NC}"
+    
+    # Verify build artifact
+    if [ ! -f "figma-plugin/dist/code.js" ]; then
+        echo -e "${RED}❌ Figma Plugin build failed (no dist/code.js)${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Figma Plugin built successfully${NC}"
   fi
 fi
 
@@ -174,7 +189,8 @@ echo -e "${BLUE}🚀 Starting Handoff Server on port 4411...${NC}"
 echo -e "${YELLOW}🔍 Checking for existing server on port 4411...${NC}"
 
 # Method 1: Kill by process name
-if pkill -f "handoff-server\\.cjs" 2>/dev/null; then
+# Only kill if it's NOT this script (unlikely but safe)
+if pkill -f "node handoff-server.cjs" 2>/dev/null; then
   echo -e "${YELLOW}♻️  Killed existing handoff server process${NC}"
   sleep 1
 fi
@@ -223,14 +239,14 @@ echo -e "${GREEN}✅ Handoff Server process is active (PID: $HANDOFF_PID)${NC}"
 
 # Wait for server to be ready and check if it's responding
 echo -e "${CYAN}⏳ Waiting for server to initialize...${NC}"
-MAX_RETRIES=10
+MAX_RETRIES=15
 RETRY_COUNT=0
 SERVER_RESPONDING=false
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
   # Check if process is still running
   if ! kill -0 "$HANDOFF_PID" 2>/dev/null; then
-    echo -e "${RED}❌ Server process died (PID: $HANDOFF_PID)${NC}"
+    echo -e "${RED}❌ Server process died with exit code $? (PID: $HANDOFF_PID)${NC}"
     if [ -f handoff-server.log ]; then
       echo -e "${YELLOW}   Last log entries:${NC}"
       tail -20 handoff-server.log
@@ -238,18 +254,16 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
     exit 1
   fi
   
-  # Try to connect to the server
+  # Try to connect to the server (check both 127.0.0.1 and localhost)
   if curl -s -f http://127.0.0.1:4411/api/health > /dev/null 2>&1 || \
-     curl -s -f http://127.0.0.1:4411/api/status > /dev/null 2>&1; then
-    echo -e "${GREEN}✅ Handoff Server is responding${NC}"
+     curl -s -f http://localhost:4411/api/health > /dev/null 2>&1; then
+    echo -e "${GREEN}✅ Handoff Server is online and responding${NC}"
     SERVER_RESPONDING=true
     break
   else
     RETRY_COUNT=$((RETRY_COUNT + 1))
-    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-      echo -e "${YELLOW}   Waiting for server... ($RETRY_COUNT/$MAX_RETRIES)${NC}"
-      sleep 2
-    fi
+    echo -e "${YELLOW}   Waiting for server response... ($RETRY_COUNT/$MAX_RETRIES)${NC}"
+    sleep 1
   fi
 done
 

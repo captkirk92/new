@@ -1,21 +1,28 @@
-# HTML to Figma Converter
+# figmafi - Web to Figma Converter
 
 Convert any website directly into pixel-perfect, editable Figma designs with Auto Layout, components, and interactive states.
 
+
 ## ⚡ **Quick Start: URL to Figma in 3 Steps**
 
-### **Step 1: Load the Plugin
+
+### **Step 1: Load the Plugin**
+
 1. Open **Figma Desktop**
 2. Go to **Plugins → Development → Import plugin from manifest**
 3. Select `figma-plugin/manifest.json`
 
+
 ### **Step 2: Convert Any URL**
-1. Launch **"Web to Figma"** plugin
+
+1. Launch **"figmafi"** plugin
 2. Enter any website URL (e.g., `https://github.com`)
 3. Click **"Capture from Cloud"**
 4. Wait 30-60 seconds for processing
 
+
 ### **Step 3: Auto-Import**
+
 - Plugin automatically imports the captured design
 - Creates pixel-perfect Figma frames with Auto Layout
 - Extracts colors, text styles, and components
@@ -326,4 +333,4 @@ npm run build
 - **GitHub Issues** - Report bugs and feature requests
 - **Documentation** - Complete guides in `/docs` folder
 - **Community** - Contribute improvements and extensions
-# web2figma
+# figmafi

@@ -2,6 +2,26 @@
 // Phase 5: Element screenshot capture for rasterization fallback
 
 /**
+ * Check if the current page URL is capturable via CDP/captureVisibleTab.
+ * Chrome blocks CDP attachment to certain URL schemes for security.
+ */
+function isCapturablePageUrl(): boolean {
+  const protocol = window.location.protocol;
+  const restrictedProtocols = [
+    "chrome-extension:",
+    "chrome:",
+    "edge:",
+    "about:",
+    "data:",
+    "javascript:",
+    "file:",
+    "view-source:",
+    "chrome-search:",
+  ];
+  return !restrictedProtocols.includes(protocol);
+}
+
+/**
  * PRIMARY: Capture element using native browser screenshot (pixel-perfect)
  * FALLBACK: Use SVG foreignObject if native capture fails
  *
@@ -11,33 +31,134 @@
  * 3. Return null (graceful degradation)
  */
 export async function captureElementScreenshot(
-  element: Element
+  element: Element,
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    targetWidth?: number;
+    targetHeight?: number;
+  } = {},
 ): Promise<string | null> {
+  // P0-3 FIX: Enhanced diagnostic logging for rasterization debugging
+  const elementInfo = getElementDiagnosticInfo(element);
+  const startTime = performance.now();
+
+  console.log(`[PHASE 5 RASTER] Starting capture for ${elementInfo.tag} (${elementInfo.dimensions})`);
+
+  // Early exit for non-capturable URLs (chrome-extension://, chrome://, etc.)
+  // CDP/captureVisibleTab always fails on these URLs
+  if (!isCapturablePageUrl()) {
+    console.warn(`[PHASE 5 RASTER] Skipping: non-capturable URL protocol (${window.location.protocol})`);
+    return null;
+  }
+
   // Try native capture first (highest fidelity)
-  const nativeResult = await captureElementViaTabCapture(element);
+  console.log(`[PHASE 5 RASTER] Attempting native CDP capture...`);
+  let nativeResult: string | null = null;
+  let nativeError: string | null = null;
+
+  try {
+    nativeResult = await captureElementViaTabCapture(
+      element,
+      options.signal,
+      options.timeoutMs,
+      options.targetWidth,
+      options.targetHeight,
+    );
+  } catch (err) {
+    nativeError = err instanceof Error ? err.message : String(err);
+    console.error(`[PHASE 5 RASTER] Native capture threw error:`, nativeError);
+  }
 
   // Validate native capture didn't fail silently
   if (nativeResult && validateCaptureResult(nativeResult, element)) {
-    console.log("[PHASE 5] ✅ Native screenshot capture successful");
+    const elapsed = (performance.now() - startTime).toFixed(1);
+    const dataSize = nativeResult.length;
+    console.log(`[PHASE 5 RASTER] Native capture SUCCESS for ${elementInfo.tag} (${dataSize} bytes, ${elapsed}ms)`);
     return nativeResult;
   }
 
+  // P0-3 FIX: Log why native capture failed
+  if (!nativeResult) {
+    console.warn(`[PHASE 5 RASTER] Native capture returned null/empty${nativeError ? `: ${nativeError}` : ''}`);
+  } else {
+    console.warn(`[PHASE 5 RASTER] Native capture failed validation (likely blank/corrupted)`);
+  }
+
   // Fallback to foreignObject if native failed
-  console.warn(
-    "[PHASE 5] Native capture failed or invalid, trying foreignObject fallback"
-  );
-  const foreignObjectResult = await captureElementViaForeignObject(element);
+  console.log(`[PHASE 5 RASTER] Attempting foreignObject fallback for ${elementInfo.tag}...`);
+  let foreignObjectResult: string | null = null;
+  let foreignObjectError: string | null = null;
+
+  try {
+    foreignObjectResult = await captureElementViaForeignObject(
+      element,
+      options.targetWidth,
+      options.targetHeight,
+    );
+  } catch (err) {
+    foreignObjectError = err instanceof Error ? err.message : String(err);
+    console.error(`[PHASE 5 RASTER] ForeignObject capture threw error:`, foreignObjectError);
+  }
 
   if (
     foreignObjectResult &&
     validateCaptureResult(foreignObjectResult, element)
   ) {
-    console.log("[PHASE 5] ⚠️ ForeignObject fallback successful (best effort)");
+    const elapsed = (performance.now() - startTime).toFixed(1);
+    const dataSize = foreignObjectResult.length;
+    console.log(`[PHASE 5 RASTER] ForeignObject fallback SUCCESS for ${elementInfo.tag} (${dataSize} bytes, ${elapsed}ms)`);
     return foreignObjectResult;
   }
 
-  console.error("[PHASE 5] ❌ All capture methods failed");
+  // P0-3 FIX: Log detailed failure info
+  const elapsed = (performance.now() - startTime).toFixed(1);
+  console.error(`[PHASE 5 RASTER] ALL CAPTURE METHODS FAILED for ${elementInfo.tag} after ${elapsed}ms`);
+  console.error(`[PHASE 5 RASTER] Element details:`, {
+    tag: elementInfo.tag,
+    dimensions: elementInfo.dimensions,
+    hasFilter: elementInfo.hasFilter,
+    hasBackdropFilter: elementInfo.hasBackdropFilter,
+    hasMask: elementInfo.hasMask,
+    hasClipPath: elementInfo.hasClipPath,
+    nativeError,
+    foreignObjectError,
+  });
+
   return null;
+}
+
+/**
+ * P0-3 FIX: Get diagnostic info about an element for logging
+ */
+function getElementDiagnosticInfo(element: Element): {
+  tag: string;
+  dimensions: string;
+  hasFilter: boolean;
+  hasBackdropFilter: boolean;
+  hasMask: boolean;
+  hasClipPath: boolean;
+} {
+  const tag = element.tagName?.toLowerCase() || 'unknown';
+  const rect = element.getBoundingClientRect();
+  const dimensions = `${Math.round(rect.width)}x${Math.round(rect.height)}`;
+
+  let hasFilter = false;
+  let hasBackdropFilter = false;
+  let hasMask = false;
+  let hasClipPath = false;
+
+  try {
+    const style = window.getComputedStyle(element);
+    hasFilter = !!(style.filter && style.filter !== 'none');
+    hasBackdropFilter = !!((style as any).backdropFilter && (style as any).backdropFilter !== 'none');
+    hasMask = !!((style as any).webkitMaskImage || (style as any).maskImage);
+    hasClipPath = !!(style.clipPath && style.clipPath !== 'none');
+  } catch {
+    // Ignore style access errors
+  }
+
+  return { tag, dimensions, hasFilter, hasBackdropFilter, hasMask, hasClipPath };
 }
 
 /**
@@ -55,7 +176,7 @@ function validateCaptureResult(dataUrl: string, element: Element): boolean {
     console.warn(
       "[PHASE 5] Capture result suspiciously small:",
       base64Data?.length || 0,
-      "bytes"
+      "bytes",
     );
     return false;
   }
@@ -94,7 +215,9 @@ function validateCaptureResult(dataUrl: string, element: Element): boolean {
  * - Some CSS features not supported in foreignObject
  */
 async function captureElementViaForeignObject(
-  element: Element
+  element: Element,
+  targetWidth?: number,
+  targetHeight?: number,
 ): Promise<string | null> {
   try {
     const rect = element.getBoundingClientRect();
@@ -114,25 +237,34 @@ async function captureElementViaForeignObject(
 
     // Set canvas size to element size (accounting for device pixel ratio)
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.scale(dpr, dpr);
+    const finalWidth = targetWidth || rect.width;
+    const finalHeight = targetHeight || rect.height;
+
+    canvas.width = finalWidth * dpr;
+    canvas.height = finalHeight * dpr;
+    ctx.scale(
+      dpr * (finalWidth / rect.width),
+      dpr * (finalHeight / rect.height),
+    );
 
     // Strategy: Use SVG foreignObject to render the element
     // This captures all CSS effects including filters, blends, transforms
     const elementHtml = element.outerHTML;
     const computedStyle = window.getComputedStyle(element);
 
+    // Sanitize HTML to remove cross-origin resources that would taint the canvas
+    const sanitizedHtml = sanitizeHtmlForForeignObject(elementHtml);
+
     // Create SVG with foreignObject containing the element
     const svg = `
       <svg xmlns="http://www.w3.org/2000/svg" width="${rect.width}" height="${
-      rect.height
-    }">
+        rect.height
+      }">
         <foreignObject width="${rect.width}" height="${rect.height}">
           <div xmlns="http://www.w3.org/1999/xhtml" style="${getInlineStyles(
-            computedStyle
+            computedStyle,
           )}">
-            ${elementHtml}
+            ${sanitizedHtml}
           </div>
         </foreignObject>
       </svg>
@@ -179,6 +311,98 @@ async function captureElementViaForeignObject(
     console.warn("[RASTERIZE] Element screenshot capture failed:", err);
     return null;
   }
+}
+
+/**
+ * Sanitizes HTML for safe use in foreignObject SVG rendering.
+ * Removes cross-origin resources that would taint the canvas.
+ */
+function sanitizeHtmlForForeignObject(html: string): string {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+
+  // Remove script and iframe elements to prevent execution/loading
+  const scripts = Array.from(doc.querySelectorAll("script, iframe, frame, object, embed"));
+  for (let i = 0; i < scripts.length; i++) {
+    scripts[i].remove();
+  }
+
+  // Remove all images with cross-origin or extension URLs
+  const images = Array.from(doc.querySelectorAll("img"));
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    const src = img.getAttribute("src") || "";
+    const srcset = img.getAttribute("srcset") || "";
+
+    // Check for problematic URL patterns
+    const isCrossOrigin =
+      src.startsWith("http") && !src.startsWith(window.location.origin);
+    const isExtensionUrl =
+      src.startsWith("chrome-extension://") ||
+      src.startsWith("moz-extension://") ||
+      src.startsWith("edge://");
+
+    // Keep only same-origin, data URLs, and blob URLs
+    if (isCrossOrigin || isExtensionUrl) {
+      img.removeAttribute("src");
+      img.removeAttribute("srcset");
+      // Set a transparent placeholder
+      img.setAttribute("src", "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
+    }
+
+    // Also clean srcset of cross-origin URLs
+    if (srcset) {
+      const cleanedSrcset = srcset
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => {
+          const url = s.split(/\s+/)[0];
+          return (
+            !url.startsWith("http") ||
+            url.startsWith(window.location.origin)
+          );
+        })
+        .join(", ");
+      if (cleanedSrcset) {
+        img.setAttribute("srcset", cleanedSrcset);
+      } else {
+        img.removeAttribute("srcset");
+      }
+    }
+  }
+
+  // Remove link elements (external stylesheets/fonts)
+  const links = Array.from(doc.querySelectorAll('link[rel="stylesheet"], link[rel="preload"]'));
+  for (let i = 0; i < links.length; i++) {
+    links[i].remove();
+  }
+
+  // Remove style elements with @import or @font-face pointing to external URLs
+  const styles = Array.from(doc.querySelectorAll("style"));
+  for (let i = 0; i < styles.length; i++) {
+    const style = styles[i];
+    const text = style.textContent || "";
+    // Remove @import and @font-face rules with external URLs
+    const cleaned = text
+      .replace(/@import\s+url\([^)]+\)[^;]*;?/gi, "")
+      .replace(/@font-face\s*\{[^}]*url\s*\([^)]+\)[^}]*\}/gi, "");
+    style.textContent = cleaned;
+  }
+
+  // Remove background-image styles pointing to external URLs in inline styles
+  const elementsWithStyle = Array.from(doc.querySelectorAll("[style]"));
+  for (let i = 0; i < elementsWithStyle.length; i++) {
+    const el = elementsWithStyle[i];
+    const style = el.getAttribute("style") || "";
+    // Remove background-image with external URLs
+    const cleaned = style.replace(
+      /background(-image)?\s*:\s*url\s*\(\s*['"]?(https?:\/\/[^'")\s]+)['"]?\s*\)[^;]*;?/gi,
+      ""
+    );
+    el.setAttribute("style", cleaned);
+  }
+
+  return doc.body.innerHTML;
 }
 
 /**
@@ -240,7 +464,11 @@ function getInlineStyles(computed: CSSStyleDeclaration): string {
  * Requires: 'activeTab' permission in manifest.json
  */
 async function captureElementViaTabCapture(
-  element: Element
+  element: Element,
+  signal?: AbortSignal,
+  configuredTimeoutMs: number = 2500,
+  targetWidth?: number,
+  targetHeight?: number,
 ): Promise<string | null> {
   try {
     const rect = element.getBoundingClientRect();
@@ -316,20 +544,45 @@ async function captureElementViaTabCapture(
         .substr(2, 9)}`;
 
       response = await new Promise<any>((resolve) => {
+        let resolved = false;
+        let fallbackTimeoutId: ReturnType<typeof setTimeout> | null = null;
+        let overallTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+        const cleanup = () => {
+          if (fallbackTimeoutId) clearTimeout(fallbackTimeoutId);
+          if (overallTimeoutId) clearTimeout(overallTimeoutId);
+          window.removeEventListener("message", messageHandler);
+        };
+
+        const resolveOnce = (value: any, source: string) => {
+          if (resolved) {
+            console.log(
+              `[CAPTURE] Ignoring duplicate response from ${source} for ${requestId}`,
+            );
+            return;
+          }
+          resolved = true;
+          cleanup();
+          console.log(`[CAPTURE] Resolved via ${source} for ${requestId}`);
+          resolve(value);
+        };
+
         // Set up one-time listener for the response
         const messageHandler = (event: MessageEvent) => {
           if (event.source !== window) return;
+          if (resolved) return; // Already resolved, ignore
+
           if (
             (event.data.type === "CAPTURE_CDP_CLIP_PROXY_RESPONSE" ||
               event.data.type === "CAPTURE_VISIBLE_TAB_PROXY_RESPONSE") &&
             event.data.requestId === requestId
           ) {
-            window.removeEventListener("message", messageHandler);
-            resolve(
+            resolveOnce(
               event.data.response || {
                 ok: false,
                 error: "No response received",
-              }
+              },
+              event.data.type,
             );
           }
         };
@@ -337,17 +590,24 @@ async function captureElementViaTabCapture(
         window.addEventListener("message", messageHandler);
 
         // Send request to content script (prefer CDP clip capture).
+        console.log(`[CAPTURE] Sending CDP request ${requestId}`);
         window.postMessage(
           {
             type: "CAPTURE_CDP_CLIP_PROXY",
             requestId,
             clip,
           },
-          "*"
+          "*",
         );
 
+        const timeoutMs = Math.max(500, Math.min(8000, configuredTimeoutMs));
+
         // Fallback to visible-tab proxy if CDP path doesn't respond quickly.
-        setTimeout(() => {
+        fallbackTimeoutId = setTimeout(() => {
+          if (resolved) return;
+          console.log(
+            `[CAPTURE] CDP timeout (${timeoutMs}ms), sending VISIBLE_TAB fallback for ${requestId}`,
+          );
           window.postMessage(
             {
               type: "CAPTURE_VISIBLE_TAB_PROXY",
@@ -359,22 +619,35 @@ async function captureElementViaTabCapture(
                 height: cropRect.height,
               },
             },
-            "*"
+            "*",
           );
-        }, 750);
+        }, timeoutMs);
 
-        // Timeout after 10 seconds
-        setTimeout(() => {
-          window.removeEventListener("message", messageHandler);
-          resolve({ ok: false, error: "Capture request timeout" });
-        }, 10000);
+        // Abort signal handling
+        if (signal) {
+          signal.addEventListener(
+            "abort",
+            () => {
+              resolveOnce({ ok: false, error: "Aborted" }, "abort");
+            },
+            { once: true },
+          );
+        }
+
+        // Timeout after 10 seconds (hard limit)
+        overallTimeoutId = setTimeout(() => {
+          resolveOnce(
+            { ok: false, error: "Capture request timeout" },
+            "timeout",
+          );
+        }, 12000);
       });
     }
 
     if (!response || !response.ok) {
       console.warn(
         "[PHASE 5] Native capture failed:",
-        response?.error || "Unknown error"
+        response?.error || "Unknown error",
       );
       return null;
     }
@@ -387,7 +660,7 @@ async function captureElementViaTabCapture(
       // so only crop when the source is likely full-viewport.
       const isLikelyFullViewport = rawData.length > 200000; // rough heuristic
       if (isLikelyFullViewport) {
-        return await cropImage(rawData, cropRect);
+        return await cropImage(rawData, cropRect, targetWidth, targetHeight);
       }
       return rawData;
     }
@@ -404,7 +677,9 @@ async function captureElementViaTabCapture(
  */
 async function cropImage(
   dataUrl: string,
-  rect: DOMRect
+  rect: DOMRect,
+  targetWidth?: number,
+  targetHeight?: number,
 ): Promise<string | null> {
   return new Promise((resolve) => {
     const img = new Image();
@@ -417,9 +692,18 @@ async function cropImage(
       }
 
       const dpr = window.devicePixelRatio || 1;
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
-      ctx.scale(dpr, dpr);
+
+      // Target dimensions: if explicitly provided, use them. Otherwise use rendered size * DPR.
+      // This effectively clamps resolution to the rendered size.
+      const finalWidth = targetWidth || rect.width;
+      const finalHeight = targetHeight || rect.height;
+
+      canvas.width = finalWidth * dpr;
+      canvas.height = finalHeight * dpr;
+      ctx.scale(
+        dpr * (finalWidth / rect.width),
+        dpr * (finalHeight / rect.height),
+      );
 
       // Crop from the full screenshot
       ctx.drawImage(
@@ -431,7 +715,7 @@ async function cropImage(
         0,
         0,
         rect.width,
-        rect.height
+        rect.height,
       );
 
       resolve(canvas.toDataURL("image/png"));

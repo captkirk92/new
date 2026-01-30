@@ -12,7 +12,14 @@
  * - Graceful error handling for network failures
  */
 
+import { FontManager } from "./font-manager";
 import { NodeBuilder } from "./node-builder";
+
+// ... (other imports)
+
+// ...
+
+import { fetchWithProxy } from "./utils/asset-proxy";
 import { StyleManager } from "./style-manager";
 import { ComponentManager } from "./component-manager";
 import { ImportOptions } from "./import-options";
@@ -35,6 +42,8 @@ import {
   optimizeFigmaTree,
   type FigmaOptimizationOptions,
 } from "./figma-tree-optimizer";
+import { buildRenderTree, getRenderTreeStats } from "./render-tree-builder";
+import { optimizeLayerTree, validateCleanup } from "./layer-cleanup-optimizer";
 
 // Import tree chunker for large import splitting
 import { chunkTree, TreeChunk, countNodes } from "./tree-chunker";
@@ -87,7 +96,15 @@ export interface EnhancedImportOptions {
   detectComponents?: boolean; // Find and create reusable component patterns
   groupByRole?: boolean; // Group into Header/Main/Footer sections
   addVisualMarkers?: boolean; // Add emoji prefixes and color coding
+  colorCodeByRole?: boolean; // Apply color coding to roles
   minComponentInstances?: number; // Minimum instances to create component (default: 3)
+  parseMetaTags?: boolean; // Parse meta tags for SEO and metadata
+
+  // Render Tree Optimization (SERVER Module)
+  enableRenderTreeOptimization?: boolean; // Build render tree instead of using raw DOM tree (removes invisible nodes, materializes pseudo-elements)
+
+  // Layer Cleanup Optimization (BUILDER Module)
+  enableLayerCleanup?: boolean; // Remove wrappers, merge duplicates, flatten nesting for human-quality output
 }
 
 export interface ImageCreationResult {
@@ -130,6 +147,7 @@ export enum NodeFailureReason {
   FAIL_SVG_PARSE = "FAIL_SVG_PARSE",
   FAIL_NODE_CREATION_NULL = "FAIL_NODE_CREATION_NULL",
   FAIL_UNKNOWN_EXCEPTION = "FAIL_UNKNOWN_EXCEPTION",
+  SKIP_HIDDEN = "SKIP_HIDDEN",
 }
 
 export interface FailedNodeReport {
@@ -283,7 +301,7 @@ class ValidationUtils {
           hasId: !!node.id,
           idType: typeof node.id,
           node: node,
-        }
+        },
       );
       return null;
     }
@@ -308,7 +326,7 @@ class ValidationUtils {
 
     if (!node.type || typeof node.type !== "string") {
       console.warn(
-        `⚠️ [VALIDATION] Node ${node.id}: missing type, defaulting to FRAME`
+        `⚠️ [VALIDATION] Node ${node.id}: missing type, defaulting to FRAME`,
       );
       node.type = "FRAME";
     }
@@ -407,6 +425,17 @@ export class EnhancedFigmaImporter {
   private coordinateOffset: { x: number; y: number } = { x: 0, y: 0 };
   private importStartTime: number = 0;
   private processedNodeCount: number = 0;
+  // DIAGNOSTIC: Node creation statistics for tracking content loss
+  private nodeCreationStats = {
+    attempted: 0,
+    created: 0,
+    failed: 0,
+    nullValidation: 0,
+    byType: new Map<
+      string,
+      { attempted: number; created: number; failed: number }
+    >(),
+  };
   private loadedFonts = new Set<string>();
   private mainFrame: FrameNode | null = null;
   public diagnosticCollector: DiagnosticCollector; // Public so NodeBuilder can access
@@ -423,7 +452,11 @@ export class EnhancedFigmaImporter {
     return map;
   }
 
-  constructor(private data: any, options: Partial<EnhancedImportOptions> = {}) {
+  constructor(
+    private data: any,
+    options: Partial<EnhancedImportOptions> = {},
+    private fontManager?: FontManager,
+  ) {
     (this as any).importStartTime = Date.now();
     // DEBUG: Log what schema data we received
     console.log("🔍 [EnhancedFigmaImporter] Constructor received data:", {
@@ -464,18 +497,40 @@ export class EnhancedFigmaImporter {
     // CRITICAL MEMORY OPTIMIZATION: Disable full diagnostics for very large pages
     // For imports with > 5000 nodes, tracking every node state in memory often causes OOM
     const estimatedNodes = data.root?.children?.length || 0; // Simple estimate first
+
+    // SAFETY RAIL: Force disable Auto Layout for large imports to prevent WASM OOM
+    // The "Low confidence layout" thrashing seen in logs consumes massive memory
+    if (
+      estimatedNodes > 1000 ||
+      (data.metadata?.extractionSummary?.totalElements > 1000 &&
+        this.options.applyAutoLayout)
+    ) {
+      console.warn(
+        `⚠️ [MEMORY SAFETY] Large import detected (>1000 nodes). Forcing Auto Layout OFF to prevent crash.`,
+      );
+      this.options.applyAutoLayout = false;
+
+      // Also disable verification to save memory
+      if (this.options.verifyPositions) {
+        console.warn(
+          `⚠️ [MEMORY SAFETY] Large import detected. Disabling position verification to save memory.`,
+        );
+        this.options.verifyPositions = false;
+      }
+    }
+
     if (
       estimatedNodes > 1000 ||
       data.metadata?.extractionSummary?.totalElements > 5000
     ) {
       console.warn(
-        `🚀 [MEMORY] Large import detected (>5000 nodes). Enabling FAILURE_ONLY diagnostics to prevent OOM.`
+        `🚀 [MEMORY] Large import detected (>5000 nodes). Enabling FAILURE_ONLY diagnostics to prevent OOM.`,
       );
       this.diagnosticCollector.failureOnlyMode = true;
     }
 
     console.log(
-      "📊 [DIAGNOSTICS] Diagnostic collector initialized for import tracking"
+      "📊 [DIAGNOSTICS] Diagnostic collector initialized for import tracking",
     );
 
     // ENHANCED: Scale factor is now fixed at 1.0 because the extractor provides CSS pixels.
@@ -483,7 +538,7 @@ export class EnhancedFigmaImporter {
     const devicePixelRatio = data.metadata?.devicePixelRatio || 1;
     this.scaleFactor = 1;
     console.log(
-      `📏 [SCALE FACTOR] Fixed scale factor: ${this.scaleFactor} (extraction dpr was: ${devicePixelRatio})`
+      `📏 [SCALE FACTOR] Fixed scale factor: ${this.scaleFactor} (extraction dpr was: ${devicePixelRatio})`,
     );
 
     // Initialize managers
@@ -499,7 +554,7 @@ export class EnhancedFigmaImporter {
       usePixelPerfectPositioning: !this.options.applyAutoLayout,
       createScreenshotOverlay: false,
       showValidationMarkers: false,
-      strictCloneMode: this.options.strictCloneMode ?? false, // Pass through strict clone mode
+      strictCloneMode: this.options.strictCloneMode ?? true, // FIDELITY FIX: Default to true for pixel-perfect text rendering
     };
 
     this.nodeBuilder = new NodeBuilder(
@@ -507,9 +562,23 @@ export class EnhancedFigmaImporter {
       new ComponentManager(data.components),
       builderImportOptions,
       { ...(data.assets || {}), baseUrl: data?.metadata?.url },
-      undefined,
-      this.diagnosticCollector
+      undefined, // designTokensManager (none at import time)
+      data, // schema -> pass full capture data so NodeBuilder can access metadata (viewport, DPR, etc.)
+      this.diagnosticCollector,
+      this.fontManager,
     );
+
+    // MEMORY SAFETY: Enable memory safety mode for large imports
+    // This disables expensive layout intelligence analysis per-node
+    if (
+      estimatedNodes > 1000 ||
+      data.metadata?.extractionSummary?.totalElements > 1000
+    ) {
+      this.nodeBuilder.memorySafetyMode = true;
+      console.warn(
+        `🛡️ [MEMORY SAFETY] Enabling memory safety mode for NodeBuilder - skipping layout intelligence analysis`,
+      );
+    }
 
     // PIXEL-PERFECT FIX: Validate assets were passed correctly
     console.log(`📊 [IMPORT VALIDATION] Checking assets structure...`);
@@ -529,7 +598,7 @@ export class EnhancedFigmaImporter {
 
     if (assetsCheck.imageCount === 0) {
       console.error(
-        `❌ [IMPORT VALIDATION] NO IMAGES IN ASSETS! This will cause all images to fail.`
+        `❌ [IMPORT VALIDATION] NO IMAGES IN ASSETS! This will cause all images to fail.`,
       );
       console.error(`   Check extension console for asset finalization logs.`);
     } else {
@@ -552,33 +621,33 @@ export class EnhancedFigmaImporter {
         // P0 FIX: Enhanced validation for URL-only assets
         const allImages = Object.values(this.data.assets.images);
         const urlOnlyCount = allImages.filter(
-          (a: any) => !a.data && !a.base64 && a.url
+          (a: any) => !a.data && !a.base64 && a.url,
         ).length;
         const totalCount = allImages.length;
 
         if (urlOnlyCount > 0) {
           console.warn(
-            `⚠️ [ASSET VALIDATION] ${urlOnlyCount}/${totalCount} assets are URL-only (no embedded data).`
+            `⚠️ [ASSET VALIDATION] ${urlOnlyCount}/${totalCount} assets are URL-only (no embedded data).`,
           );
           console.warn(`   These will use the proxy fallback in NodeBuilder.`);
         }
 
         if (!sampleAsset.data && !sampleAsset.base64 && !sampleAsset.url) {
           console.error(
-            `❌ [IMPORT VALIDATION] Sample asset has NO data, NO base64, AND NO url!`
+            `❌ [IMPORT VALIDATION] Sample asset has NO data, NO base64, AND NO url!`,
           );
           console.error(
-            `   Image resolution will FAIL. Check extension finalizeAssets logic.`
+            `   Image resolution will FAIL. Check extension finalizeAssets logic.`,
           );
         } else if (!sampleAsset.data && !sampleAsset.base64) {
           console.warn(
-            `⚠️ [IMPORT VALIDATION] Assets are URL-only (no embedded data)`
+            `⚠️ [IMPORT VALIDATION] Assets are URL-only (no embedded data)`,
           );
           console.warn(
-            `   Ensure handoff server proxy is running at http://localhost:4411`
+            `   Ensure handoff server proxy is running at http://localhost:4411`,
           );
           console.warn(
-            `   All images will be fetched via proxy. This may be slower.`
+            `   All images will be fetched via proxy. This may be slower.`,
           );
         }
       }
@@ -602,7 +671,7 @@ export class EnhancedFigmaImporter {
           data && typeof data === "object"
             ? JSON.stringify(data).substring(0, 300) + "..."
             : String(data),
-      }
+      },
     );
 
     if (!data || typeof data !== "object") {
@@ -790,7 +859,7 @@ export class EnhancedFigmaImporter {
     // Sort displacements descending
     significantDisplacements.sort(
       (a, b) =>
-        Math.abs(b.dx) + Math.abs(b.dy) - (Math.abs(a.dx) + Math.abs(a.dy))
+        Math.abs(b.dx) + Math.abs(b.dy) - (Math.abs(a.dx) + Math.abs(a.dy)),
     );
     const topDisplacements = significantDisplacements.slice(0, 10);
 
@@ -825,8 +894,8 @@ ${
         .map(
           (d) =>
             `   - ${d.name} (${d.id}): dx=${d.dx.toFixed(1)}, dy=${d.dy.toFixed(
-              1
-            )}`
+              1,
+            )}`,
         )
         .join("\n")
     : "   (None)"
@@ -838,12 +907,12 @@ ${
     // (Optional: currently just logging)
     if (this.options.enableDebugMode && severityCounts.FATAL > 0) {
       console.error(
-        "❌ CRITICAL: Fatal validation issues detected during build."
+        "❌ CRITICAL: Fatal validation issues detected during build.",
       );
     }
   }
 
-  async runImport(): Promise<ImportVerificationReport> {
+  async runImport(targetFrame?: FrameNode): Promise<ImportVerificationReport> {
     this.importStartTime = Date.now();
 
     // Start performance tracking
@@ -860,6 +929,57 @@ ${
       // (Moved to processNodesWithBatchingRobust for better parallelization)
       this.checkTimeout();
 
+      // Step 1.5: Build render tree from DOM tree (SERVER Module)
+      if (
+        this.options.enableRenderTreeOptimization !== false &&
+        this.data.root
+      ) {
+        this.postProgress("Building render tree...", 5);
+        console.log("[RENDER_TREE] Converting DOM tree to render tree...");
+
+        try {
+          const renderTreeRoot = buildRenderTree(this.data.root, {
+            materializePseudoElements: true,
+            flattenStackingContexts: false, // CRITICAL FIX: Flattening destroys hierarchy/nesting
+            removeInvisible: true,
+            resolveShadowDOM: false,
+          });
+
+          if (renderTreeRoot) {
+            const stats = getRenderTreeStats(this.data.root, renderTreeRoot);
+            console.log("[RENDER_TREE] Transformation complete:", {
+              originalNodes: stats.originalNodeCount,
+              renderNodes: stats.renderNodeCount,
+              removedNodes: stats.removedNodes,
+              pseudoElementsAdded: stats.pseudoElementsAdded,
+            });
+
+            // Replace DOM tree with render tree
+            this.data.root = renderTreeRoot;
+
+            // Track stats in diagnostics
+            this.diagnosticCollector.addMetric("renderTree", {
+              originalNodeCount: stats.originalNodeCount,
+              renderNodeCount: stats.renderNodeCount,
+              removedNodes: stats.removedNodes,
+              pseudoElementsAdded: stats.pseudoElementsAdded,
+            });
+          } else {
+            console.warn(
+              "[RENDER_TREE] Failed to build render tree, using original DOM tree",
+            );
+          }
+        } catch (renderTreeError) {
+          console.error(
+            "[RENDER_TREE] Error building render tree:",
+            renderTreeError,
+          );
+          // Continue with original tree on error
+        }
+
+        this.checkTimeout();
+      }
+
       // Step 2: Create Figma styles
       if (this.options.createStyles) {
         this.postProgress("Creating local styles with hang protection...", 8);
@@ -870,7 +990,7 @@ ${
             new Promise((_, reject) => {
               setTimeout(
                 () => reject(new Error("Style creation timeout")),
-                30000
+                30000,
               );
             }),
           ]);
@@ -886,11 +1006,11 @@ ${
         } catch (styleError) {
           console.warn(
             "⚠️ [ENHANCED-IMPORTER] Style creation failed/timeout, continuing:",
-            styleError
+            styleError,
           );
           this.postProgress(
             "Skipping styles due to timeout, continuing import...",
-            12
+            12,
           );
           // Continue without styles rather than hanging
         }
@@ -905,14 +1025,22 @@ ${
       if (this.data.designTokensRegistry?.variables) {
         this.postProgress("Creating design tokens...", 10);
         this.designTokensManager = new DesignTokensManager(
-          this.data.designTokensRegistry
+          this.data.designTokensRegistry,
         );
         await this.designTokensManager.createFigmaVariables();
       }
       this.checkTimeout();
 
-      // Step 4: Create main frame
-      this.mainFrame = await this.createMainFrameRobust();
+      // Step 4: Create or use main frame
+      if (targetFrame) {
+        this.mainFrame = targetFrame;
+        // Ensure the frame is properly set up with data
+        if (this.data.metadata?.documentBackgroundColor) {
+          // Optional: apply background color if needed, or respect the frame as-is
+        }
+      } else {
+        this.mainFrame = await this.createMainFrameRobust();
+      }
       const mainFrame = this.mainFrame;
       this.checkTimeout();
 
@@ -931,7 +1059,7 @@ ${
         console.warn(
           `⚠️ [EMPTY TREE] Schema has 0 children in root. Has screenshot: ${hasScreenshot}. Will ${
             shouldForceScreenshotFallback ? "force" : "skip"
-          } screenshot fallback.`
+          } screenshot fallback.`,
         );
       }
 
@@ -948,7 +1076,7 @@ ${
         hasScreenshot
       ) {
         const screenshotDataUrl = this.normalizeScreenshotToDataUrl(
-          this.data.screenshot
+          this.data.screenshot,
         );
         if (screenshotDataUrl) {
           const overlay = await ScreenshotOverlay.createReferenceOverlay(
@@ -959,7 +1087,7 @@ ${
               // CRITICAL FIX: Hide overlay by default unless it's the fallback or explicitly requested
               visible: shouldForceScreenshotFallback,
               position: "background",
-            }
+            },
           );
 
           // Track screenshot overlay in diagnostics for empty tree fallback
@@ -967,14 +1095,14 @@ ${
             this.diagnosticCollector.initNode("screenshot-overlay");
             this.diagnosticCollector.setFigmaNodeId(
               "screenshot-overlay",
-              overlay.id
+              overlay.id,
             );
             this.diagnosticCollector.recordPhase(
               "screenshot-overlay",
-              "COMPLETE"
+              "COMPLETE",
             );
             console.log(
-              "✅ [DIAGNOSTICS] Tracked screenshot overlay node for empty tree fallback"
+              "✅ [DIAGNOSTICS] Tracked screenshot overlay node for empty tree fallback",
             );
           }
 
@@ -991,21 +1119,41 @@ ${
       if (!schemaValidation.isValid) {
         console.error(
           "❌ [TREE VALIDATION] Schema tree structure has errors:",
-          schemaValidation
+          schemaValidation,
         );
         // Log tree diagram for debugging
         if (this.data.root || this.data.tree) {
           console.log("📊 [TREE DIAGRAM] Schema tree structure:");
           console.log(
-            treeValidator.generateTreeDiagram(this.data.root || this.data.tree)
+            treeValidator.generateTreeDiagram(this.data.root || this.data.tree),
           );
         }
       } else {
         console.log(
           "✅ [TREE VALIDATION] Schema tree structure is valid -",
-          schemaValidation.summary
+          schemaValidation.summary,
         );
       }
+
+      // Step 5.6: CRITICAL FIX - Pre-load all images before node processing
+      // This was missing, causing images to never be cached and resulting in "0 images processed"
+      this.postProgress("Pre-loading images...", 40);
+      console.log(
+        "🖼️ [IMAGE PRELOAD] Starting image preloading before node processing...",
+      );
+      try {
+        await this.batchProcessImagesRobust([]);
+        console.log(
+          `✅ [IMAGE PRELOAD] Image preloading complete. Cached ${this.imageCreationCache.size} images.`,
+        );
+      } catch (imagePreloadError) {
+        console.warn(
+          "⚠️ [IMAGE PRELOAD] Image preloading failed, continuing:",
+          imagePreloadError,
+        );
+        // Continue without preloaded images - NodeBuilder will attempt fallback
+      }
+      this.checkTimeout();
 
       // Step 6: Process all nodes with batching
       await this.processNodesWithBatchingRobust(mainFrame);
@@ -1018,11 +1166,12 @@ ${
 
         const optimizationOptions: FigmaOptimizationOptions = {
           enableAutoLayout: this.options.applyAutoLayout ?? true,
-          detectComponents: this.options.detectComponents ?? true,
-          groupByRole: this.options.groupByRole ?? false, // Conservative default
-          applyNamingConventions: this.options.semanticNaming ?? true,
-          addVisualMarkers: this.options.addVisualMarkers ?? true,
-          colorCodeByRole: this.options.addVisualMarkers ?? false, // Conservative
+          // CRITICAL FIX: Default all destructive optimizations to FALSE
+          detectComponents: this.options.detectComponents ?? false,
+          groupByRole: this.options.groupByRole ?? false,
+          applyNamingConventions: this.options.semanticNaming ?? false,
+          addVisualMarkers: this.options.addVisualMarkers ?? false,
+          colorCodeByRole: this.options.colorCodeByRole ?? false,
           minComponentInstances: this.options.minComponentInstances ?? 3,
           createComponentVariants: false, // Don't replace instances by default
           useAutoLayoutPadding: true,
@@ -1033,14 +1182,14 @@ ${
           await optimizeFigmaTree(
             mainFrame,
             this.data.root,
-            optimizationOptions
+            optimizationOptions,
           );
           console.log("✅ [OPTIMIZER] Tree optimization complete");
           this.postProgress("Tree optimization complete", 90);
         } catch (optimizationError) {
           console.warn(
             "⚠️ [OPTIMIZER] Tree optimization failed, continuing:",
-            optimizationError
+            optimizationError,
           );
           // Continue without optimization rather than failing the entire import
         }
@@ -1076,7 +1225,7 @@ ${
         // This allows dark backgrounds (black) to be preserved
         if (!hasMatchingFill) {
           const hasImageFill = mainFrame.fills.some(
-            (fill) => fill.type === "IMAGE"
+            (fill) => fill.type === "IMAGE",
           );
           if (hasImageFill) {
             // Restore document background color (or white if not specified)
@@ -1101,14 +1250,14 @@ ${
                 },
               ];
               console.log(
-                `🛡️ Main frame had image fill, restoring document background color: ${documentBgColor}`
+                `🛡️ Main frame had image fill, restoring document background color: ${documentBgColor}`,
               );
             } else {
               mainFrame.fills = [
                 { type: "SOLID", color: { r: 1, g: 1, b: 1 } },
               ];
               console.log(
-                `🛡️ Main frame had image fill, restoring white solid background (no document color)`
+                `🛡️ Main frame had image fill, restoring white solid background (no document color)`,
               );
             }
           }
@@ -1176,6 +1325,73 @@ ${
       figma.viewport.scrollAndZoomIntoView([mainFrame]);
       figma.currentPage.selection = [mainFrame];
 
+      // Step 11: Layer cleanup optimization (BUILDER Module)
+      if (this.options.enableLayerCleanup !== false && mainFrame) {
+        this.postProgress("Optimizing layer structure...", 95);
+        console.log("[CLEANUP] Starting layer cleanup optimization...");
+
+        try {
+          const originalBounds = {
+            width: mainFrame.width,
+            height: mainFrame.height,
+          };
+
+          const cleanupStats = await optimizeLayerTree(mainFrame, {
+            removeNonVisualWrappers: true,
+            mergeAdjacentRectangles: true,
+            mergeConsecutiveText: true,
+            flattenUnnecessaryNesting: true,
+            maxNestingDepth: 10,
+          });
+
+          console.log("[CLEANUP] Layer cleanup complete:", {
+            originalLayerCount: cleanupStats.originalLayerCount,
+            finalLayerCount: cleanupStats.finalLayerCount,
+            reduction:
+              cleanupStats.originalLayerCount - cleanupStats.finalLayerCount,
+            reductionPercent: Math.round(
+              ((cleanupStats.originalLayerCount -
+                cleanupStats.finalLayerCount) /
+                cleanupStats.originalLayerCount) *
+                100,
+            ),
+            wrappersRemoved: cleanupStats.wrappersRemoved,
+            rectanglesMerged: cleanupStats.rectanglesMerged,
+            textNodesMerged: cleanupStats.textNodesMerged,
+            layersFlattened: cleanupStats.layersFlattened,
+          });
+
+          // Validate cleanup didn't break visual correctness
+          const validation = validateCleanup(originalBounds, mainFrame);
+          if (!validation.valid) {
+            console.warn(
+              "[CLEANUP] Validation warnings (non-critical):",
+              validation.errors,
+            );
+          } else {
+            console.log(
+              "[CLEANUP] Validation passed - visual integrity preserved",
+            );
+          }
+
+          // Track cleanup stats in diagnostics
+          this.diagnosticCollector.addMetric("layerCleanup", {
+            originalLayerCount: cleanupStats.originalLayerCount,
+            finalLayerCount: cleanupStats.finalLayerCount,
+            wrappersRemoved: cleanupStats.wrappersRemoved,
+            rectanglesMerged: cleanupStats.rectanglesMerged,
+            textNodesMerged: cleanupStats.textNodesMerged,
+            layersFlattened: cleanupStats.layersFlattened,
+            validationPassed: validation.valid,
+          });
+        } catch (cleanupError) {
+          console.error("[CLEANUP] Error during layer cleanup:", cleanupError);
+          // Continue with non-optimized tree on error
+        }
+
+        this.checkTimeout();
+      }
+
       // PHASE 7: Generate Build Validation Report
       this.generateValidationReport();
 
@@ -1203,24 +1419,24 @@ ${
 
       const figmaValidation = treeValidator.validateFigmaTree(
         mainFrame,
-        this.data.root || this.data.tree
+        this.data.root || this.data.tree,
       );
 
       if (!figmaValidation.isValid) {
         console.error(
           "❌ [TREE VALIDATION] Figma tree structure doesn't match schema:",
-          figmaValidation
+          figmaValidation,
         );
       } else {
         console.log(
           "✅ [TREE VALIDATION] Figma tree structure matches schema -",
-          figmaValidation.summary
+          figmaValidation.summary,
         );
       }
 
       // Export tree structure for external analysis
       const treeStructure = treeValidator.exportTreeStructure(
-        this.data.root || this.data.tree
+        this.data.root || this.data.tree,
       );
       console.log("📤 [TREE EXPORT] Tree structure available for inspection");
       console.log("📊 [TREE DIAGRAM] Figma tree structure:");
@@ -1253,7 +1469,7 @@ ${
       console.error("❌ [IMPORT] Stack:", stackTrace);
       console.error(
         "❌ [IMPORT] Nodes created before failure:",
-        this.createdNodes.size
+        this.createdNodes.size,
       );
       console.error("❌ [IMPORT] Failed nodes:", this.failedNodes.length);
 
@@ -1274,7 +1490,7 @@ ${
 
     if ("children" in node) {
       tree.children = (node as FrameNode).children.map((child) =>
-        this.buildFigmaTreeForDiagram(child)
+        this.buildFigmaTreeForDiagram(child),
       );
     }
 
@@ -1293,34 +1509,34 @@ ${
       this._logged90Timeout = true;
       console.warn(
         `⚠️ [TIMEOUT] 90% of timeout used: ${Math.round(
-          elapsed / 1000
-        )}s / ${Math.round(this.options.maxImportDuration / 1000)}s`
+          elapsed / 1000,
+        )}s / ${Math.round(this.options.maxImportDuration / 1000)}s`,
       );
       console.warn(
-        `⚠️ [TIMEOUT] ${this.processedNodeCount} nodes processed so far`
+        `⚠️ [TIMEOUT] ${this.processedNodeCount} nodes processed so far`,
       );
     } else if (percentUsed >= 75 && !this._logged75Timeout) {
       this._logged75Timeout = true;
       console.warn(
         `⚠️ [TIMEOUT] 75% of timeout used: ${Math.round(
-          elapsed / 1000
-        )}s / ${Math.round(this.options.maxImportDuration / 1000)}s`
+          elapsed / 1000,
+        )}s / ${Math.round(this.options.maxImportDuration / 1000)}s`,
       );
     } else if (percentUsed >= 50 && !this._logged50Timeout) {
       this._logged50Timeout = true;
       console.log(
         `ℹ️ [TIMEOUT] 50% of timeout used: ${Math.round(
-          elapsed / 1000
-        )}s / ${Math.round(this.options.maxImportDuration / 1000)}s`
+          elapsed / 1000,
+        )}s / ${Math.round(this.options.maxImportDuration / 1000)}s`,
       );
     }
 
     if (elapsed > this.options.maxImportDuration) {
       console.error(
-        `❌ [TIMEOUT] Import timeout exceeded after processing ${this.processedNodeCount} nodes`
+        `❌ [TIMEOUT] Import timeout exceeded after processing ${this.processedNodeCount} nodes`,
       );
       throw new Error(
-        `Import timeout exceeded: ${elapsed}ms > ${this.options.maxImportDuration}ms (${this.processedNodeCount} nodes processed)`
+        `Import timeout exceeded: ${elapsed}ms > ${this.options.maxImportDuration}ms (${this.processedNodeCount} nodes processed)`,
       );
     }
   }
@@ -1338,7 +1554,7 @@ ${
    * PHASE 1 OPTIMIZATION: Pre-load fonts with smart fallback and caching
    */
   private async preloadFontsWithSmartFallback(
-    requiredFonts: Set<string>
+    requiredFonts: Set<string>,
   ): Promise<Map<string, FontName>> {
     const fontMap = new Map<string, FontName>();
     const fontPromises: Array<
@@ -1363,7 +1579,7 @@ ${
           // Use NodeBuilder's font loading with fallbacks
           const loaded = await this.nodeBuilder.loadFontWithFallbacks(
             font.family,
-            font.style
+            font.style,
           );
           return { fontKey, loaded };
         } catch (error) {
@@ -1396,14 +1612,14 @@ ${
     console.log(`📝 Attempting to load ${requiredFonts.length} fonts`);
 
     const results = await Promise.allSettled(
-      requiredFonts.map((font) => this.loadFontWithValidation(font))
+      requiredFonts.map((font) => this.loadFontWithValidation(font)),
     );
 
     const successful = results.filter((r) => r.status === "fulfilled").length;
     const failed = results.filter((r) => r.status === "rejected").length;
 
     console.log(
-      `✅ Font loading complete: ${successful} succeeded, ${failed} failed`
+      `✅ Font loading complete: ${successful} succeeded, ${failed} failed`,
     );
 
     // Always ensure fallback font is loaded
@@ -1499,7 +1715,7 @@ ${
 
     if (Array.isArray(node.children)) {
       node.children.forEach((child: any) =>
-        this.extractFontsFromTree(child, fonts)
+        this.extractFontsFromTree(child, fonts),
       );
     }
   }
@@ -1530,7 +1746,7 @@ ${
         viewport.layoutViewportWidth ||
         viewport.width ||
         this.data.root?.layout?.width,
-      1440
+      1440,
     );
 
     const viewportHeight = ValidationUtils.safeParseFloat(
@@ -1539,12 +1755,12 @@ ${
         viewport.scrollHeight ||
         viewport.layoutViewportHeight ||
         viewport.height,
-      900
+      900,
     );
 
     const treeHeight = ValidationUtils.safeParseFloat(
       this.data.root?.layout?.height,
-      0
+      0,
     );
 
     const scrollHeight = Math.max(viewportHeight, treeHeight);
@@ -1587,23 +1803,23 @@ ${
         };
         console.log(
           `🎨 [BACKGROUND] Using document background color: ${documentBgColor} → RGB(${Math.round(
-            parsedColor.r * 255
+            parsedColor.r * 255,
           )}, ${Math.round(parsedColor.g * 255)}, ${Math.round(
-            parsedColor.b * 255
-          )})`
+            parsedColor.b * 255,
+          )})`,
         );
       } else {
         // Fallback to white if parsing fails
         mainFrameFill = { type: "SOLID", color: { r: 1, g: 1, b: 1 } };
         console.warn(
-          `⚠️ [BACKGROUND] Failed to parse document background color: ${documentBgColor}. Using white fallback.`
+          `⚠️ [BACKGROUND] Failed to parse document background color: ${documentBgColor}. Using white fallback.`,
         );
       }
     } else {
       // Default to white if no background color is specified
       mainFrameFill = { type: "SOLID", color: { r: 1, g: 1, b: 1 } };
       console.log(
-        `🎨 [BACKGROUND] No document background color found. Using white default.`
+        `🎨 [BACKGROUND] No document background color found. Using white default.`,
       );
     }
 
@@ -1616,6 +1832,10 @@ ${
     this.safeSetPluginData(frame, "absoluteY", "0");
 
     console.log(`📐 Main frame created: ${finalWidth}×${finalHeight}`);
+    console.log(`📐 [FRAME-DEBUG] Frame position: x=${frame.x}, y=${frame.y}`);
+    console.log(
+      `📐 [FRAME-DEBUG] Input dimensions: viewportHeight=${viewportHeight}, treeHeight=${treeHeight}, scrollHeight=${scrollHeight}`,
+    );
 
     // Track main frame in diagnostics
     this.diagnosticCollector.initNode("main-frame");
@@ -1627,11 +1847,11 @@ ${
 
   private getNextImportPosition(
     width: number,
-    height: number
+    height: number,
   ): { x: number; y: number } {
     const siblings = figma.currentPage.children.filter(
       (n) =>
-        n.type === "FRAME" || n.type === "COMPONENT" || n.type === "INSTANCE"
+        n.type === "FRAME" || n.type === "COMPONENT" || n.type === "INSTANCE",
     ) as Array<FrameNode | ComponentNode | InstanceNode>;
 
     if (siblings.length === 0) {
@@ -1659,7 +1879,7 @@ ${
    */
   private collectInteractiveElements(
     node: any,
-    interactiveElements: any[] = []
+    interactiveElements: any[] = [],
   ): void {
     if (!node) return;
 
@@ -1680,7 +1900,7 @@ ${
    * Create a second frame with all interactive elements for prototyping
    */
   private async createInteractivePrototypeFrame(
-    mainFrame: FrameNode
+    mainFrame: FrameNode,
   ): Promise<FrameNode | null> {
     if (!this.data.root) return null;
 
@@ -1694,7 +1914,7 @@ ${
     }
 
     console.log(
-      `🎯 Found ${interactiveElements.length} interactive elements for prototype frame`
+      `🎯 Found ${interactiveElements.length} interactive elements for prototype frame`,
     );
 
     // Create the interactive frame
@@ -1773,19 +1993,20 @@ ${
 
           const elementNode = await this.createSingleNodeRobust(
             isolatedElementData,
-            sectionFrame
+            sectionFrame,
+            { x: 0, y: 0 },
           );
           if (elementNode) {
             // Store original element ID for prototype connections
             this.safeSetPluginData(
               elementNode,
               "originalElementId",
-              elementData.id
+              elementData.id,
             );
             this.safeSetPluginData(
               elementNode,
               "interactionType",
-              elementData.interactionType || "interactive"
+              elementData.interactionType || "interactive",
             );
 
             // Add label showing what type of interaction this is
@@ -1803,7 +2024,7 @@ ${
         } catch (error) {
           console.warn(
             `⚠️ Failed to create interactive element ${elementData.id}:`,
-            error
+            error,
           );
         }
       }
@@ -1819,7 +2040,7 @@ ${
       // Add to the same page as main frame
       mainFrame.parent?.appendChild(interactiveFrame);
       console.log(
-        `✅ Created interactive prototype frame with ${interactiveElements.length} elements`
+        `✅ Created interactive prototype frame with ${interactiveElements.length} elements`,
       );
       return interactiveFrame;
     } else {
@@ -1833,7 +2054,7 @@ ${
    */
   private async setupPrototypeConnections(
     mainFrame: FrameNode,
-    interactiveFrame: FrameNode
+    interactiveFrame: FrameNode,
   ): Promise<void> {
     if (!mainFrame || !interactiveFrame) return;
 
@@ -1875,7 +2096,7 @@ ${
     const interactiveFrameNodes = findInteractiveNodes(interactiveFrame);
 
     console.log(
-      `🔗 Setting up prototype connections: ${mainInteractiveNodes.length} nodes in main frame, ${interactiveFrameNodes.length} in interactive frame`
+      `🔗 Setting up prototype connections: ${mainInteractiveNodes.length} nodes in main frame, ${interactiveFrameNodes.length} in interactive frame`,
     );
 
     // Create prototype connections
@@ -1894,7 +2115,7 @@ ${
           // Try to find by original element ID
           for (const interactiveNode of interactiveFrameNodes) {
             const interactiveId = (interactiveNode as any).getPluginData?.(
-              "originalElementId"
+              "originalElementId",
             );
             if (interactiveId === mainNodeId) {
               targetNode = interactiveNode;
@@ -1923,7 +2144,7 @@ ${
         this.safeSetPluginData(
           mainNode as SceneNode,
           "prototypeTarget",
-          targetNode.id
+          targetNode.id,
         );
         this.safeSetPluginData(
           mainNode as SceneNode,
@@ -1932,7 +2153,7 @@ ${
             type: "INSTANT",
             duration: 0,
             easing: { type: "EASE_IN_OUT" },
-          })
+          }),
         );
 
         // Set actual prototype connection using Figma API
@@ -1948,7 +2169,7 @@ ${
             // For non-frame nodes, we'll store the connection info in plugin data
             // Users can manually set up connections in Figma's prototype mode
             console.log(
-              `ℹ️ Node ${mainNode.name} is not a frame/component, storing prototype info in plugin data`
+              `ℹ️ Node ${mainNode.name} is not a frame/component, storing prototype info in plugin data`,
             );
           } else {
             // Set prototype connection for frames/components
@@ -1966,7 +2187,7 @@ ${
                 ],
               });
               console.log(
-                `✅ Set prototype connection from ${mainNode.name} to ${targetNode.name}`
+                `✅ Set prototype connection from ${mainNode.name} to ${targetNode.name}`,
               );
             }
           }
@@ -1974,7 +2195,7 @@ ${
           // If setPrototypeData fails, the plugin data will still be available
           console.warn(
             `⚠️ Could not set prototype data directly, stored in plugin data instead:`,
-            error
+            error,
           );
         }
 
@@ -1982,7 +2203,7 @@ ${
       } catch (error) {
         console.warn(
           `⚠️ Failed to set prototype connection for ${mainNode.name}:`,
-          error
+          error,
         );
       }
     }
@@ -1998,7 +2219,7 @@ ${
           type: "INSTANT",
           duration: 0,
           easing: { type: "EASE_IN_OUT" },
-        })
+        }),
       );
 
       // Set actual prototype connection from interactive frame back to main frame
@@ -2021,13 +2242,13 @@ ${
       } catch (error) {
         console.warn(
           "⚠️ Could not set prototype connection from interactive frame:",
-          error
+          error,
         );
       }
     } catch (error) {
       console.warn(
         "⚠️ Failed to set prototype connection from interactive frame:",
-        error
+        error,
       );
     }
   }
@@ -2039,7 +2260,7 @@ ${
   private async processChunkedImport(
     rootNode: ElementNode,
     parentFrame: FrameNode,
-    analysis: any
+    analysis: any,
   ): Promise<void> {
     console.log("🪓 [CHUNKER] Starting chunked import process");
 
@@ -2050,7 +2271,7 @@ ${
     });
 
     console.log(
-      `🪓 [CHUNKER] Created ${chunks.length} chunks from ${analysis.totalNodes} total nodes`
+      `🪓 [CHUNKER] Created ${chunks.length} chunks from ${analysis.totalNodes} total nodes`,
     );
 
     // Create a parent frame to hold all chunk frames
@@ -2073,14 +2294,14 @@ ${
       console.log(
         `🪓 [CHUNKER] Processing chunk ${i + 1}/${chunks.length} (${
           chunk.nodeCount
-        } nodes)`
+        } nodes)`,
       );
 
       this.postProgress(
         `Processing chunk ${i + 1}/${chunks.length} (${
           chunk.nodeCount
         } nodes)...`,
-        15 + (i / chunks.length) * 70
+        15 + (i / chunks.length) * 70,
       );
 
       // Create a frame for this chunk
@@ -2139,6 +2360,100 @@ ${
   }
 
   /**
+   * COORDINATE FIX: Find minimum x/y bounds across entire tree
+   * Captured coordinates are PAGE_ABSOLUTE_CSS_PX, we need to normalize to (0,0)
+   */
+  private findMinimumBounds(node: any): { x: number; y: number } {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let sampleNodes: Array<{ name: string; x: number; y: number }> = [];
+    let negativeNodes: Array<{ name: string; x: number; y: number }> = [];
+
+    const traverse = (n: any, depth: number = 0) => {
+      if (!n) return;
+
+      // Check this node's layout
+      if (n.layout) {
+        const x = typeof n.layout.x === "number" ? n.layout.x : Infinity;
+        const y = typeof n.layout.y === "number" ? n.layout.y : Infinity;
+
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          // FIX: Only consider elements with non-negative coordinates for minBounds
+          // Elements with negative Y are typically off-screen overlays, transforms,
+          // or pseudo-elements that shouldn't shift the entire page layout
+          if (y >= 0 && x >= -50) {
+            // Allow small negative X (for shadows/transforms) but not large negative
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+          } else {
+            // Track excluded nodes for diagnostics
+            if (negativeNodes.length < 5) {
+              negativeNodes.push({
+                name: n.name || n.htmlTag || n.type || "unknown",
+                x,
+                y,
+              });
+            }
+          }
+
+          if (y > maxY) maxY = y;
+
+          // Collect first 10 valid nodes for diagnostic
+          if (sampleNodes.length < 10 && y >= 0) {
+            sampleNodes.push({
+              name: n.name || n.htmlTag || n.type || "unknown",
+              x,
+              y,
+            });
+          }
+        }
+      }
+
+      // Recurse through children
+      if (n.children && Array.isArray(n.children)) {
+        for (const child of n.children) {
+          traverse(child, depth + 1);
+        }
+      }
+    };
+
+    traverse(node);
+
+    // If no valid bounds found, default to 0
+    if (!Number.isFinite(minX)) minX = 0;
+    if (!Number.isFinite(minY)) minY = 0;
+    if (!Number.isFinite(maxY)) maxY = 0;
+
+    // Clamp minX to 0 to avoid shifting content left
+    if (minX < 0) {
+      console.log(`⚠️ [BOUNDS] Clamping minX from ${minX} to 0`);
+      minX = 0;
+    }
+
+    // DIAGNOSTIC: Log findings
+    console.log("🔍 [BOUNDS-DIAGNOSTIC] Sample node coordinates (y >= 0):");
+    sampleNodes.forEach((n, i) => {
+      console.log(`   ${i}: "${n.name}" at (${n.x}, ${n.y})`);
+    });
+    console.log(`🔍 [BOUNDS-DIAGNOSTIC] Y range: min=${minY}, max=${maxY}`);
+
+    // Log excluded negative coordinate nodes
+    if (negativeNodes.length > 0) {
+      console.log(
+        `⚠️ [BOUNDS-DIAGNOSTIC] Excluded ${negativeNodes.length} nodes with negative coords:`,
+      );
+      negativeNodes.forEach((n) => {
+        console.log(
+          `   ❌ "${n.name}" at (${n.x}, ${n.y}) - excluded from offset calc`,
+        );
+      });
+    }
+
+    return { x: minX, y: minY };
+  }
+
+  /**
    * Process nodes for a single chunk.
    * This is a simplified version of processNodesWithBatchingRobust.
    */
@@ -2148,38 +2463,79 @@ ${
    */
   private async processChunkNodes(
     chunkRoot: ElementNode,
-    chunkFrame: FrameNode
+    chunkFrame: FrameNode,
   ): Promise<void> {
-    // Stack for iterative traversal: [NodeData, ParentFigmaNode]
-    const stack: { data: any; parent: FrameNode | SceneNode }[] = [];
+    // Stack for iterative traversal: [NodeData, ParentFigmaNode, AbsoluteOffset]
+    const stack: {
+      data: any;
+      parent: FrameNode | SceneNode;
+      absoluteOffset: { x: number; y: number };
+    }[] = [];
 
     // Initial population
     if (chunkRoot.children && Array.isArray(chunkRoot.children)) {
+      // COORDINATE FIX: Use the already-calculated coordinateOffset from processNodesWithBatchingRobust
+      // This offset normalizes PAGE_ABSOLUTE_CSS_PX coordinates to start at (0,0)
+      console.log(
+        `🔧 [CHUNKER] Using global coordinate offset: x=${this.coordinateOffset.x}, y=${this.coordinateOffset.y}`,
+      );
+
+      // Chunk frame position (usually 0,0 for first chunk)
+      const chunkAbsX = chunkFrame.x || 0;
+      const chunkAbsY = chunkFrame.y || 0;
+
+      // Apply the global coordinate offset to the chunk frame position
+      const normalizedOffsetX = chunkAbsX + this.coordinateOffset.x;
+      const normalizedOffsetY = chunkAbsY + this.coordinateOffset.y;
+
+      console.log(
+        `🔧 [CHUNKER] Chunk absoluteOffset: x=${normalizedOffsetX}, y=${normalizedOffsetY}`,
+      );
+
       // Push in reverse order so first child is processed first
       for (let i = chunkRoot.children.length - 1; i >= 0; i--) {
-        stack.push({ data: chunkRoot.children[i], parent: chunkFrame });
+        stack.push({
+          data: chunkRoot.children[i],
+          parent: chunkFrame,
+          absoluteOffset: { x: normalizedOffsetX, y: normalizedOffsetY },
+        });
       }
     }
 
     let nodesProcessed = 0;
-    const TOTAL_NODES_PER_YIELD = 20;
+    // MEMORY SAFETY: Extremely aggressive throttling for large schemas (14MB+)
+    // Yield every 5 nodes to prevent WASM sandbox OOM on 10k+ node imports
+    const TOTAL_NODES_PER_YIELD = 5;
 
     while (stack.length > 0) {
-      const { data, parent } = stack.pop()!;
+      const { data, parent, absoluteOffset } = stack.pop()!;
 
       try {
         // Create the node
-        const createdNode = await this.nodeBuilder.createNode(data);
+        // ROOT CAUSE FIX: Use manual coordinate propagation instead of
+        // unreliable parent.absoluteRenderBounds (which is async and often null).
+        const createdNode = await this.nodeBuilder.createNode(
+          data,
+          absoluteOffset,
+        );
 
         if (createdNode) {
           // Append to parent
           if (parent && "appendChild" in parent) {
             try {
-              (parent as any).appendChild(createdNode);
+              // CRITICAL FIX: Use insertChildByZIndex to respect CSS stacking order
+              if ("children" in parent) {
+                this.nodeBuilder.insertChildByZIndex(
+                  parent as BaseNode & ChildrenMixin,
+                  createdNode,
+                );
+              } else {
+                (parent as any).appendChild(createdNode);
+              }
             } catch (appendError) {
               console.warn(
                 `⚠️ [CHUNKER] Child append failed for ${data.type} -> ${parent.type}:`,
-                appendError
+                appendError,
               );
             }
           }
@@ -2193,10 +2549,16 @@ ${
             data.children &&
             Array.isArray(data.children)
           ) {
+            // Calculate absolute position for children
+            // Need to handle both regular and Auto Layout cases
+            const currentAbsX = absoluteOffset.x + (createdNode.x || 0);
+            const currentAbsY = absoluteOffset.y + (createdNode.y || 0);
+
             for (let i = data.children.length - 1; i >= 0; i--) {
               stack.push({
                 data: data.children[i],
                 parent: createdNode as FrameNode,
+                absoluteOffset: { x: currentAbsX, y: currentAbsY },
               });
             }
           }
@@ -2208,13 +2570,16 @@ ${
 
       nodesProcessed++;
       if (nodesProcessed % TOTAL_NODES_PER_YIELD === 0) {
+        // MEMORY SAFETY: Extended yield to allow Figma's GC to run
+        // For large imports, this prevents the WASM memory from spiking
+        await new Promise((resolve) => setTimeout(resolve, 1));
         await yieldToMain();
       }
     }
   }
 
   private async processNodesWithBatchingRobust(
-    parentFrame: FrameNode
+    parentFrame: FrameNode,
   ): Promise<void> {
     // 🚨 EMERGENCY DIAGNOSTIC LOGGING - Capture complete schema structure
     console.log("\n" + "=".repeat(80));
@@ -2242,7 +2607,7 @@ ${
         "  .children type:",
         Array.isArray(this.data.root.children)
           ? "Array"
-          : typeof this.data.root.children
+          : typeof this.data.root.children,
       );
       console.log("  .children length:", this.data.root.children?.length);
       if (this.data.root.children?.length > 0) {
@@ -2280,7 +2645,7 @@ ${
     // BACKWARDS COMPATIBILITY: Support both schema v2 (root) and v1 (tree)
     if (!this.data.root && !this.data.tree) {
       throw new Error(
-        "No root data available (expected 'root' or 'tree' field in schema)"
+        "No root data available (expected 'root' or 'tree' field in schema)",
       );
     }
 
@@ -2291,8 +2656,8 @@ ${
       throw new Error(
         `CRITICAL: No root node found in schema. ` +
           `Expected 'root' (schema v2) or 'tree' (schema v1), but got: ${Object.keys(
-            this.data || {}
-          )}`
+            this.data || {},
+          )}`,
       );
     }
 
@@ -2312,7 +2677,7 @@ ${
     perfTracker.endPhase(PerfPhase.SCHEMA_ANALYSIS);
     perfTracker.updateStats({ totalNodes: analysis.totalNodes });
     console.log(
-      `🌳 Schema Analysis: ${analysis.totalNodes} nodes, ${analysis.requiredFonts.size} fonts, ${analysis.imageHashes.size} images, depth: ${analysis.depth}`
+      `🌳 Schema Analysis: ${analysis.totalNodes} nodes, ${analysis.requiredFonts.size} fonts, ${analysis.imageHashes.size} images, depth: ${analysis.depth}`,
     );
 
     // CRITICAL CHECK: If analysis found 0 nodes, something is wrong
@@ -2330,7 +2695,7 @@ ${
       });
 
       console.warn(
-        "⚠️ Proceeding with 0 nodes - this will likely result in blank frame"
+        "⚠️ Proceeding with 0 nodes - this will likely result in blank frame",
       );
     }
 
@@ -2355,15 +2720,15 @@ ${
     // Only run when Auto Layout is enabled; pixel-perfect mode must preserve original geometry.
     if (this.options.applyAutoLayout !== false) {
       console.log(
-        "🏗️ [PROFESSIONAL LAYOUT] Preparing layout schema with professional intelligence..."
+        "🏗️ [PROFESSIONAL LAYOUT] Preparing layout schema with professional intelligence...",
       );
       prepareLayoutSchema(this.data);
       console.log(
-        "✅ [PROFESSIONAL LAYOUT] Layout schema prepared with professional-grade analysis"
+        "✅ [PROFESSIONAL LAYOUT] Layout schema prepared with professional-grade analysis",
       );
     } else {
       console.log(
-        "🧷 [PROFESSIONAL LAYOUT] Skipping prepareLayoutSchema() (Auto Layout disabled)"
+        "🧷 [PROFESSIONAL LAYOUT] Skipping prepareLayoutSchema() (Auto Layout disabled)",
       );
     }
     perfTracker.endPhase(PerfPhase.SCHEMA_PREPROCESSING);
@@ -2376,7 +2741,7 @@ ${
     this.postProgress(`Pre-loading ${analysis.requiredFonts.size} fonts...`, 6);
     perfTracker.startPhase(PerfPhase.FONT_PRELOAD);
     const fontMap = await this.preloadFontsWithSmartFallback(
-      analysis.requiredFonts
+      analysis.requiredFonts,
     );
     perfTracker.endPhase(PerfPhase.FONT_PRELOAD);
     perfTracker.updateStats({ fontsLoaded: fontMap.size });
@@ -2386,10 +2751,13 @@ ${
     if (analysis.imageHashes.size > 0) {
       this.postProgress(
         `Pre-resolving ${analysis.imageHashes.size} images...`,
-        8
+        8,
       );
       perfTracker.startPhase(PerfPhase.IMAGE_PRELOAD);
-      const imageMap = await this.preResolveImages(analysis.imageHashes);
+      const imageMap = await this.preResolveImages(
+        analysis.imageHashes,
+        analysis.totalNodes,
+      );
       perfTracker.endPhase(PerfPhase.IMAGE_PRELOAD);
       perfTracker.updateStats({ imagesLoaded: imageMap.size });
       console.log(`✅ Pre-resolved ${imageMap.size} images`);
@@ -2405,15 +2773,15 @@ ${
 
     // Log analysis stats
     console.log(
-      `📊 [ANALYSIS] Total nodes: ${analysis.totalNodes}, Chunking threshold: ${CHUNKING_THRESHOLD}`
+      `📊 [ANALYSIS] Total nodes: ${analysis.totalNodes}, Chunking threshold: ${CHUNKING_THRESHOLD}`,
     );
 
     if (needsChunking) {
       console.log(
-        `🪓 [CHUNKER] Large import detected (${analysis.totalNodes} nodes > ${CHUNKING_THRESHOLD} threshold)`
+        `🪓 [CHUNKER] Large import detected (${analysis.totalNodes} nodes > ${CHUNKING_THRESHOLD} threshold)`,
       );
       console.log(
-        "🪓 [CHUNKER] Enabling chunked import to prevent WASM memory exhaustion"
+        "🪓 [CHUNKER] Enabling chunked import to prevent WASM memory exhaustion",
       );
 
       try {
@@ -2447,7 +2815,7 @@ ${
 
         if (inferenceTime > INFERENCE_TIMEOUT) {
           console.warn(
-            `⚠️ [HIERARCHY] Inference took ${inferenceTime}ms (exceeded ${INFERENCE_TIMEOUT}ms threshold), using original tree for performance`
+            `⚠️ [HIERARCHY] Inference took ${inferenceTime}ms (exceeded ${INFERENCE_TIMEOUT}ms threshold), using original tree for performance`,
           );
           treeToBuild = this.data.root;
         } else {
@@ -2459,7 +2827,7 @@ ${
           // Generate and print quality report
           const report = generateTreeQualityReport(
             inferredTree,
-            analysis.totalNodes
+            analysis.totalNodes,
           );
           printTreeQualityReport(report);
 
@@ -2468,23 +2836,23 @@ ${
             const debugArtifact = exportDebugArtifact(inferredTree, report);
             console.log(
               "📊 [HIERARCHY] Debug artifact (first 1000 chars):",
-              debugArtifact.substring(0, 1000)
+              debugArtifact.substring(0, 1000),
             );
             // Store in plugin data for potential download
             figma.root.setPluginData(
               "hierarchy-inference-debug",
-              debugArtifact
+              debugArtifact,
             );
           }
 
           console.log(
-            `✅ [HIERARCHY] Hierarchy inference complete (${inferenceTime}ms)`
+            `✅ [HIERARCHY] Hierarchy inference complete (${inferenceTime}ms)`,
           );
         }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         console.error(
-          `❌ [HIERARCHY] Hierarchy inference failed, falling back to original tree: ${errorMsg}`
+          `❌ [HIERARCHY] Hierarchy inference failed, falling back to original tree: ${errorMsg}`,
         );
         if (error instanceof Error && error.stack) {
           console.error("Stack trace:", error.stack);
@@ -2494,140 +2862,12 @@ ${
       }
     } else {
       console.log(
-        "⏭️ [HIERARCHY] Hierarchy inference disabled (useHierarchyInference=false)"
+        "⏭️ [HIERARCHY] Hierarchy inference disabled (useHierarchyInference=false)",
       );
     }
 
     // Build node hierarchy with error tracking and PARALLEL processing
     this.processedNodeCount = 0;
-
-    const buildHierarchy = async (
-      nodeData: any,
-      parent: FrameNode | SceneNode,
-      options: { batchSize?: number } = {}
-    ): Promise<SceneNode | null> => {
-      const batchSize = options.batchSize || 100; // Increased from 50 for faster import of large pages
-
-      // Validate node data
-      // CRITICAL FIX: Bypass strict validation to ensure SOMETHING is created
-      // const validated = ValidationUtils.validateNodeData(nodeData);
-      const validated = nodeData; // FORCE BYPASS
-
-      if (!validated) {
-        this.recordFailedNode(
-          nodeData,
-          "Validation failed (ValidationUtils)", // Modified msg
-          null,
-          NodeFailureReason.FAIL_VALIDATION
-        );
-        return null;
-      }
-
-      try {
-        console.log(
-          `🔨 [BUILD] Creating node ${validated.id} (${
-            validated.type
-          }) - Parent: ${parent?.name || "root"}`
-        );
-        // Note: Per-node agent logging disabled for performance (was causing 10,000+ HTTP requests)
-        const figmaNode = await this.createSingleNodeRobust(
-          validated,
-          parent as FrameNode
-        );
-
-        if (!figmaNode) {
-          console.error(
-            `❌ [BUILD] Failed to create node ${validated.id} (returned null)`
-          );
-          this.recordFailedNode(
-            validated,
-            "Node creation returned null",
-            null,
-            NodeFailureReason.FAIL_NODE_CREATION_NULL
-          );
-          return null;
-        }
-        // Note: Per-node agent logging disabled for performance
-
-        this.createdNodes.set(validated.id, figmaNode);
-        hierarchyValidator.registerFigmaNode(validated.id, figmaNode);
-        this.verificationData.push({
-          elementId: validated.id,
-          originalData: validated,
-          figmaNode,
-        });
-
-        this.processedNodeCount++;
-        perfTracker.incrementStat("nodesCreated");
-
-        const progress =
-          10 + (this.processedNodeCount / analysis.totalNodes) * 70;
-
-        // Enhanced granular progress: update every 10 nodes
-        if (this.processedNodeCount % 10 === 0) {
-          const currentNodeDesc = `${validated.name || "Element"} (${
-            validated.type
-          })`;
-          this.postProgress(
-            `Building: ${currentNodeDesc} (${this.processedNodeCount}/${analysis.totalNodes})`,
-            progress
-          );
-          // Yield to keep Figma responsive during large imports
-          await yieldToMain();
-        }
-
-        // Process pseudo-elements and children in correct paint order.
-        // CSS: ::before paints before the element's children; ::after paints after.
-        if (validated.pseudoElements?.before) {
-          await buildHierarchy(
-            validated.pseudoElements.before,
-            figmaNode,
-            options
-          );
-        }
-
-        // PHASE 1 OPTIMIZATION: Process children in PARALLEL batches instead of sequentially
-        // CRITICAL FIX: Use DOM order for processing to ensure correct Auto Layout stacking.
-        // Previous sorting by Z-Index/Stacking Context caused positioned elements (like headers)
-        // to be appended last, appearing at the bottom of Auto Layout frames.
-        if (validated.children && Array.isArray(validated.children)) {
-          const sortedChildren = validated.children; // Maintain DOM order
-
-          // DETERMINISTIC PAINT ORDER: Process children SEQUENTIALLY to preserve DOM order
-          // CRITICAL: Parallel processing can reorder siblings, causing z-order issues
-          // ("blank frames covering content", wrong stacking)
-          for (const child of sortedChildren) {
-            try {
-              await buildHierarchy(child, figmaNode, options);
-            } catch (error) {
-              console.warn(
-                `⚠️ Failed to build child node: ${child.name || child.id}`,
-                error
-              );
-              // Continue with next child even if one fails
-            }
-          }
-        }
-
-        if (validated.pseudoElements?.after) {
-          await buildHierarchy(
-            validated.pseudoElements.after,
-            figmaNode,
-            options
-          );
-        }
-
-        return figmaNode;
-      } catch (error) {
-        this.recordFailedNode(
-          validated,
-          error instanceof Error ? error.message : "Unknown error",
-          error instanceof Error ? error.stack : undefined,
-          NodeFailureReason.FAIL_UNKNOWN_EXCEPTION
-        );
-        return null;
-      }
-    };
 
     // Handle body node properly - support both html and body root tags
     // CRITICAL FIX: The schema may have either "html" or "body" as root
@@ -2635,10 +2875,16 @@ ${
     console.log(
       `[DEBUG] Building tree from root: ${
         treeToBuild.htmlTag || treeToBuild.type
-      }`
+      }`,
     );
 
-    const result = await buildHierarchy(treeToBuild, parentFrame);
+    const result = await this.buildHierarchyRobust(
+      treeToBuild,
+      parentFrame,
+      { x: 0, y: 0 },
+      analysis.totalNodes,
+      { isRoot: true },
+    );
 
     if (!result) {
       console.error(`❌ [CRITICAL] Failed to build root node:`, {
@@ -2655,13 +2901,66 @@ ${
       });
       // GRACEFUL FAILURE: Don't throw - allow partial imports to persist for validation
       console.warn(
-        `⚠️ [GRACEFUL] Continuing import despite root tree node failure`
+        `⚠️ [GRACEFUL] Continuing import despite root tree node failure`,
       );
     }
 
     console.log(
-      `✅ Node processing complete: ${this.processedNodeCount} created, ${this.failedNodes.length} failed`
+      `✅ Node processing complete: ${this.processedNodeCount} created, ${this.failedNodes.length} failed`,
     );
+
+    // DIAGNOSTIC: Print detailed node creation statistics
+    console.log("\n" + "=".repeat(80));
+    console.log("📊 [DIAGNOSTIC] NODE CREATION STATISTICS");
+    console.log("=".repeat(80));
+    console.log(`  Total Attempted:     ${this.nodeCreationStats.attempted}`);
+    console.log(`  Successfully Created: ${this.nodeCreationStats.created}`);
+    console.log(`  Failed:              ${this.nodeCreationStats.failed}`);
+    console.log(
+      `  Null Validation:     ${this.nodeCreationStats.nullValidation}`,
+    );
+    const successRate =
+      this.nodeCreationStats.attempted > 0
+        ? (
+            (this.nodeCreationStats.created /
+              this.nodeCreationStats.attempted) *
+            100
+          ).toFixed(1)
+        : 0;
+    console.log(`  Success Rate:        ${successRate}%`);
+
+    if (this.nodeCreationStats.byType.size > 0) {
+      console.log("\n  Breakdown by Type:");
+      const sortedTypes = Array.from(
+        this.nodeCreationStats.byType.entries(),
+      ).sort((a, b) => b[1].attempted - a[1].attempted);
+      for (const [type, stats] of sortedTypes) {
+        const typeSuccessRate =
+          stats.attempted > 0
+            ? ((stats.created / stats.attempted) * 100).toFixed(0)
+            : 0;
+        console.log(
+          `    ${type}: ${stats.created}/${stats.attempted} created (${typeSuccessRate}%), ${stats.failed} failed`,
+        );
+      }
+    }
+
+    if (
+      this.nodeCreationStats.created === 0 &&
+      this.nodeCreationStats.attempted > 0
+    ) {
+      console.error(
+        "🚨 [CRITICAL] ALL NODES FAILED TO CREATE! Check createSingleNodeRobust and NodeBuilder.createNode for errors.",
+      );
+    } else if (
+      this.nodeCreationStats.created <
+      this.nodeCreationStats.attempted * 0.5
+    ) {
+      console.warn(
+        `⚠️ [WARNING] Less than 50% of nodes were created successfully. This may explain missing content.`,
+      );
+    }
+    console.log("=".repeat(80) + "\n");
 
     /*
     // OLD COMPLEX LOGIC REMOVED FOR STABILITY
@@ -2688,11 +2987,11 @@ ${
         const b = bWrap.child;
         const zIndexA = ValidationUtils.safeParseFloat(
           a.zIndex || a.layoutContext?.zIndex,
-          0
+          0,
         );
         const zIndexB = ValidationUtils.safeParseFloat(
           b.zIndex || b.layoutContext?.zIndex,
-          0
+          0,
         );
 
         // RULE 6.1: Consider stacking context markers
@@ -2710,7 +3009,7 @@ ${
         const getWeight = (
           zIndex: number,
           isPositioned: boolean,
-          hasStacking: boolean
+          hasStacking: boolean,
         ) => {
           if (zIndex < 0) return zIndex;
           if (zIndex > 0) return zIndex;
@@ -2732,29 +3031,305 @@ ${
   // ROBUST NODE CREATION
   // ============================================================================
 
+  /**
+   * RECURSIVE HIERARCHY BUILDER
+   * Refactored out of processNodesWithBatchingRobust to resolve QuickJS InternalError.
+   * This class method avoids nested async closures which cause "unconsistent stack size" errors.
+   */
+  /**
+   * ITERATIVE HIERARCHY BUILDER (Robust Queue-Based)
+   * Refactored to use an iterative queue instead of recursion to prevent "QuickJS InternalError"
+   * and stack overflows on deep DOM trees (e.g. YouTube).
+   */
+  private async buildHierarchyRobust(
+    rootNodeData: any,
+    rootParent: FrameNode | SceneNode,
+    rootAbsoluteOffset: { x: number; y: number },
+    totalNodes: number,
+    options: { batchSize?: number; isRoot?: boolean } = {},
+  ): Promise<SceneNode | null> {
+    const batchSize = options.batchSize || 100;
+
+    // Queue for BFS/Iterative processing
+    // We use a queue to manage the nodes to create
+    interface QueueItem {
+      nodeData: any;
+      parent: FrameNode | SceneNode;
+      absoluteOffset: { x: number; y: number };
+      isRoot: boolean;
+    }
+
+    const queue: QueueItem[] = [
+      {
+        nodeData: rootNodeData,
+        parent: rootParent,
+        absoluteOffset: rootAbsoluteOffset,
+        isRoot: options.isRoot || false,
+      },
+    ];
+
+    let rootCreatedNode: SceneNode | null = null;
+    let isFirstItem = true;
+
+    // Process queue
+    while (queue.length > 0) {
+      const item = queue.shift(); // BFS (FIFO) - better for incremental visuals than DFS
+      if (!item) continue;
+
+      const { nodeData, parent, absoluteOffset, isRoot } = item;
+
+      // DIAGNOSTIC: Track attempted node creation
+      const nodeType = nodeData?.type || nodeData?.htmlTag || "UNKNOWN";
+      this.nodeCreationStats.attempted++;
+      if (!this.nodeCreationStats.byType.has(nodeType)) {
+        this.nodeCreationStats.byType.set(nodeType, {
+          attempted: 0,
+          created: 0,
+          failed: 0,
+        });
+      }
+      this.nodeCreationStats.byType.get(nodeType)!.attempted++;
+
+      // Validate node data
+      const validated = ValidationUtils.validateNodeData(nodeData);
+
+      if (!validated) {
+        this.nodeCreationStats.nullValidation++;
+        this.nodeCreationStats.failed++;
+        this.nodeCreationStats.byType.get(nodeType)!.failed++;
+        this.recordFailedNode(
+          nodeData,
+          "Validation failed (ValidationUtils)",
+          null,
+          NodeFailureReason.FAIL_VALIDATION,
+        );
+        continue;
+      }
+
+      // FIX 1: Display Contents Handling [REFINED]
+      // Elements with display: contents do not generate boxes, they should be flattened
+      // CRITICAL: NEVER flatten the root node
+      const display =
+        nodeData.layout?.display || nodeData.layoutContext?.display;
+      if (display === "contents" && !isRoot) {
+        // Check for visual properties that would be lost if flattened
+        const hasVisuals =
+          (nodeData.fills && nodeData.fills.length > 0) ||
+          (nodeData.strokes && nodeData.strokes.length > 0) ||
+          (nodeData.effects && nodeData.effects.length > 0) ||
+          (nodeData.opacity !== undefined && nodeData.opacity < 1);
+
+        if (hasVisuals) {
+          console.log(
+            `⚠️ [DISPLAY_CONTENTS] Skipping flatten for ${nodeData.name} due to visual properties`,
+          );
+          // Proceed to create node
+        } else {
+          console.log(
+            `✨ [DISPLAY_CONTENTS] Flattening ${nodeData.name} (passing children to ${parent.name})`,
+          );
+
+          // Add children to queue with CURRENT parent
+          if (nodeData.children && Array.isArray(nodeData.children)) {
+            // Preserve order
+            for (const child of nodeData.children) {
+              queue.push({
+                nodeData: child,
+                parent: parent,
+                absoluteOffset: absoluteOffset, // contents doesn't offset
+                isRoot: false,
+              });
+            }
+          }
+          continue; // Done with this node (flattened)
+        }
+      }
+
+      // FIX 2: Zero-Height Container Filtering [REFINED]
+      const width = nodeData.layout?.width ?? 0;
+      const height = nodeData.layout?.height ?? 0;
+      const isVisible = nodeData.visible !== false && nodeData.opacity !== 0;
+
+      if (
+        !isRoot &&
+        width <= 0 &&
+        height <= 0 &&
+        isVisible &&
+        (nodeData.type === "FRAME" ||
+          nodeData.type === "RECTANGLE" ||
+          !nodeData.type) &&
+        nodeData.htmlTag !== "body"
+      ) {
+        const hasPaint =
+          (nodeData.fills && nodeData.fills.length > 0) ||
+          (nodeData.strokes && nodeData.strokes.length > 0) ||
+          (nodeData.effects && nodeData.effects.length > 0);
+
+        const clipsContent =
+          nodeData.layoutContext?.overflow === "hidden" ||
+          nodeData.layoutContext?.overflow === "scroll";
+
+        if (!hasPaint && !clipsContent) {
+          // Log less frequently or only on debug
+          // console.log(`🗑️ [ZERO_DIM] Skipping...`);
+          this.recordFailedNode(
+            nodeData,
+            "Zero dimensions and no paint",
+            null,
+            NodeFailureReason.SKIP_HIDDEN,
+          );
+          continue;
+        }
+      }
+
+      try {
+        // Log sparingly for performance
+        // console.log(`🔨 [BUILD] Creating node ${validated.id}...`);
+
+        const figmaNode = await this.createSingleNodeRobust(
+          validated,
+          parent as FrameNode,
+          absoluteOffset,
+        );
+
+        if (!figmaNode) {
+          this.nodeCreationStats.failed++;
+          this.nodeCreationStats.byType.get(nodeType)!.failed++;
+          this.recordFailedNode(
+            validated,
+            "Node creation returned null",
+            null,
+            NodeFailureReason.FAIL_NODE_CREATION_NULL,
+          );
+          continue;
+        }
+
+        // Store root return value
+        if (isFirstItem) {
+          rootCreatedNode = figmaNode;
+          isFirstItem = false;
+        }
+
+        // Track successful creation
+        this.nodeCreationStats.created++;
+        this.nodeCreationStats.byType.get(nodeType)!.created++;
+
+        this.createdNodes.set(validated.id, figmaNode);
+        hierarchyValidator.registerFigmaNode(validated.id, figmaNode);
+        this.verificationData.push({
+          elementId: validated.id,
+          originalData: validated,
+          figmaNode,
+        });
+
+        this.processedNodeCount++;
+        perfTracker.incrementStat("nodesCreated");
+
+        const progress = 10 + (this.processedNodeCount / totalNodes) * 70;
+
+        // Yield and update progress occasionally
+        if (this.processedNodeCount % 10 === 0) {
+          const currentNodeDesc = `${validated.name || "Element"} (${validated.type})`;
+          this.postProgress(
+            `Building: ${currentNodeDesc} (${this.processedNodeCount}/${totalNodes})`,
+            progress,
+          );
+          await yieldToMain();
+        }
+
+        // Calculate new offset for children
+        const newOffset = {
+          x: absoluteOffset.x + (figmaNode.x || 0),
+          y: absoluteOffset.y + (figmaNode.y || 0),
+        };
+
+        // QUEUE CHILDREN (Processing Order)
+
+        // 1. Pseudo-elements BEFORE
+        if (validated.pseudoElements?.before) {
+          queue.push({
+            nodeData: validated.pseudoElements.before,
+            parent: figmaNode,
+            absoluteOffset: newOffset,
+            isRoot: false,
+          });
+        }
+
+        // 2. Children
+        if (validated.children && Array.isArray(validated.children)) {
+          // Add to queue in standard order
+          for (const child of validated.children) {
+            queue.push({
+              nodeData: child,
+              parent: figmaNode,
+              absoluteOffset: newOffset,
+              isRoot: false,
+            });
+          }
+        }
+
+        // 3. Pseudo-elements AFTER
+        if (validated.pseudoElements?.after) {
+          queue.push({
+            nodeData: validated.pseudoElements.after,
+            parent: figmaNode,
+            absoluteOffset: newOffset,
+            isRoot: false,
+          });
+        }
+      } catch (error) {
+        this.recordFailedNode(
+          validated,
+          error instanceof Error ? error.message : "Unknown error",
+          error instanceof Error ? error.stack : undefined,
+          NodeFailureReason.FAIL_UNKNOWN_EXCEPTION,
+        );
+      }
+    }
+
+    return rootCreatedNode;
+  }
+
   private async createSingleNodeRobust(
     nodeData: ValidatedNodeData,
-    parent: FrameNode
+    parent: FrameNode,
+    absoluteOffset: { x: number; y: number },
   ): Promise<SceneNode | null> {
     // FIX: Skip hidden SVG sprite sheets that obscure content
+    // CRITICAL FIX: Only skip if explicitly zero-sized. Do NOT skip based on fills alone,
+    // as SVGs may have strokes or internal paths that are visible even without top-level fills.
     if (
       (nodeData.type === "VECTOR" || nodeData.htmlTag === "svg") &&
-      nodeData.attributes?.["aria-hidden"] === "true" &&
-      (nodeData.attributes?.style?.includes("height: 0") ||
-        nodeData.attributes?.style?.includes("width: 0") ||
-        !nodeData.fills?.length)
+      nodeData.attributes?.["aria-hidden"] === "true"
     ) {
-      console.log(
-        `🚫 [SKIP] Ignoring hidden SVG sprite sheet: ${nodeData.name}`
-      );
-      return null;
+      const hasZeroDims =
+        (nodeData.attributes &&
+          nodeData.attributes.style &&
+          nodeData.attributes.style.includes("height: 0")) ||
+        (nodeData.attributes &&
+          nodeData.attributes.style &&
+          nodeData.attributes.style.includes("width: 0")) ||
+        (nodeData.layout &&
+          (nodeData.layout.width <= 1 || nodeData.layout.height <= 1));
+
+      if (hasZeroDims) {
+        console.log(
+          `🚫 [SKIP] Ignoring hidden SVG sprite sheet (zero size): ${nodeData.name}`,
+        );
+        return null;
+      }
     }
 
     // Create node via NodeBuilder
     console.log(
-      `➡️ [NODE_BUILDER] calling createNode for ${nodeData.id} (${nodeData.type})`
+      `➡️ [NODE_BUILDER] calling createNode for ${nodeData.id} (${nodeData.type})`,
     );
-    const figmaNode = await this.nodeBuilder.createNode(nodeData);
+    // CRITICAL FIX: Pass parent absolute bounds to ensure correct relative positioning
+    const parentBounds = parent.absoluteRenderBounds
+      ? { x: parent.absoluteRenderBounds.x, y: parent.absoluteRenderBounds.y }
+      : undefined;
+
+    const figmaNode = await this.nodeBuilder.createNode(nodeData, parentBounds);
 
     if (!figmaNode) {
       console.error(
@@ -2767,12 +3342,12 @@ ${
           hasRect: !!nodeData.rect,
           hasStyles: !!nodeData.styles,
           nodeKeys: Object.keys(nodeData),
-        }
+        },
       );
       return null;
     }
     console.log(
-      `✅ [NODE_CREATION] Created figma node: ${figmaNode.id} (${figmaNode.type})`
+      `✅ [NODE_CREATION] Created figma node: ${figmaNode.id} (${figmaNode.type})`,
     );
 
     // Clear body/html backgrounds (including images)
@@ -2803,7 +3378,7 @@ ${
           // ENHANCED: PRESERVE DARK MODE
           // Do NOT strip backgrounds from body/html. If they are dark, we want them!
           console.log(
-            `  ✅ [THEME] Preserving ${bodyFills.length} fill(s) on ${nodeData.htmlTag} element (Dark Mode support)`
+            `  ✅ [THEME] Preserving ${bodyFills.length} fill(s) on ${nodeData.htmlTag} element (Dark Mode support)`,
           );
           // (figmaNode as any).fills = []; // DISABLED
         }
@@ -2819,7 +3394,7 @@ ${
       console.warn(
         `⚠️ IMAGE node "${
           nodeData.name || nodeData.id
-        }" has no parentId - placement may be inaccurate`
+        }" has no parentId - placement may be inaccurate`,
       );
       // Don't throw - attempt to proceed
     }
@@ -2831,15 +3406,14 @@ ${
       !parent.getPluginData("absoluteY")
     ) {
       // Try to get parent's absolute coordinates from its stored data
-      const parentAbsX = nodeData.parentId
-        ? this.createdNodes
-            .get(nodeData.parentId)
-            ?.getPluginData("absoluteX") || "0"
+      const parentNode = nodeData.parentId
+        ? this.createdNodes.get(nodeData.parentId)
+        : null;
+      const parentAbsX = parentNode
+        ? parentNode.getPluginData("absoluteX") || "0"
         : "0";
-      const parentAbsY = nodeData.parentId
-        ? this.createdNodes
-            .get(nodeData.parentId)
-            ?.getPluginData("absoluteY") || "0"
+      const parentAbsY = parentNode
+        ? parentNode.getPluginData("absoluteY") || "0"
         : "0";
 
       // If parent doesn't have stored coordinates, check if it's the root frame
@@ -2865,11 +3439,11 @@ ${
             if (parentParent && "x" in parentParent && "y" in parentParent) {
               const parentParentAbsX = ValidationUtils.safeParseFloat(
                 parentParent.getPluginData("absoluteX") || "0",
-                0
+                0,
               );
               const parentParentAbsY = ValidationUtils.safeParseFloat(
                 parentParent.getPluginData("absoluteY") || "0",
-                0
+                0,
               );
               const absX = parentParentAbsX + parent.x;
               const absY = parentParentAbsY + parent.y;
@@ -2908,7 +3482,15 @@ ${
     // Figma requires nodes to be in the parent's coordinate system before positioning
     if ((parent as SceneNode).type !== "TEXT") {
       // removed agent log block
-      parent.appendChild(figmaNode);
+      // CRITICAL FIX: Use insertChildByZIndex to respect CSS stacking order
+      if ("children" in parent) {
+        this.nodeBuilder.insertChildByZIndex(
+          parent as BaseNode & ChildrenMixin,
+          figmaNode,
+        );
+      } else {
+        (parent as any).appendChild(figmaNode);
+      }
       // removed agent log block
     }
 
@@ -2954,15 +3536,36 @@ ${
           if (this.options.enableDebugMode) {
             console.log(
               `🎯 [PIXEL-SNAP] Adjusted "${nodeData.name}" by (${dx.toFixed(
-                2
-              )}, ${dy.toFixed(2)}) to match absoluteLayout`
+                2,
+              )}, ${dy.toFixed(2)}) to match absoluteLayout`,
             );
           }
         }
       }
 
+      // DIAGNOSTIC: Log first 10 node positions to debug placement issues
+      if (this.processedNodeCount < 10) {
+        console.log(
+          `📍 [POSITION-DEBUG] Node #${this.processedNodeCount} "${nodeData.name}" (${nodeData.type}):`,
+        );
+        console.log(
+          `   Schema coords: layout=(${nodeData.layout?.x}, ${nodeData.layout?.y}), boundingBox=(${nodeData.boundingBox?.x}, ${nodeData.boundingBox?.y})`,
+        );
+        console.log(
+          `   Calculated: position=(${position.x}, ${position.y}), absolute=(${position.absoluteX}, ${position.absoluteY})`,
+        );
+        console.log(`   Applied: figmaNode.x=${validX}, figmaNode.y=${validY}`);
+        console.log(
+          `   Parent: "${parent.name}" absoluteX=${parent.getPluginData(
+            "absoluteX",
+          )}, absoluteY=${parent.getPluginData("absoluteY")}`,
+        );
+        console.log(
+          `   CoordinateOffset: x=${this.coordinateOffset.x}, y=${this.coordinateOffset.y}`,
+        );
+      }
       console.log(
-        `📍 [POSITION] Node "${nodeData.name}" positioned at (${validX}, ${validY})`
+        `📍 [POSITION] Node "${nodeData.name}" positioned at (${validX}, ${validY})`,
       );
 
       // Store absolute coordinates for verification
@@ -2974,12 +3577,12 @@ ${
       this.safeSetPluginData(
         figmaNode,
         "originalX",
-        String(position.absoluteX)
+        String(position.absoluteX),
       );
       this.safeSetPluginData(
         figmaNode,
         "originalY",
-        String(position.absoluteY)
+        String(position.absoluteY),
       );
     }
 
@@ -2996,81 +3599,35 @@ ${
   }
 
   /**
-   * Compute a global coordinate offset so that negative page coordinates
-   * (often caused by transforms / scroll / pseudo-elements) don't push the
-   * main content off-canvas or into clipped regions.
+   * COORDINATE FIX: Compute global coordinate offset to normalize page-absolute coordinates
    *
-   * We only consider "significant" nodes (large, shallow) to avoid outliers.
+   * Captured coordinates are PAGE_ABSOLUTE_CSS_PX (document origin + scroll position).
+   * For example, an element 2000px down a scrolled page has y=2000.
+   * Figma frames start at (0,0), so we need to subtract the minimum bounds to normalize.
+   *
+   * OLD LOGIC (BROKEN): Only handled negative coords from transforms/pseudo-elements
+   * NEW LOGIC: Finds true minimum x/y across ALL nodes, normalizes to (0,0)
    */
   private computeCoordinateOffsetFromSchema(rootNode: any): {
     x: number;
     y: number;
   } {
-    const viewport = this.data?.metadata?.viewport || {};
-    const viewportWidth = ValidationUtils.safeParseFloat(
-      viewport.width ?? this.data?.metadata?.viewportWidth,
-      1440
+    // Find minimum x/y coordinates across entire tree
+    const minBounds = this.findMinimumBounds(rootNode);
+
+    console.log(
+      `🔧 [COORD-FIX] Page minimum bounds: x=${minBounds.x}, y=${minBounds.y}`,
     );
 
-    const minCandidateWidth = Math.max(50, viewportWidth * 0.25);
-    const minCandidateHeight = 50;
+    // Calculate offset to shift everything so minimum becomes (0,0)
+    // Example: if minX=100, offsetX=-100, so all coords get shifted left by 100
+    const offsetX = -minBounds.x;
+    const offsetY = -minBounds.y;
 
-    let seen = false;
-    let minX = 0;
-    let minY = 0;
-
-    const isPseudoLike = (node: any): boolean => {
-      const name = String(node?.name || "");
-      const tag = String(node?.htmlTag || "");
-      return name.startsWith("::") || tag.startsWith("::");
-    };
-
-    const walk = (node: any, depth: number) => {
-      if (!node) return;
-
-      const abs = node.absoluteLayout;
-      const left = abs?.left;
-      const top = abs?.top;
-      const w = abs?.width ?? node.layout?.width;
-      const h = abs?.height ?? node.layout?.height;
-
-      if (
-        !isPseudoLike(node) &&
-        typeof left === "number" &&
-        Number.isFinite(left) &&
-        typeof top === "number" &&
-        Number.isFinite(top)
-      ) {
-        const width = typeof w === "number" && Number.isFinite(w) ? w : 0;
-        const height = typeof h === "number" && Number.isFinite(h) ? h : 0;
-
-        // Prioritize shallow, large containers (hero/sections/root wrappers).
-        const isCandidate =
-          depth <= 3 &&
-          width >= minCandidateWidth &&
-          height >= minCandidateHeight;
-
-        if (isCandidate) {
-          if (!seen) {
-            seen = true;
-            minX = left;
-            minY = top;
-          } else {
-            minX = Math.min(minX, left);
-            minY = Math.min(minY, top);
-          }
-        }
-      }
-
-      if (Array.isArray(node.children)) {
-        for (const child of node.children) walk(child, depth + 1);
-      }
-    };
-
-    walk(rootNode, 0);
-
-    const offsetX = minX < -1 ? -minX : 0;
-    const offsetY = minY < -1 ? -minY : 0;
+    console.log(`🔧 [COORD-FIX] Computed offset: x=${offsetX}, y=${offsetY}`);
+    console.log(
+      `🔧 [COORD-FIX] This will normalize all coordinates to start at (0,0) in Figma frame`,
+    );
 
     return {
       x: ValidationUtils.safeParseFloat(offsetX, 0),
@@ -3080,7 +3637,7 @@ ${
 
   private calculateNodePosition(
     nodeData: ValidatedNodeData,
-    parent: FrameNode
+    parent: FrameNode,
   ): { x: number; y: number; absoluteX: number; absoluteY: number } {
     // PIXEL-PERFECT POSITION CALCULATION v2.0
     // Fixes coordinate system mismatches and Auto Layout positioning issues
@@ -3112,7 +3669,7 @@ ${
     ) {
       const baselineOffset = ValidationUtils.safeParseFloat(
         (nodeData as any).renderedMetrics.baselineOffset,
-        0
+        0,
       );
       // Only apply if significant (> 0.5px) to avoid subpixel noise
       if (Math.abs(baselineOffset) > 0.5) {
@@ -3121,7 +3678,7 @@ ${
           console.log(
             `📏 [BASELINE] Adjusted "${
               nodeData.name
-            }" y by ${baselineOffset.toFixed(2)}px`
+            }" y by ${baselineOffset.toFixed(2)}px`,
           );
         }
       }
@@ -3165,7 +3722,7 @@ ${
       relativeY = absY - parentAbsY;
 
       console.log(
-        `🔧 [FIXED BUG] ${cssPosition} element "${nodeData.name}": abs(${absX}, ${absY}) - parent(${parentAbsX}, ${parentAbsY}) = rel(${relativeX}, ${relativeY})`
+        `🔧 [FIXED BUG] ${cssPosition} element "${nodeData.name}": abs(${absX}, ${absY}) - parent(${parentAbsX}, ${parentAbsY}) = rel(${relativeX}, ${relativeY})`,
       );
     } else if (parentHasAutoLayout) {
       // CRITICAL FIX: Don't override positions for manually positioned elements within Auto Layout containers
@@ -3184,7 +3741,7 @@ ${
         relativeY = absY - parentAbsY;
 
         console.log(
-          `📍 [MANUAL IN AUTO] "${nodeData.name}" manually positioned in Auto Layout parent: (${relativeX}, ${relativeY})`
+          `📍 [MANUAL IN AUTO] "${nodeData.name}" manually positioned in Auto Layout parent: (${relativeX}, ${relativeY})`,
         );
       } else {
         // True Auto Layout child: let layout handle positioning
@@ -3192,7 +3749,7 @@ ${
         relativeY = 0;
 
         console.log(
-          `🔄 [AUTO LAYOUT] Child "${nodeData.name}" in Auto Layout parent - position managed by layout`
+          `🔄 [AUTO LAYOUT] Child "${nodeData.name}" in Auto Layout parent - position managed by layout`,
         );
       }
     } else if (
@@ -3202,12 +3759,30 @@ ${
       // Use pre-calculated relative positions, but validate against absolute coordinates
       const preCalcRelX = ValidationUtils.safeParseFloat(
         nodeData.layout.relativeX,
-        0
+        0,
       );
-      const preCalcRelY = ValidationUtils.safeParseFloat(
+      // FIX 4: Text Baseline Fix [REFINED]
+      // Prevent SMALL negative Y offsets (-2px to 0) which are usually baseline noise.
+      // Larger negatives are preserved as they likely indicate upstream coordinate bugs.
+      let preCalcRelY = ValidationUtils.safeParseFloat(
         nodeData.layout.relativeY,
-        0
+        0,
       );
+
+      if (nodeData.type === "TEXT" && preCalcRelY < 0) {
+        if (preCalcRelY > -2) {
+          // Epsilon clamp for micro-jitter
+          console.log(
+            `📏 [BASELINE_CLAMP] Clamping micro-negative Y for text ${nodeData.name}: ${preCalcRelY} -> 0`,
+          );
+          preCalcRelY = 0;
+        } else {
+          // Log but DO NOT CLAMP larger negatives - these are real bugs
+          console.warn(
+            `⚠️ [TEXT_BASELINE_ISSUE] Significant negative Y for text ${nodeData.name}: ${preCalcRelY} (preserved)`,
+          );
+        }
+      }
 
       // Validate pre-calculated relative position against absolute coordinates
       const calculatedRelX = absX - parentAbsX;
@@ -3224,7 +3799,7 @@ ${
         relativeY = calculatedRelY;
 
         console.log(
-          `⚠️ [POSITION FIX] "${nodeData.name}": Pre-calc rel(${preCalcRelX}, ${preCalcRelY}) differs from calc rel(${calculatedRelX}, ${calculatedRelY}) by (${xDiff}, ${yDiff})px. Using calculated position.`
+          `⚠️ [POSITION FIX] "${nodeData.name}": Pre-calc rel(${preCalcRelX}, ${preCalcRelY}) differs from calc rel(${calculatedRelX}, ${calculatedRelY}) by (${xDiff}, ${yDiff})px. Using calculated position.`,
         );
       } else {
         // Pre-calculated position is reasonable, use it
@@ -3232,7 +3807,7 @@ ${
         relativeY = preCalcRelY;
 
         console.log(
-          `📐 [RELATIVE] Pre-calc position for "${nodeData.name}": (${relativeX}, ${relativeY})`
+          `📐 [RELATIVE] Pre-calc position for "${nodeData.name}": (${relativeX}, ${relativeY})`,
         );
       }
     } else {
@@ -3257,19 +3832,19 @@ ${
         if (absY < scrollOffset.top && relativeY < 0) {
           relativeY = absY; // Use absolute position instead (REMOVED incorrect scaleFactor)
           console.log(
-            `📜 [SCROLL FIX] Top-level element "${nodeData.name}" scroll correction: ${absY} → ${relativeY}`
+            `📜 [SCROLL FIX] Top-level element "${nodeData.name}" scroll correction: ${absY} → ${relativeY}`,
           );
         }
         if (absX < scrollOffset.left && relativeX < 0) {
           relativeX = absX; // Use absolute position instead (REMOVED incorrect scaleFactor)
           console.log(
-            `📜 [SCROLL FIX] Top-level element "${nodeData.name}" scroll correction: ${absX} → ${relativeX}`
+            `📜 [SCROLL FIX] Top-level element "${nodeData.name}" scroll correction: ${absX} → ${relativeX}`,
           );
         }
       }
 
       console.log(
-        `🧮 [CALC] Position for "${nodeData.name}": abs(${absX}, ${absY}) - parent(${parentAbsX}, ${parentAbsY}) = rel(${relativeX}, ${relativeY})`
+        `🧮 [CALC] Position for "${nodeData.name}": abs(${absX}, ${absY}) - parent(${parentAbsX}, ${parentAbsY}) = rel(${relativeX}, ${relativeY})`,
       );
     }
 
@@ -3281,13 +3856,13 @@ ${
     const isHeroElement =
       nodeData.name?.toLowerCase().includes("hero") ||
       nodeData.cssClasses?.some((cls: string) =>
-        /hero|banner|navbar|header/i.test(cls)
+        /hero|banner|navbar|header/i.test(cls),
       ) ||
       (absY < 100 && (nodeData.layout?.height || 0) > 200);
 
     if (isHeroElement && relativeY < 0 && !isSpeciallyPositioned) {
       console.log(
-        `🦸 [HERO FIX] Hero element "${nodeData.name}" had negative Y (${relativeY}), correcting using absolute Y: ${absY}`
+        `🦸 [HERO FIX] Hero element "${nodeData.name}" had negative Y (${relativeY}), correcting using absolute Y: ${absY}`,
       );
       relativeY = Math.max(0, absY);
     }
@@ -3296,8 +3871,8 @@ ${
     if (this.options?.enableDebugMode) {
       console.log(
         `✅ [FINAL POSITION] "${nodeData.name}": (${relativeX.toFixed(
-          1
-        )}, ${relativeY.toFixed(1)}) | absolute: (${absX}, ${absY})`
+          1,
+        )}, ${relativeY.toFixed(1)}) | absolute: (${absX}, ${absY})`,
       );
     }
 
@@ -3317,7 +3892,7 @@ ${
   private validateNodeGeometry(
     node: SceneNode,
     nodeData: ValidatedNodeData,
-    position: { x: number; y: number; absoluteX: number; absoluteY: number }
+    position: { x: number; y: number; absoluteX: number; absoluteY: number },
   ): void {
     if (
       !("x" in node) ||
@@ -3370,16 +3945,16 @@ ${
 
       console.warn(
         `⚠️ [GEOMETRY DELTA] "${report.nodeName}" deviation: dx=${dx.toFixed(
-          2
+          2,
         )}px dy=${dy.toFixed(2)}px dw=${dw.toFixed(2)}px dh=${dh.toFixed(2)}px`,
-        report
+        report,
       );
     }
   }
 
   private applyNodeMetadata(
     node: SceneNode,
-    nodeData: ValidatedNodeData
+    nodeData: ValidatedNodeData,
   ): void {
     // Store absolute coordinates
     const absX = nodeData.absoluteLayout?.left ?? nodeData.layout?.x ?? 0;
@@ -3413,7 +3988,7 @@ ${
       this.safeSetPluginData(
         node,
         "mlConfidence",
-        String(nodeData.mlConfidence)
+        String(nodeData.mlConfidence),
       );
 
       if (
@@ -3431,7 +4006,7 @@ ${
         this.safeSetPluginData(
           node,
           "suggestedComponentType",
-          nodeData.mlUIType
+          nodeData.mlUIType,
         );
       }
     }
@@ -3439,7 +4014,7 @@ ${
 
   private async applyAutoLayoutRobust(
     node: SceneNode,
-    nodeData: ValidatedNodeData
+    nodeData: ValidatedNodeData,
   ): Promise<void> {
     if (!("layoutMode" in node)) return;
 
@@ -3467,7 +4042,7 @@ ${
           maxChildDeltaPx: validation.maxChildDeltaPx,
           tolerancePx: validation.tolerancePx,
           reasons: validation.reasons,
-        }
+        },
       );
       return;
     }
@@ -3514,22 +4089,22 @@ ${
       // Spacing
       const itemSpacing = ValidationUtils.safeParseFloat(
         nodeData.autoLayout?.itemSpacing ?? nodeData.itemSpacing,
-        0
+        0,
       );
       frame.itemSpacing = Math.max(0, itemSpacing);
 
       // Padding
       frame.paddingLeft = this.clampPadding(
-        nodeData.autoLayout?.paddingLeft ?? nodeData.paddingLeft
+        nodeData.autoLayout?.paddingLeft ?? nodeData.paddingLeft,
       );
       frame.paddingRight = this.clampPadding(
-        nodeData.autoLayout?.paddingRight ?? nodeData.paddingRight
+        nodeData.autoLayout?.paddingRight ?? nodeData.paddingRight,
       );
       frame.paddingTop = this.clampPadding(
-        nodeData.autoLayout?.paddingTop ?? nodeData.paddingTop
+        nodeData.autoLayout?.paddingTop ?? nodeData.paddingTop,
       );
       frame.paddingBottom = this.clampPadding(
-        nodeData.autoLayout?.paddingBottom ?? nodeData.paddingBottom
+        nodeData.autoLayout?.paddingBottom ?? nodeData.paddingBottom,
       );
 
       // Wrap mode
@@ -3539,7 +4114,7 @@ ${
         const counterAxisSpacing = ValidationUtils.safeParseFloat(
           nodeData.autoLayout?.counterAxisSpacing ??
             nodeData.counterAxisSpacing,
-          0
+          0,
         );
         frame.counterAxisSpacing = Math.max(0, counterAxisSpacing);
       }
@@ -3557,7 +4132,7 @@ ${
       } catch (resizeErr) {
         console.warn(
           "⚠️ Failed to preserve frame size after Auto Layout:",
-          resizeErr
+          resizeErr,
         );
       }
 
@@ -3569,7 +4144,7 @@ ${
 
   private applyFlexChildProperties(
     node: SceneNode,
-    nodeData: ValidatedNodeData
+    nodeData: ValidatedNodeData,
   ): void {
     // Support absolute-positioned children inside Auto Layout frames.
     // This preserves pixel-perfect x/y even when parent uses Auto Layout.
@@ -3640,7 +4215,7 @@ ${
     nodeData: any,
     errorMessage: string,
     stack: string | undefined | null,
-    reasonCode: NodeFailureReason = NodeFailureReason.FAIL_UNKNOWN_EXCEPTION
+    reasonCode: NodeFailureReason = NodeFailureReason.FAIL_UNKNOWN_EXCEPTION,
   ): void {
     this.failedNodes.push({
       id: nodeData.id || "unknown",
@@ -3662,6 +4237,13 @@ ${
     });
   }
 
+  /**
+   * Helper to yield control back to the main thread, preventing [Violation] warnings.
+   */
+  private yieldToMainThread(): Promise<void> {
+    return new Promise((r) => setTimeout(r, 0));
+  }
+
   // ============================================================================
   // IMAGE PROCESSING WITH VALIDATION
   // ============================================================================
@@ -3670,7 +4252,8 @@ ${
    * PHASE 1 OPTIMIZATION: Pre-resolve all images upfront in parallel
    */
   private async preResolveImages(
-    imageHashes: Set<string>
+    imageHashes: Set<string>,
+    nodeCount?: number,
   ): Promise<Map<string, Paint>> {
     const imageMap = new Map<string, Paint>();
     const hashArray = Array.from(imageHashes);
@@ -3681,66 +4264,95 @@ ${
 
     console.log(`📸 Pre-resolving ${hashArray.length} images in parallel...`);
 
+    // Statistics tracking
+    const stats = { resolved: 0, timedOut: 0, failed: 0 };
+    const timedOutHashes: string[] = [];
+    const failedHashes: string[] = [];
+
     // CRITICAL DIAGNOSTIC: Log assets.images content vs requested hashes
     const assetKeys = Object.keys(this.nodeBuilder.assets?.images || {});
     console.log(
-      `📊 [IMAGE DEBUG] Assets.images has ${assetKeys.length} entries`
+      `📊 [IMAGE DEBUG] Assets.images has ${assetKeys.length} entries`,
     );
     console.log(`📊 [IMAGE DEBUG] Image hashes requested: ${hashArray.length}`);
     if (assetKeys.length > 0) {
       console.log(
         `📊 [IMAGE DEBUG] First 5 asset keys: ${assetKeys
           .slice(0, 5)
-          .join(", ")}`
+          .join(", ")}`,
       );
     }
     if (hashArray.length > 0) {
       console.log(
         `📊 [IMAGE DEBUG] First 5 requested hashes: ${hashArray
           .slice(0, 5)
-          .join(", ")}`
+          .join(", ")}`,
       );
     }
     // Check for mismatches
     const missingInAssets = hashArray.filter((h) => !assetKeys.includes(h));
     if (missingInAssets.length > 0) {
       console.warn(
-        `⚠️ [IMAGE DEBUG] ${missingInAssets.length} hashes NOT in assets.images!`
+        `⚠️ [IMAGE DEBUG] ${missingInAssets.length} hashes NOT in assets.images!`,
       );
       console.warn(
         `⚠️ [IMAGE DEBUG] Missing hashes: ${missingInAssets
           .slice(0, 5)
-          .join(", ")}`
+          .join(", ")}`,
       );
     }
-    // Check if assets have data/URLs
-    assetKeys.slice(0, 3).forEach((key) => {
-      const asset = this.nodeBuilder.assets.images[key];
-      console.log(
-        `📊 [IMAGE DEBUG] Asset ${key.substring(0, 20)}...: hasBase64=${!!(
-          asset?.data || asset?.base64
-        )}, url=${asset?.url?.substring(0, 60) || "NONE"}`
-      );
-    });
+
+    // Helper to get asset source type for logging
+    const getSourceType = (hash: string): string => {
+      const asset = this.nodeBuilder.assets?.images?.[hash];
+      if (!asset) return "MISSING";
+      if (asset.data || asset.base64) return "BASE64";
+      if (asset.url) return "URL";
+      return "UNKNOWN";
+    };
 
     // Process images in parallel batches with concurrency limit
-    const concurrency = 10;
+    const concurrency = 12;
+
     for (let i = 0; i < hashArray.length; i += concurrency) {
+      // Yield before each batch to allow rAF to breathe
+      await this.yieldToMainThread();
+
       const batch = hashArray.slice(i, i + concurrency);
+      console.log(
+        `Processing batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(hashArray.length / concurrency)} (${batch.length} images)...`,
+      );
+
       const batchPromises = batch.map(async (hash) => {
+        const sourceType = getSourceType(hash);
+        console.log(`  ▶️ Resolving ${hash} [source: ${sourceType}]...`);
+        const startTime = Date.now();
         try {
-          const fill = { imageHash: hash, type: "IMAGE" as const };
-          const paint = await this.nodeBuilder.resolveImagePaint(fill);
+          // MANDATORY FIX: Direct resolution without timeout to prevent "ignore-late" data loss
+          const paint = await this.nodeBuilder.resolveImagePaint({
+            imageHash: hash,
+            type: "IMAGE",
+          });
+          const duration = Date.now() - startTime;
+
+          console.log(`  ✅ Resolved ${hash} [${sourceType}] in ${duration}ms`);
+          stats.resolved++;
           return { hash, paint };
         } catch (error) {
-          console.warn(`⚠️ Failed to resolve image ${hash}:`, error);
-          // Return a placeholder solid fill
+          const duration = Date.now() - startTime;
+          console.warn(
+            `  ❌ FAILED ${hash} [${sourceType}] after ${duration}ms:`,
+            error,
+          );
+          stats.failed++;
+          failedHashes.push(hash);
+          // Return transparent fallback (not visible placeholder)
           return {
             hash,
             paint: {
               type: "SOLID",
-              color: { r: 1, g: 0.5, b: 0.5 },
-              opacity: 0.7,
+              color: { r: 0, g: 0, b: 0 },
+              opacity: 0,
             } as SolidPaint,
           };
         }
@@ -3751,11 +4363,11 @@ ${
         if (result.status === "fulfilled") {
           imageMap.set(batch[idx], result.value.paint);
         } else {
-          // Fallback to placeholder on error
+          // Fallback to transparent on critical error
           imageMap.set(batch[idx], {
             type: "SOLID",
-            color: { r: 1, g: 0.5, b: 0.5 },
-            opacity: 0.7,
+            color: { r: 0, g: 0, b: 0 },
+            opacity: 0,
           } as SolidPaint);
         }
       });
@@ -3764,6 +4376,22 @@ ${
       if (i + concurrency < hashArray.length) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
+    }
+
+    // Summary log
+    console.log(`\n📊 [IMAGE RESOLUTION SUMMARY]`);
+    console.log(`   ✅ Resolved: ${stats.resolved}/${hashArray.length}`);
+    console.log(`   ⏰ Timed Out: ${stats.timedOut}`);
+    console.log(`   ❌ Failed: ${stats.failed}`);
+    if (timedOutHashes.length > 0) {
+      console.log(
+        `   ⏰ Timed out hashes: ${timedOutHashes.slice(0, 5).join(", ")}${timedOutHashes.length > 5 ? ` (+${timedOutHashes.length - 5} more)` : ""}`,
+      );
+    }
+    if (failedHashes.length > 0) {
+      console.log(
+        `   ❌ Failed hashes: ${failedHashes.slice(0, 5).join(", ")}${failedHashes.length > 5 ? ` (+${failedHashes.length - 5} more)` : ""}`,
+      );
     }
 
     console.log(`✅ Pre-resolved ${imageMap.size}/${hashArray.length} images`);
@@ -3784,7 +4412,7 @@ ${
     }
 
     console.log(
-      `📸 Preloading ${imageNodes.length} images (${assetImageHashes.size} from asset registry)`
+      `📸 Preloading ${imageNodes.length} images (${assetImageHashes.size} from asset registry)`,
     );
 
     const batches = this.chunkArray(imageNodes, this.options.maxBatchSize);
@@ -3792,11 +4420,11 @@ ${
     for (let i = 0; i < batches.length; i++) {
       this.postProgress(
         `Processing image batch ${i + 1}/${batches.length}...`,
-        15 + (i / batches.length) * 15
+        15 + (i / batches.length) * 15,
       );
 
       const batchPromises = batches[i].map((node) =>
-        this.preloadImageRobust(node)
+        this.preloadImageRobust(node),
       );
       const results = await Promise.allSettled(batchPromises);
 
@@ -3804,7 +4432,7 @@ ${
       const failures = results.filter((r) => r.status === "rejected");
       if (failures.length > 0) {
         console.warn(
-          `⚠️ ${failures.length} images failed to preload in batch ${i + 1}`
+          `⚠️ ${failures.length} images failed to preload in batch ${i + 1}`,
         );
       }
 
@@ -3814,7 +4442,7 @@ ${
 
   private async preloadImageRobust(
     nodeData: any,
-    attempt: number = 0
+    attempt: number = 0,
   ): Promise<ImageCreationResult> {
     const startTime = Date.now();
     const result: ImageCreationResult = {
@@ -3837,37 +4465,80 @@ ${
         return result;
       }
 
+      // P0-1 FIX: Normalize hash by stripping any data URI prefixes
+      // Capture side may send full data URLs as hashes in some edge cases
+      const normalizedHash = this.normalizeImageHash(imageHash);
+
       let imageAsset = this.data.assets?.images?.[imageHash];
+
+      // P0-1 FIX: Also try normalized hash if exact match fails
+      if (!imageAsset && normalizedHash !== imageHash) {
+        imageAsset = this.data.assets?.images?.[normalizedHash];
+        if (imageAsset) {
+          console.log(
+            `[IMAGE HASH] Matched via normalized hash: ${imageHash.substring(0, 30)}... -> ${normalizedHash.substring(0, 20)}...`,
+          );
+        }
+      }
 
       // If exact match not found, try fuzzy matching
       if (!imageAsset && this.data.assets?.images) {
-        const hashSuffix = imageHash.slice(-8); // Last 8 chars
         const allKeys = Object.keys(this.data.assets.images);
 
-        // Deterministic fuzzy matching: only accept suffix matches when unique.
-        const candidates = allKeys.filter(
-          (key) => key.endsWith(hashSuffix) || imageHash.endsWith(key.slice(-8))
-        );
-        if (candidates.length === 1) {
-          const key = candidates[0];
+        // P0-1 FIX: Log diagnostic info for debugging hash mismatches
+        if (allKeys.length > 0 && allKeys.length <= 20) {
           console.log(
-            `  🔍 Fuzzy matching image hash (unique candidate): ${key} for ${imageHash}`
+            `[IMAGE HASH DEBUG] Looking for: ${imageHash.substring(0, 40)}...`,
           );
-          imageAsset = this.data.assets.images[key];
-          // Note: Don't cache here - wait until Figma image is actually created below
-        } else if (candidates.length > 1) {
-          console.warn(
-            `  ⚠️ Ambiguous fuzzy image hash match for ${imageHash} (${candidates.length} candidates) - skipping fuzzy mapping to avoid wrong images`
+          console.log(
+            `[IMAGE HASH DEBUG] Available keys (${allKeys.length}):`,
+            allKeys.map((k) => k.substring(0, 30) + "..."),
           );
         }
 
-        // Try case-insensitive matching
+        // P0-1 FIX: Try matching by normalized forms of both sides
+        const normalizedLookupHash = normalizedHash.toLowerCase();
+        for (const key of allKeys) {
+          const normalizedKey = this.normalizeImageHash(key).toLowerCase();
+          if (normalizedKey === normalizedLookupHash) {
+            console.log(
+              `[IMAGE HASH] Matched via double-normalized hash: ${key.substring(0, 30)}...`,
+            );
+            imageAsset = this.data.assets.images[key];
+            break;
+          }
+        }
+
+        // Fallback: Deterministic fuzzy matching via suffix
+        if (!imageAsset) {
+          const hashSuffix = normalizedHash.slice(-8); // Last 8 chars
+          const candidates = allKeys.filter((key) => {
+            const normalizedKey = this.normalizeImageHash(key);
+            return (
+              normalizedKey.endsWith(hashSuffix) ||
+              normalizedHash.endsWith(normalizedKey.slice(-8))
+            );
+          });
+          if (candidates.length === 1) {
+            const key = candidates[0];
+            console.log(
+              `[IMAGE HASH] Fuzzy matching (unique suffix candidate): ${key.substring(0, 30)}... for ${imageHash.substring(0, 30)}...`,
+            );
+            imageAsset = this.data.assets.images[key];
+          } else if (candidates.length > 1) {
+            console.warn(
+              `[IMAGE HASH] Ambiguous fuzzy match for ${imageHash.substring(0, 30)}... (${candidates.length} candidates) - skipping to avoid wrong image`,
+            );
+          }
+        }
+
+        // Try case-insensitive matching on original hash
         if (!imageAsset) {
           const lowerHash = imageHash.toLowerCase();
           for (const key of allKeys) {
             if (key.toLowerCase() === lowerHash) {
               console.log(
-                `  🔍 Case-insensitive match: ${key} for ${imageHash}`
+                `[IMAGE HASH] Case-insensitive match: ${key.substring(0, 30)}... for ${imageHash.substring(0, 30)}...`,
               );
               imageAsset = this.data.assets.images[key];
               if (imageAsset) {
@@ -3879,11 +4550,17 @@ ${
       }
 
       if (!imageAsset) {
+        const availableKeys = Object.keys(this.data.assets?.images || {});
         console.error(
-          `❌ Image asset not found: ${imageHash}. Available keys:`,
-          Object.keys(this.data.assets?.images || {}).slice(0, 10)
+          `[IMAGE HASH] FAILED: Asset not found for hash: ${imageHash.substring(0, 50)}...`,
         );
-        throw new Error(`Image asset not found: ${imageHash}`);
+        console.error(
+          `[IMAGE HASH] Available keys (${availableKeys.length}):`,
+          availableKeys.slice(0, 10).map((k) => k.substring(0, 30) + "..."),
+        );
+        throw new Error(
+          `Image asset not found: ${imageHash.substring(0, 50)}...`,
+        );
       }
 
       const base64Data =
@@ -3908,13 +4585,13 @@ ${
           /\.avif(\?|#|$)/i.test(urlCandidate));
 
       let imageBytes: Uint8Array | null = null;
-      const strictCloneMode = this.options.strictCloneMode ?? false;
+      const strictCloneMode = this.options.strictCloneMode ?? true; // FIDELITY FIX: Default to true
 
       if (base64Data && typeof base64Data === "string") {
         const normalized = ValidationUtils.normalizeBase64Payload(base64Data);
         if (!ValidationUtils.validateBase64(normalized)) {
           console.warn(
-            `⚠️ Invalid base64 for image ${imageHash}, will try URL fallback if available`
+            `⚠️ Invalid base64 for image ${imageHash}, will try URL fallback if available`,
           );
         } else {
           try {
@@ -3926,14 +4603,15 @@ ${
           } catch (decodeError) {
             console.warn(
               `⚠️ base64Decode failed for ${imageHash}, will try URL fallback if available`,
-              decodeError
+              decodeError,
             );
           }
         }
       }
 
-      // Strict clone: do NOT fetch at import time (non-deterministic).
-      if (!imageBytes && urlCandidate && !strictCloneMode) {
+      // ROOT CAUSE FIX: Even in strictCloneMode, we MUST allow fetching if the extension
+      // skipped embedding OR if base64 decode failed. Otherwise, we get magenta rectangles.
+      if (!imageBytes && urlCandidate) {
         const isSvg =
           /\.svg(\?|#|$)/i.test(urlCandidate) ||
           (typeof imageAsset.mimeType === "string" &&
@@ -3952,15 +4630,15 @@ ${
             this.isAvifBytes(fetched.bytes);
           imageBytes = isWebp
             ? await this.transcodeWebpWithRetry(
-                this.uint8ToBase64(fetched.bytes),
-                2
+                await this.uint8ToBase64(fetched.bytes),
+                2,
               )
             : isAvif
-            ? await requestImageTranscode(
-                this.uint8ToBase64(fetched.bytes),
-                "image/avif"
-              )
-            : fetched.bytes;
+              ? await requestImageTranscode(
+                  await this.uint8ToBase64(fetched.bytes),
+                  "image/avif",
+                )
+              : fetched.bytes;
         }
       }
 
@@ -3970,7 +4648,7 @@ ${
             ? strictCloneMode
               ? `No usable image bytes for ${imageHash} (strict clone: missing/invalid embedded bytes; URL fetch disabled)`
               : `No usable image bytes for ${imageHash} (base64 invalid and URL fetch skipped/failed)`
-            : `No usable image bytes for ${imageHash} (missing/invalid base64 and no URL)`
+            : `No usable image bytes for ${imageHash} (missing/invalid base64 and no URL)`,
         );
       }
       const figmaImage = figma.createImage(imageBytes);
@@ -3994,7 +4672,7 @@ ${
 
       console.warn(
         `❌ Failed to preload image after ${attempt + 1} attempts:`,
-        result.error
+        result.error,
       );
     } finally {
       result.processingTime = Date.now() - startTime;
@@ -4028,42 +4706,52 @@ ${
 
   private async fetchImageBytesRobust(
     url: string,
-    timeoutMs = 20000
+    timeoutMs = 20000,
   ): Promise<{ bytes: Uint8Array; contentType?: string }> {
-    let signal: AbortSignal | undefined;
-    let timeout: any;
-
-    if (typeof AbortController !== "undefined") {
-      const controller = new AbortController();
-      timeout = setTimeout(() => controller.abort(), timeoutMs);
-      signal = controller.signal;
-    }
-
     try {
-      const fetchOptions: any = {
-        headers: {
-          Accept:
-            "image/webp,image/png,image/jpeg,image/apng,image/svg+xml,*/*;q=0.8",
-        },
-      };
-      if (signal) {
-        fetchOptions.signal = signal;
+      // Use proxy fetch for external URLs
+      const result = await fetchWithProxy(url);
+      return { bytes: result.bytes, contentType: result.contentType };
+    } catch (proxyError) {
+      console.warn(
+        `  ⚠️ Proxy fetch failed for ${url}, trying direct:`,
+        proxyError,
+      );
+
+      let signal: AbortSignal | undefined;
+      let timeout: any;
+
+      if (typeof AbortController !== "undefined") {
+        const controller = new AbortController();
+        timeout = setTimeout(() => controller.abort(), timeoutMs);
+        signal = controller.signal;
       }
 
-      const response = await fetch(url, fetchOptions);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      try {
+        const fetchOptions: any = {
+          headers: {
+            Accept:
+              "image/webp,image/png,image/jpeg,image/apng,image/svg+xml,*/*;q=0.8",
+          },
+        };
+        if (signal) {
+          fetchOptions.signal = signal;
+        }
+
+        const response = await fetch(url, fetchOptions);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const contentType = response.headers.get("content-type") || undefined;
+        const buffer = await response.arrayBuffer();
+        return { bytes: new Uint8Array(buffer), contentType };
+      } finally {
+        if (timeout) clearTimeout(timeout);
       }
-      const contentType = response.headers.get("content-type") || undefined;
-      const buffer = await response.arrayBuffer();
-      return { bytes: new Uint8Array(buffer), contentType };
-    } finally {
-      clearTimeout(timeout);
     }
   }
 
   private isWebpBytes(bytes: Uint8Array): boolean {
-    // "RIFF"...."WEBP"
     if (!bytes || bytes.length < 12) return false;
     return (
       bytes[0] === 0x52 &&
@@ -4078,26 +4766,28 @@ ${
   }
 
   private isAvifBytes(bytes: Uint8Array): boolean {
-    // ISO BMFF: size(4) + 'ftyp'(4) + majorBrand(4)
     if (!bytes || bytes.length < 16) return false;
     const isFtyp =
-      bytes[4] === 0x66 && // f
-      bytes[5] === 0x74 && // t
-      bytes[6] === 0x79 && // y
-      bytes[7] === 0x70; // p
+      bytes[4] === 0x66 &&
+      bytes[5] === 0x74 &&
+      bytes[6] === 0x79 &&
+      bytes[7] === 0x70;
     if (!isFtyp) return false;
     const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
     return brand === "avif" || brand === "avis";
   }
 
-  private uint8ToBase64(bytes: Uint8Array): string {
-    // Pure JavaScript base64 encoding - works in Figma's sandbox where btoa is unavailable
+  private async uint8ToBase64(bytes: Uint8Array): Promise<string> {
     const BASE64_CHARS =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let result = "";
     const len = bytes.length;
 
     for (let i = 0; i < len; i += 3) {
+      // Yield to main thread every 100kb to prevent blocking rAF
+      if (i > 0 && i % 102400 === 0) {
+        await this.yieldToMainThread();
+      }
       const byte1 = bytes[i];
       const byte2 = i + 1 < len ? bytes[i + 1] : 0;
       const byte3 = i + 2 < len ? bytes[i + 2] : 0;
@@ -4115,10 +4805,9 @@ ${
 
   private async transcodeWebpWithRetry(
     base64: string,
-    retries: number
+    retries: number,
   ): Promise<Uint8Array> {
     let lastError: any;
-
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
         const png = await requestWebpTranscode(base64);
@@ -4129,11 +4818,10 @@ ${
       } catch (error) {
         lastError = error;
         await new Promise((resolve) =>
-          setTimeout(resolve, 200 * (attempt + 1))
+          setTimeout(resolve, 200 * (attempt + 1)),
         );
       }
     }
-
     throw lastError || new Error("WebP transcode failed");
   }
 
@@ -4145,7 +4833,7 @@ ${
     this.postProgress("Validating text nodes...", 88);
 
     const textNodes = Array.from(this.createdNodes.values()).filter(
-      (node) => node.type === "TEXT"
+      (node) => node.type === "TEXT",
     ) as TextNode[];
 
     console.log(`📝 Validating ${textNodes.length} text nodes`);
@@ -4156,13 +4844,13 @@ ${
     }
 
     const failures = this.textValidationResults.filter(
-      (v) => !v.success
+      (v) => !v.success,
     ).length;
     console.log(`✅ Text validation complete: ${failures} failures`);
   }
 
   private async validateTextNode(
-    textNode: TextNode
+    textNode: TextNode,
   ): Promise<TextValidationResult> {
     const result: TextValidationResult = {
       elementId: textNode.id,
@@ -4207,7 +4895,7 @@ ${
     } catch (error) {
       result.success = false;
       result.errors.push(
-        error instanceof Error ? error.message : "Unknown error"
+        error instanceof Error ? error.message : "Unknown error",
       );
     }
 
@@ -4243,11 +4931,11 @@ ${
     // Determine sample size based on total elements (max 100 elements for performance)
     const maxSampleSize = Math.min(
       100,
-      Math.max(10, Math.floor(totalElements * 0.05))
+      Math.max(10, Math.floor(totalElements * 0.05)),
     ); // 5% sample, capped at 100
 
     console.log(
-      `📊 [VERIFICATION] Sampling ${maxSampleSize} elements from ${totalElements} total for position verification`
+      `📊 [VERIFICATION] Sampling ${maxSampleSize} elements from ${totalElements} total for position verification`,
     );
 
     let samplesToCheck: typeof allElements = [];
@@ -4259,7 +4947,7 @@ ${
       // INTELLIGENT SAMPLING: Mix of different element types for representative results
       const stratifiedSample = this.createStratifiedSample(
         allElements,
-        maxSampleSize
+        maxSampleSize,
       );
       samplesToCheck = stratifiedSample;
     }
@@ -4278,11 +4966,11 @@ ${
 
       const expectedX = ValidationUtils.safeParseFloat(
         originalData.absoluteLayout?.left ?? originalData.layout?.x,
-        0
+        0,
       );
       const expectedY = ValidationUtils.safeParseFloat(
         originalData.absoluteLayout?.top ?? originalData.layout?.y,
-        0
+        0,
       );
 
       // Get absolute position of the node in Figma (traversing up to Page)
@@ -4318,10 +5006,10 @@ ${
       if (!withinTolerance) {
         console.warn(
           `⚠️ [POSITION] Element "${elementId}" position deviation: ${deviation.toFixed(
-            1
+            1,
           )}px (expected: ${expected.x.toFixed(1)}, ${expected.y.toFixed(
-            1
-          )} | actual: ${actual.x.toFixed(1)}, ${actual.y.toFixed(1)})`
+            1,
+          )} | actual: ${actual.x.toFixed(1)}, ${actual.y.toFixed(1)})`,
         );
 
         // UNIFIED DIAGNOSTICS: Record position mismatch
@@ -4331,7 +5019,7 @@ ${
           expected,
           actual,
           `Position deviation: ${deviation.toFixed(1)}px`,
-          deviation > 10 ? "ERROR" : "WARN"
+          deviation > 10 ? "ERROR" : "WARN",
         );
       }
 
@@ -4343,7 +5031,7 @@ ${
 
         if (!hasImage) {
           console.error(
-            `❌ [ASSET] Image element "${elementId}" is missing its image fill in Figma!`
+            `❌ [ASSET] Image element "${elementId}" is missing its image fill in Figma!`,
           );
 
           // UNIFIED DIAGNOSTICS: Record asset mismatch
@@ -4353,7 +5041,7 @@ ${
             "IMAGE_PAINT",
             "SOLID/NONE",
             "Image asset failed to render - node has no image fill",
-            "ERROR"
+            "ERROR",
           );
         }
       }
@@ -4370,10 +5058,10 @@ ${
 
     console.log(
       `📊 [VERIFICATION] Sample accuracy: ${(sampleAccuracy * 100).toFixed(
-        1
+        1,
       )}% (${withinTolerance}/${
         results.length
-      }) | Estimated total accurate: ${estimatedTotalAccurate}/${totalElements}`
+      }) | Estimated total accurate: ${estimatedTotalAccurate}/${totalElements}`,
     );
 
     return {
@@ -4393,13 +5081,13 @@ ${
         .slice(0, 10),
       imagesProcessed: this.imageCreationCache.size,
       imagesSuccessful: Array.from(this.imageCreationCache.values()).filter(
-        (h) => h
+        (h) => h,
       ).length,
       imagesFailed: 0,
       totalProcessingTime: 0,
       textNodesValidated: this.textValidationResults.length,
       textValidationFailures: this.textValidationResults.filter(
-        (v) => !v.success
+        (v) => !v.success,
       ).length,
       failedNodes: this.failedNodes,
       // Add sampling metadata
@@ -4417,13 +5105,13 @@ ${
     // Categorize elements by type for stratified sampling
     const textElements = elements.filter((e) => e.originalData.type === "TEXT");
     const imageElements = elements.filter(
-      (e) => e.originalData.type === "IMAGE"
+      (e) => e.originalData.type === "IMAGE",
     );
     const frameElements = elements.filter(
-      (e) => e.originalData.type === "FRAME"
+      (e) => e.originalData.type === "FRAME",
     );
     const otherElements = elements.filter(
-      (e) => !["TEXT", "IMAGE", "FRAME"].includes(e.originalData.type)
+      (e) => !["TEXT", "IMAGE", "FRAME"].includes(e.originalData.type),
     );
 
     const strata = [
@@ -4470,9 +5158,9 @@ ${
         sample.filter((e) => e.originalData.type === "FRAME").length
       }, Other: ${
         sample.filter(
-          (e) => !["TEXT", "IMAGE", "FRAME"].includes(e.originalData.type)
+          (e) => !["TEXT", "IMAGE", "FRAME"].includes(e.originalData.type),
         ).length
-      })`
+      })`,
     );
 
     return sample.slice(0, sampleSize);
@@ -4480,7 +5168,7 @@ ${
 
   private generateFinalReport(
     totalTime: number,
-    verification: ImportVerificationReport | null
+    verification: ImportVerificationReport | null,
   ): ImportVerificationReport {
     const report: ImportVerificationReport = verification || {
       totalElements: this.createdNodes.size,
@@ -4498,7 +5186,7 @@ ${
       totalProcessingTime: totalTime,
       textNodesValidated: this.textValidationResults.length,
       textValidationFailures: this.textValidationResults.filter(
-        (v) => !v.success
+        (v) => !v.success,
       ).length,
       failedNodes: this.failedNodes,
     };
@@ -4515,48 +5203,70 @@ ${
 
   /**
    * PHASE 2: Pre-process schema to normalize values upfront
+   * REFACTORED: Iterative traversal to prevent Maximum Call Stack Exceeded
    */
-  private preprocessSchema(node: any): void {
-    if (!node) return;
+  private preprocessSchema(rootNode: any): void {
+    if (!rootNode) return;
 
-    // ROBUSTNESS: BACKFILL LAYOUT FROM RECT
-    // Some capture engines produce 'rect' instead of 'layout'. NodeBuilder strictly requires 'layout'.
-    if (!node.layout && node.rect && typeof node.rect === "object") {
-      node.layout = {
-        x: node.rect.x,
-        y: node.rect.y,
-        width: node.rect.width,
-        height: node.rect.height,
-      };
-    }
+    // Iterative traversal with cycle detection
+    const stack = [rootNode];
+    const visited = new Set<any>();
 
-    // Normalize numeric values
-    if (node.layout) {
-      node.layout.x = ValidationUtils.safeParseFloat(node.layout.x, 0);
-      node.layout.y = ValidationUtils.safeParseFloat(node.layout.y, 0);
-      node.layout.width = ValidationUtils.safeParseFloat(node.layout.width, 0);
-      node.layout.height = ValidationUtils.safeParseFloat(
-        node.layout.height,
-        0
-      );
-    }
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (!node) continue;
 
-    // Normalize opacity
-    if (node.opacity !== undefined) {
-      node.opacity = Math.max(
-        0,
-        Math.min(1, ValidationUtils.safeParseFloat(node.opacity, 1))
-      );
-    }
+      // Cycle detection
+      if (visited.has(node)) {
+        continue;
+      }
+      visited.add(node);
 
-    // Normalize zIndex
-    if (node.zIndex !== undefined) {
-      node.zIndex = ValidationUtils.safeParseFloat(node.zIndex, 0);
-    }
+      // ROBUSTNESS: BACKFILL LAYOUT FROM RECT
+      // Some capture engines produce 'rect' instead of 'layout'. NodeBuilder strictly requires 'layout'.
+      if (!node.layout && node.rect && typeof node.rect === "object") {
+        node.layout = {
+          x: node.rect.x,
+          y: node.rect.y,
+          width: node.rect.width,
+          height: node.rect.height,
+        };
+      }
 
-    // Process children recursively
-    if (Array.isArray(node.children)) {
-      node.children.forEach((child: any) => this.preprocessSchema(child));
+      // Normalize numeric values
+      if (node.layout) {
+        node.layout.x = ValidationUtils.safeParseFloat(node.layout.x, 0);
+        node.layout.y = ValidationUtils.safeParseFloat(node.layout.y, 0);
+        node.layout.width = ValidationUtils.safeParseFloat(
+          node.layout.width,
+          0,
+        );
+        node.layout.height = ValidationUtils.safeParseFloat(
+          node.layout.height,
+          0,
+        );
+      }
+
+      // Normalize opacity
+      if (node.opacity !== undefined) {
+        node.opacity = Math.max(
+          0,
+          Math.min(1, ValidationUtils.safeParseFloat(node.opacity, 1)),
+        );
+      }
+
+      // Normalize zIndex
+      if (node.zIndex !== undefined) {
+        node.zIndex = ValidationUtils.safeParseFloat(node.zIndex, 0);
+      }
+
+      // Push children to stack
+      if (Array.isArray(node.children)) {
+        // Reverse order to process first child first (though order doesn't strictly matter for preprocessing)
+        for (let i = node.children.length - 1; i >= 0; i--) {
+          stack.push(node.children[i]);
+        }
+      }
     }
   }
 
@@ -4617,17 +5327,17 @@ ${
         message += `. ${percentFailed}% of style operations failed`;
         console.warn(
           `⚠️ [STYLE_OPERATIONS] High failure rate detected:`,
-          styleStats
+          styleStats,
         );
         console.warn(
-          `⚠️ [STYLE_OPERATIONS] This may indicate schema issues or incompatible CSS properties. Check console for details.`
+          `⚠️ [STYLE_OPERATIONS] This may indicate schema issues or incompatible CSS properties. Check console for details.`,
         );
       }
 
       figma.notify(message + ". See console for details.", { timeout: 6000 });
     } else {
       figma.notify(
-        `✅ Import complete: ${report.successfulElements} elements created!`
+        `✅ Import complete: ${report.successfulElements} elements created!`,
       );
     }
   }
@@ -4679,11 +5389,17 @@ ${
 
     // CRITICAL: Iterative traversal to prevent stack overflow
     const stack: { node: any; depth: number }[] = [{ node: root, depth: 0 }];
+    // Cycle detection to prevent infinite loops
+    const visited = new Set<any>();
 
     while (stack.length > 0) {
       const { node, depth } = stack.pop()!;
 
       if (!node) continue;
+
+      // Cycle detection
+      if (visited.has(node)) continue;
+      visited.add(node);
 
       totalNodes++;
       maxDepth = Math.max(maxDepth, depth);
@@ -4786,16 +5502,47 @@ ${
   }
 
   /**
+   * P0-1 FIX: Normalize an image hash by stripping data URI prefixes.
+   * The capture side sometimes uses full data URLs as keys, while the lookup
+   * side may use just the base64 portion or a hash of the content.
+   *
+   * This normalizes by:
+   * 1. Stripping data:image/...;base64, prefixes
+   * 2. Removing any whitespace
+   * 3. Returning just the raw base64/hash portion
+   */
+  private normalizeImageHash(hash: string): string {
+    if (!hash || typeof hash !== "string") return "";
+
+    // Strip data URI prefix if present (common format: data:image/png;base64,...)
+    let normalized = hash;
+    const dataUriMatch = hash.match(/^data:[^;]+;base64,(.+)$/i);
+    if (dataUriMatch) {
+      normalized = dataUriMatch[1];
+    }
+
+    // Also handle cases where only "base64," prefix exists
+    if (normalized.startsWith("base64,")) {
+      normalized = normalized.substring(7);
+    }
+
+    // Remove any whitespace that might have crept in
+    normalized = normalized.replace(/\s/g, "");
+
+    return normalized;
+  }
+
+  /**
    * CRITICAL: Validate and sanitize coordinates to prevent positioning failures
    */
   private validateCoordinate(
     value: any,
     axis: "x" | "y",
-    nodeId: string
+    nodeId: string,
   ): number {
     if (typeof value !== "number" || !isFinite(value)) {
       console.warn(
-        `⚠️ Invalid ${axis} coordinate for node ${nodeId}: ${value}, using 0`
+        `⚠️ Invalid ${axis} coordinate for node ${nodeId}: ${value}, using 0`,
       );
       return 0;
     }
@@ -4806,7 +5553,7 @@ ${
 
     if (value < MIN_COORD || value > MAX_COORD) {
       console.warn(
-        `⚠️ ${axis} coordinate ${value} outside safe bounds for node ${nodeId}, clamping`
+        `⚠️ ${axis} coordinate ${value} outside safe bounds for node ${nodeId}, clamping`,
       );
       return Math.max(MIN_COORD, Math.min(MAX_COORD, value));
     }
@@ -4859,7 +5606,7 @@ ${
           const fontFamily = token.fontFamily || "Inter";
           const fontWeight = ValidationUtils.safeParseFloat(
             token.fontWeight,
-            400
+            400,
           );
           const fontSize = ValidationUtils.safeParseFloat(token.fontSize, 16);
           const fontStyle = this.weightToStyle(fontWeight);
@@ -4877,7 +5624,7 @@ ${
           if (token.lineHeight) {
             const lineHeight = ValidationUtils.safeParseFloat(
               token.lineHeight,
-              0
+              0,
             );
             if (lineHeight > 0) {
               style.lineHeight = { unit: "PIXELS", value: lineHeight };
@@ -4887,7 +5634,7 @@ ${
           if (token.letterSpacing) {
             const letterSpacing = ValidationUtils.safeParseFloat(
               token.letterSpacing,
-              0
+              0,
             );
             style.letterSpacing = { unit: "PIXELS", value: letterSpacing };
           }
@@ -4910,14 +5657,14 @@ ${
     const totalTime = Date.now() - (this as any).importStartTime;
 
     console.log(
-      "\n🎯 ═══════════════════════════════════════════════════════════"
+      "\n🎯 ═══════════════════════════════════════════════════════════",
     );
     console.log("🚀 FIGMA IMPORT COMPLETION REPORT");
     console.log("═══════════════════════════════════════════════════════════");
 
     console.log(`📄 SOURCE: ${this.data?.metadata?.url || "Unknown"}`);
     console.log(
-      `⏱️  IMPORT TIME: ${totalTime || report.processingTime || "Unknown"}ms`
+      `⏱️  IMPORT TIME: ${totalTime || report.processingTime || "Unknown"}ms`,
     );
     console.log(
       `📊 SUCCESS RATE: ${report.successfulNodes || 0}/${
@@ -4925,13 +5672,13 @@ ${
       } nodes (${(
         ((report.successfulNodes || 0) / Math.max(1, report.totalNodes || 1)) *
         100
-      ).toFixed(1)}%)`
+      ).toFixed(1)}%)`,
     );
 
     if (stats) {
       console.log("\n🎯 PIXEL-PERFECT RESULTS:");
       console.log(
-        `   Nodes with Transforms Applied: ${stats.transformsApplied}`
+        `   Nodes with Transforms Applied: ${stats.transformsApplied}`,
       );
       console.log(`   Matrix Transforms: ${stats.matrixTransforms}`);
       console.log(`   Auto Layout Frames: ${stats.autoLayoutFrames}`);
@@ -4951,7 +5698,7 @@ ${
         console.log(
           `   ${i + 1}. ${error.type || "Error"}: ${
             error.message || "Unknown error"
-          }`
+          }`,
         );
       });
     }
@@ -4966,7 +5713,7 @@ ${
     console.log("═══════════════════════════════════════════════════════════");
     console.log(`🎉 FIGMA IMPORT COMPLETE: Ready for design iteration!`);
     console.log(
-      "═══════════════════════════════════════════════════════════\n"
+      "═══════════════════════════════════════════════════════════\n",
     );
 
     // MISSING NODES REPORT - Track what failed and why
@@ -4980,13 +5727,13 @@ ${
 
     // Count total schema nodes from the original data
     const totalSchemaNodes = this.countSchemaNodes(
-      this.data.root || this.data.tree
+      this.data.root || this.data.tree,
     );
     const successfulNodes = this.createdNodes.size;
     const failedNodes = this.failedNodes.length;
     const skippedNodes = Math.max(
       0,
-      totalSchemaNodes - successfulNodes - failedNodes
+      totalSchemaNodes - successfulNodes - failedNodes,
     );
 
     console.log(`📊 Total schema nodes received: ${totalSchemaNodes}`);
@@ -4995,8 +5742,8 @@ ${
     console.log(`❌ Failed (with error): ${failedNodes}`);
     console.log(
       `📈 Success rate: ${((successfulNodes / totalSchemaNodes) * 100).toFixed(
-        1
-      )}%`
+        1,
+      )}%`,
     );
 
     // Group failures by reason code
@@ -5010,7 +5757,7 @@ ${
     if (failuresByReason.size > 0) {
       console.log("\n📋 Top Failure Reasons:");
       const sortedReasons = Array.from(failuresByReason.entries()).sort(
-        (a, b) => b[1].length - a[1].length
+        (a, b) => b[1].length - a[1].length,
       );
 
       sortedReasons.forEach(([reason, failures]) => {
@@ -5020,14 +5767,14 @@ ${
         console.log(
           `    Example: id=${first.id}, type=${first.type}, name=${
             first.nodeData?.name || "N/A"
-          }`
+          }`,
         );
         console.log(
-          `    hasLayout=${first.hasLayout}, hasRect=${first.hasRect}`
+          `    hasLayout=${first.hasLayout}, hasRect=${first.hasRect}`,
         );
         if (first.geometry) {
           console.log(
-            `    geometry: w=${first.geometry.width}, h=${first.geometry.height}`
+            `    geometry: w=${first.geometry.width}, h=${first.geometry.height}`,
           );
         }
         if (first.stack) {
@@ -5136,7 +5883,7 @@ ${
       if (diagnosticExport.summary.totalNodes === 0 && this.mainFrame) {
         const actualNodeCount = this.mainFrame.children.length + 1; // +1 for main frame itself
         console.warn(
-          `⚠️ [DIAGNOSTIC] Tracking shows 0 nodes but main frame has ${this.mainFrame.children.length} children. Updating count.`
+          `⚠️ [DIAGNOSTIC] Tracking shows 0 nodes but main frame has ${this.mainFrame.children.length} children. Updating count.`,
         );
         diagnosticExport.summary.totalNodes = actualNodeCount;
         diagnosticExport.summary.successfulNodes = actualNodeCount;
@@ -5165,11 +5912,11 @@ ${
 
       // Log summary to console
       console.log(
-        "\n📊 ═══════════════════════════════════════════════════════════"
+        "\n📊 ═══════════════════════════════════════════════════════════",
       );
       console.log("🔬 DIAGNOSTIC EXPORT SUMMARY");
       console.log(
-        "═══════════════════════════════════════════════════════════"
+        "═══════════════════════════════════════════════════════════",
       );
       console.log(`Import ID: ${diagnosticExport.importId}`);
       console.log(`Timestamp: ${diagnosticExport.timestamp}`);
@@ -5177,52 +5924,52 @@ ${
       console.log("\n📈 NODE STATISTICS:");
       console.log(`   Total Nodes: ${diagnosticExport.summary.totalNodes}`);
       console.log(
-        `   Successful Nodes: ${diagnosticExport.summary.successfulNodes}`
+        `   Successful Nodes: ${diagnosticExport.summary.successfulNodes}`,
       );
       console.log(
-        `   Failed Nodes: ${diagnosticExport.summary.failedNodes.length}`
+        `   Failed Nodes: ${diagnosticExport.summary.failedNodes.length}`,
       );
       console.log(
-        `   White Blank Frames: ${diagnosticExport.summary.whiteBlankFrames.length}`
+        `   White Blank Frames: ${diagnosticExport.summary.whiteBlankFrames.length}`,
       );
       console.log(
-        `   Rasterized Nodes: ${diagnosticExport.summary.rasterizedNodes}`
+        `   Rasterized Nodes: ${diagnosticExport.summary.rasterizedNodes}`,
       );
       console.log(
-        `   Auto Layout Nodes: ${diagnosticExport.summary.autoLayoutNodes}`
+        `   Auto Layout Nodes: ${diagnosticExport.summary.autoLayoutNodes}`,
       );
       console.log(
-        `   Transformed Nodes: ${diagnosticExport.summary.transformedNodes}`
+        `   Transformed Nodes: ${diagnosticExport.summary.transformedNodes}`,
       );
       console.log(
-        `   Early Returns Detected: ${diagnosticExport.summary.earlyReturns.length}`
+        `   Early Returns Detected: ${diagnosticExport.summary.earlyReturns.length}`,
       );
       console.log(
-        `   Critical Failures: ${diagnosticExport.summary.criticalFailures}`
+        `   Critical Failures: ${diagnosticExport.summary.criticalFailures}`,
       );
 
       if (diagnosticExport.performanceMetrics) {
         console.log("\n⏱️  PERFORMANCE:");
         console.log(
-          `   Total Import Duration: ${diagnosticExport.performanceMetrics.totalImportDurationMs}ms`
+          `   Total Import Duration: ${diagnosticExport.performanceMetrics.totalImportDurationMs}ms`,
         );
         console.log(
           `   Average Node Build Time: ${diagnosticExport.performanceMetrics.averageNodeBuildTimeMs.toFixed(
-            2
-          )}ms`
+            2,
+          )}ms`,
         );
         console.log(
-          `   Rasterization Time: ${diagnosticExport.performanceMetrics.rasterizationTimeMs}ms`
+          `   Rasterization Time: ${diagnosticExport.performanceMetrics.rasterizationTimeMs}ms`,
         );
       }
 
       console.log("\n💾 EXPORT:");
       console.log(
-        `   Diagnostic data collected for ${diagnosticExport.nodeDetails.length} nodes`
+        `   Diagnostic data collected for ${diagnosticExport.nodeDetails.length} nodes`,
       );
       console.log(`   Use figma.ui.postMessage to export full JSON`);
       console.log(
-        "═══════════════════════════════════════════════════════════\n"
+        "═══════════════════════════════════════════════════════════\n",
       );
 
       // Post diagnostic data to UI for download

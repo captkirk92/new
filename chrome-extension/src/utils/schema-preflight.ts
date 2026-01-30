@@ -30,7 +30,12 @@ export type PreflightResult = {
     imagesReferenced: number;
     imagesEmbedded: number;
     imagesMissing: number;
-    screenshot: { present: boolean; width?: number; height?: number; dpr?: number };
+    screenshot: {
+      present: boolean;
+      width?: number;
+      height?: number;
+      dpr?: number;
+    };
   };
 };
 
@@ -38,8 +43,8 @@ export type PreflightResult = {
 type Layout = {
   pageX?: number;
   pageY?: number;
-  x?: number;     // Fallback if pageX not used
-  y?: number;     // Fallback if pageY not used
+  x?: number; // Fallback if pageX not used
+  y?: number; // Fallback if pageY not used
   width: number;
   height: number;
   [key: string]: any;
@@ -56,26 +61,40 @@ type ElementNode = {
   parentId?: string;
   children?: ElementNode[];
   type?: string;
-  layout?: Layout;      // Made optional as some nodes might lack it or use different key
+  layout?: Layout; // Made optional as some nodes might lack it or use different key
   absoluteLayout?: any; // Observed in other files
   fills?: Fill[];
   [key: string]: any;
 };
 
 type Assets = {
-  images: Record<string, { bytes?: string | Uint8Array | object; mimeType?: string; width?: number; height?: number; [key: string]: any }>;
-  svgs: Record<string, { text?: string; bytes?: string | Uint8Array; [key: string]: any }>;
+  images: Record<
+    string,
+    {
+      bytes?: string | Uint8Array | object;
+      mimeType?: string;
+      width?: number;
+      height?: number;
+      [key: string]: any;
+    }
+  >;
+  svgs: Record<
+    string,
+    { text?: string; bytes?: string | Uint8Array; [key: string]: any }
+  >;
   fonts?: Record<string, any>;
   [key: string]: any;
 };
 
-type Screenshot = {
-  bytes?: string | Uint8Array; // base64 or raw bytes
-  width?: number;
-  height?: number;
-  devicePixelRatio?: number;
-  [key: string]: any;
-} | string;
+type Screenshot =
+  | {
+      bytes?: string | Uint8Array; // base64 or raw bytes
+      width?: number;
+      height?: number;
+      devicePixelRatio?: number;
+      [key: string]: any;
+    }
+  | string;
 
 function isFiniteNumber(n: any): n is number {
   return typeof n === "number" && Number.isFinite(n);
@@ -96,20 +115,22 @@ function walk(root: ElementNode): ElementNode[] {
   while (stack.length) {
     iterations++;
     if (iterations > MAX_ITERATIONS) {
-        console.warn("[PREFLIGHT] Walk terminated early: exceeded iteration limit (possible cycle or massive tree)");
-        break;
+      console.warn(
+        "[PREFLIGHT] Walk terminated early: exceeded iteration limit (possible cycle or massive tree)",
+      );
+      break;
     }
 
     const n = stack.pop()!;
     if (visited.has(n)) continue;
     visited.add(n);
-    
+
     out.push(n);
     const kids = n.children || [];
     for (let i = kids.length - 1; i >= 0; i--) {
-        if (!visited.has(kids[i])) {
-            stack.push(kids[i]);
-        }
+      if (!visited.has(kids[i])) {
+        stack.push(kids[i]);
+      }
     }
   }
   return out;
@@ -174,12 +195,26 @@ export function preflightSchemaJob(params: {
   for (const parent of nodes) {
     for (const child of parent.children || []) {
       if (child.parentId !== parent.id) {
+        // DIAGNOSTIC: Log first 5 mismatches for debugging
+        if (
+          issues.filter((i) => i.code === "SCHEMA_PARENT_MISMATCH").length < 5
+        ) {
+          console.error(
+            `[PREFLIGHT] PARENT_MISMATCH: child="${child.id}" (type=${child.type}, name=${child.name}) has parentId="${child.parentId}" but is in parent="${parent.id}" (type=${parent.type}, name=${parent.name}) children array`,
+          );
+        }
         push(issues, {
           severity: "FATAL",
           code: "SCHEMA_PARENT_MISMATCH",
           message: `Parent/child mismatch: child.parentId != parent.id`,
           nodeId: child.id,
-          details: { expectedParentId: parent.id, actualParentId: child.parentId },
+          details: {
+            expectedParentId: parent.id,
+            actualParentId: child.parentId,
+            parentName: parent.name,
+            childName: child.name,
+            childType: child.type,
+          },
         });
       }
     }
@@ -230,12 +265,12 @@ export function preflightSchemaJob(params: {
       depth++;
     }
     if (depth >= 1000) {
-       push(issues, {
-          severity: "WARN",
-          code: "SCHEMA_CYCLE",
-          message: `Potential cycle or deep nesting (depth > 1000) for node ${n.id}`,
-          nodeId: n.id,
-       });
+      push(issues, {
+        severity: "WARN",
+        code: "SCHEMA_CYCLE",
+        message: `Potential cycle or deep nesting (depth > 1000) for node ${n.id}`,
+        nodeId: n.id,
+      });
     }
   }
 
@@ -243,17 +278,17 @@ export function preflightSchemaJob(params: {
   for (const n of nodes) {
     // Check for layout or absoluteLayout
     const l = n.layout || n.absoluteLayout;
-    
+
     if (!l) {
-        // Some nodes might not have layout if they are hidden or not rendered, 
-        // but typically all should have it.
-        push(issues, {
-            severity: "WARN", 
-            code: "GEOMETRY_INVALID",
-            message: "Node missing layout information",
-            nodeId: n.id
-        });
-        continue;
+      // Some nodes might not have layout if they are hidden or not rendered,
+      // but typically all should have it.
+      push(issues, {
+        severity: "WARN",
+        code: "GEOMETRY_INVALID",
+        message: "Node missing layout information",
+        nodeId: n.id,
+      });
+      continue;
     }
 
     if (!isFiniteNumber(l.width) || !isFiniteNumber(l.height)) {
@@ -279,8 +314,10 @@ export function preflightSchemaJob(params: {
 
     // Coordinate validation
     // Prefer pageX/pageY, fallback to x/y or left/top
-    const x = l.pageX ?? l.x ?? (n.absoluteLayout ? n.absoluteLayout.left : undefined);
-    const y = l.pageY ?? l.y ?? (n.absoluteLayout ? n.absoluteLayout.top : undefined);
+    const x =
+      l.pageX ?? l.x ?? (n.absoluteLayout ? n.absoluteLayout.left : undefined);
+    const y =
+      l.pageY ?? l.y ?? (n.absoluteLayout ? n.absoluteLayout.top : undefined);
 
     if (x == null || y == null || !isFiniteNumber(x) || !isFiniteNumber(y)) {
       push(issues, {
@@ -303,7 +340,7 @@ export function preflightSchemaJob(params: {
       if (f.type === "SVG" && f.imageHash) referencedSvgs.add(f.imageHash);
     }
   }
-  
+
   imagesReferencedCount = referencedImages.size;
 
   const imageKeys = assets?.images ? Object.keys(assets.images) : [];
@@ -323,7 +360,7 @@ export function preflightSchemaJob(params: {
       const img = assets.images[h];
       // Check for 'bytes' or 'data' or 'base64' (common variations)
       const hasBytes = img && (img.bytes || img.data || img.base64);
-      
+
       if (!img || !hasBytes) {
         imagesMissingCount++;
         push(issues, {
@@ -351,100 +388,132 @@ export function preflightSchemaJob(params: {
   }
 
   // --- C) Screenshot validation ---
-  const screenshotPresent = typeof screenshot === 'string' 
+  const screenshotPresent =
+    typeof screenshot === "string"
       ? screenshot.length > 0
-      : !!(screenshot.bytes || (screenshot as any).base64 || (screenshot as any).data);
+      : !!(
+          screenshot.bytes ||
+          (screenshot as any).base64 ||
+          (screenshot as any).data
+        );
 
   if (requireScreenshot && !screenshotPresent) {
-      push(issues, {
-      severity: "FATAL",
+    push(issues, {
+      severity: "WARN", // Downgraded from FATAL - screenshot is for validation only, not required for import
       code: "SCREENSHOT_MISSING",
       message: "Reference screenshot bytes are missing.",
-      });
+    });
   }
 
-  if (screenshotPresent && typeof screenshot === 'object') {
+  if (screenshotPresent && typeof screenshot === "object") {
     if (screenshot.width != null && screenshot.height != null) {
-        if (!isFiniteNumber(screenshot.width) || !isFiniteNumber(screenshot.height) || screenshot.width <= 0 || screenshot.height <= 0) {
-            push(issues, {
-                severity: "FATAL",
-                code: "SCREENSHOT_META_INVALID",
-                message: "Screenshot meta is missing or invalid (width/height).",
-                details: { width: screenshot.width, height: screenshot.height },
-            });
-        }
+      if (
+        !isFiniteNumber(screenshot.width) ||
+        !isFiniteNumber(screenshot.height) ||
+        screenshot.width <= 0 ||
+        screenshot.height <= 0
+      ) {
+        push(issues, {
+          severity: "FATAL",
+          code: "SCREENSHOT_META_INVALID",
+          message: "Screenshot meta is missing or invalid (width/height).",
+          details: { width: screenshot.width, height: screenshot.height },
+        });
+      }
     }
-    
+
     if (screenshot.devicePixelRatio != null) {
-        if (!isFiniteNumber(screenshot.devicePixelRatio) || screenshot.devicePixelRatio <= 0) {
-            push(issues, {
-                severity: "WARN",
-                code: "SCREENSHOT_META_INVALID",
-                message: "Screenshot devicePixelRatio missing/invalid; verification alignment may be impacted.",
-                details: { devicePixelRatio: screenshot.devicePixelRatio },
-            });
-        }
+      if (
+        !isFiniteNumber(screenshot.devicePixelRatio) ||
+        screenshot.devicePixelRatio <= 0
+      ) {
+        push(issues, {
+          severity: "WARN",
+          code: "SCREENSHOT_META_INVALID",
+          message:
+            "Screenshot devicePixelRatio missing/invalid; verification alignment may be impacted.",
+          details: { devicePixelRatio: screenshot.devicePixelRatio },
+        });
+      }
     }
   }
 
-  return finalize(issues, nodesTotal, assets, screenshot, imagesReferencedCount, imagesMissingCount);
+  return finalize(
+    issues,
+    nodesTotal,
+    assets,
+    screenshot,
+    imagesReferencedCount,
+    imagesMissingCount,
+  );
 }
 
 function finalize(
-    issues: PreflightIssue[], 
-    nodesTotal: number, 
-    assets: Assets, 
-    screenshot: Screenshot,
-    imagesReferenced: number,
-    imagesMissing: number
+  issues: PreflightIssue[],
+  nodesTotal: number,
+  assets: Assets,
+  screenshot: Screenshot,
+  imagesReferenced: number,
+  imagesMissing: number,
 ): PreflightResult {
-    const fatalCount = issues.filter(i => i.severity === "FATAL").length;
-    const warnCount = issues.filter(i => i.severity === "WARN").length;
+  const fatalCount = issues.filter((i) => i.severity === "FATAL").length;
+  const warnCount = issues.filter((i) => i.severity === "WARN").length;
 
-    const embedded = assets?.images ? Object.keys(assets.images).length : 0;
-    
-    // Check if screenshot is present (handling both object and string forms)
-    const screenshotPresent = typeof screenshot === 'string' 
-        ? screenshot.length > 0
-        : !!(screenshot.bytes || (screenshot as any).base64 || (screenshot as any).data);
+  const embedded = assets?.images ? Object.keys(assets.images).length : 0;
 
-    return {
-      ok: fatalCount === 0,
-      fatalCount,
-      warnCount,
-      issues,
-      summary: {
-        nodesTotal,
-        imagesReferenced,
-        imagesEmbedded: embedded,
-        imagesMissing,
-        screenshot: {
-          present: screenshotPresent,
-          width: typeof screenshot === 'object' ? screenshot.width : undefined,
-          height: typeof screenshot === 'object' ? screenshot.height : undefined,
-          dpr: typeof screenshot === 'object' ? screenshot.devicePixelRatio : undefined,
-        },
+  // Check if screenshot is present (handling both object and string forms)
+  const screenshotPresent =
+    typeof screenshot === "string"
+      ? screenshot.length > 0
+      : !!(
+          screenshot.bytes ||
+          (screenshot as any).base64 ||
+          (screenshot as any).data
+        );
+
+  return {
+    ok: fatalCount === 0,
+    fatalCount,
+    warnCount,
+    issues,
+    summary: {
+      nodesTotal,
+      imagesReferenced,
+      imagesEmbedded: embedded,
+      imagesMissing,
+      screenshot: {
+        present: screenshotPresent,
+        width: typeof screenshot === "object" ? screenshot.width : undefined,
+        height: typeof screenshot === "object" ? screenshot.height : undefined,
+        dpr:
+          typeof screenshot === "object"
+            ? screenshot.devicePixelRatio
+            : undefined,
       },
-    };
-  }
+    },
+  };
+}
 
 export function normalizeAndPreflight(payload: any): PreflightResult {
-    // Helper to extract root, assets, screenshot from various payload shapes
-    let root = payload.root || payload.tree;
-    let assets = payload.assets || (payload.schema ? payload.schema.assets : undefined);
-    let screenshot = payload.screenshot || (payload.schema ? payload.schema.screenshot : undefined);
-    
-    // Handle wrapped schema case
-    if (payload.schema) {
-        root = root || payload.schema.root || payload.schema.tree;
-        assets = assets || payload.schema.assets;
-        screenshot = screenshot || payload.schema.screenshot;
-    }
+  // Helper to extract root, assets, screenshot from various payload shapes
+  let root = payload.root || payload.tree;
+  let assets =
+    payload.assets || (payload.schema ? payload.schema.assets : undefined);
+  let screenshot =
+    payload.screenshot ||
+    (payload.schema ? payload.schema.screenshot : undefined);
 
-    return preflightSchemaJob({
-        root,
-        assets,
-        screenshot,
-        requireScreenshot: true
-    });
+  // Handle wrapped schema case
+  if (payload.schema) {
+    root = root || payload.schema.root || payload.schema.tree;
+    assets = assets || payload.schema.assets;
+    screenshot = screenshot || payload.schema.screenshot;
+  }
+
+  return preflightSchemaJob({
+    root,
+    assets,
+    screenshot,
+    requireScreenshot: true,
+  });
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# Web to Figma - Auto-Restart Dev Script
+# figmafi - Unified Start Script
 # ============================================
 # This script starts all services in WATCH mode.
 #   1. Handoff Server: Restarts on change (Node --watch)
@@ -19,7 +19,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}╔════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║      Web to Figma - Development Mode       ║${NC}"
+echo -e "${BLUE}║          figmafi - Starting Services       ║   ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════╝${NC}"
 echo -e "${CYAN}Auto-rebuild and auto-restart enabled${NC}"
 echo ""

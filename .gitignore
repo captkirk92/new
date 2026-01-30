@@ -1,88 +1,66 @@
-# OS
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing
+coverage/
+
+# Production
+build/
+dist/
+out/
+
+# Misc
 .DS_Store
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # Logs
-*.log
-.nohup*
-
-# Env / secrets
-.env
-.env.*
-*.local
-
-# Node
-node_modules/
-coverage/
 npm-debug.log*
-pnpm-debug.log*
+yarn-debug.log*
 yarn-error.log*
-
-# Build artifacts
-dist/
-chrome-extension/dist/
-figma-plugin/dist/
-
-# Tooling
-.claude/
-.vscode/
-.idea/
-
-# Local/Temp
-jobs-debug/
-.chrome-user-data/
-*.tmp
-*.backup
-analysis.txt
-fidelity-audit-output.txt
-
-handoff-jobs.json
-eng.traineddata
-
-# Test artifacts and captures
-
-*-report.json
-*.backup
-*.backup[0-9]
-*.old
-*.swp
-*~
-
-# Browser test profiles
-.puppeteer-profile*/
-.chrome-profile*/
-
-# Archived files
-scripts/archive/
-docs/archive/
-
-# Temporary test outputs
-test-output/
-capture-output/
-debug-*.json
-
-# Test runs and recordings
-runs/
-.playwright-mcp/
-.test-chrome-profile/
-.puppeteer-profile*/
-.chrome-profile*/
-chrome-user-data*/
-.chrome-user-data/
-.cursor/
-
-# Logs and debug files
+logs/
 *.log
-www.figma.com-*.log
-www.youtube.com-*.log
 
-# Build and local dev
-node_modules/
-dist/
-chrome-extension/dist/
-figma-plugin/dist/
-*.backup
-*.backup*
-*.old
-*.swp
-*.tmp
-transform_fix.tmp
+# Editor directories and files
+.idea/
+.vscode/
+*.suo
+*.ntvs
+*.njsproj
+*.sln
+*.sw?
+
+# Figma Plugin
+manifest.json
+!figma-plugin/manifest.json
+!chrome-extension/manifest.json
+
+# Gemini/Agent artifacts
+.gemini/
+.agent/
+.claude/
+artifacts/
+thoughts/
+
+# Temp / Local Debug
+tmp/
+*.bak
+*.patch
+*.orig
+*.rej
+reproduce_issue.js
+tools/test-preprocess.js
+
+# Screenshots
+Screenshot*.png
+screen.png
+
+# Reports
+DEBUG_ANALYSIS_REPORT.md
+DIAGNOSTIC_REPORT.md
+FIDELITY_GAP_ANALYSIS.md

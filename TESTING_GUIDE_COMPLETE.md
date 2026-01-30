@@ -12,7 +12,7 @@
 The extension was just rebuilt with diagnostics. Chrome needs to reload it:
 
 1. Open `chrome://extensions/`
-2. Find "Web to Figma" extension
+2. Find "figmafi" extension
 3. Click **Reload** button (circular arrow)
 
 ### 2. Capture Test Page

@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "description": "Import web pages as editable Figma designs",
   "scripts": {
-    "build": "esbuild src/code.ts --bundle --target=es6 --format=iife --platform=browser --minify --loader:.html=text --outfile=dist/code.js",
-    "watch": "esbuild src/code.ts --bundle --target=es6 --format=iife --platform=browser --minify --loader:.html=text --outfile=dist/code.js --watch"
+    "build": "esbuild src/code.ts --bundle --target=es2017 --format=iife --platform=browser --loader:.html=text --outfile=dist/code.js",
+    "watch": "esbuild src/code.ts --bundle --target=es2015 --format=iife --platform=browser --loader:.html=text --outfile=dist/code.js --watch"
   },
   "devDependencies": {
+    "@babel/cli": "^7.28.6",
+    "@babel/core": "^7.28.6",
+    "@babel/preset-env": "^7.28.6",
     "@figma/plugin-typings": "^1.90.0",
     "@types/node": "^20.0.0",
     "@types/pako": "^2.0.4",

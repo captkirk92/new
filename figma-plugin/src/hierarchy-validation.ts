@@ -174,7 +174,7 @@ export class HierarchyValidator {
         // Check if parent is the main frame (acceptable for root-level nodes)
         const isMainFrameParent =
           actualParent?.type === "FRAME" &&
-          (actualParent.name?.includes("Import") || !actualParentId);
+          ((actualParent.name && actualParent.name.includes("Import")) || !actualParentId);
 
         // Root-level nodes parented to main frame are acceptable
         if (isMainFrameParent && !expectedParentId) {

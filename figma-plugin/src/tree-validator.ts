@@ -67,13 +67,13 @@ export class TreeValidator {
         "No root or tree found in schema",
         {
           schemaKeys: Object.keys(schema),
-        }
+        },
       );
       return this.generateReport();
     }
 
     // Build hierarchy map
-    this.buildHierarchyMap(root, null, 0, []);
+    this.buildHierarchyMap(root, null, 0, [], new Set());
 
     // Validate structure
     this.validateHierarchyIntegrity();
@@ -92,7 +92,7 @@ export class TreeValidator {
    */
   validateFigmaTree(
     figmaFrame: FrameNode,
-    schemaRoot: any
+    schemaRoot: any,
   ): TreeValidationReport {
     console.log("🔍 [TREE VALIDATOR] Starting Figma tree validation...");
     this.issues = [];
@@ -101,11 +101,11 @@ export class TreeValidator {
 
     // Build schema hierarchy map
     const schemaMap = new Map<string, TreeNodeInfo>();
-    this.buildSchemaMap(schemaRoot, null, 0, [], schemaMap);
+    this.buildSchemaMap(schemaRoot, null, 0, [], schemaMap, new Set());
 
     // Build Figma hierarchy map
     const figmaMap = new Map<string, TreeNodeInfo>();
-    this.buildFigmaMap(figmaFrame, null, 0, [], figmaMap);
+    this.buildFigmaMap(figmaFrame, null, 0, [], figmaMap, new Set());
 
     // Compare structures
     this.compareHierarchies(schemaMap, figmaMap);
@@ -149,7 +149,7 @@ export class TreeValidator {
       type: node.type,
       childCount: node.children ? node.children.length : 0,
       children: (node.children || []).map((child: any) =>
-        this.exportTreeStructure(child)
+        this.exportTreeStructure(child),
       ),
     };
   }
@@ -160,9 +160,16 @@ export class TreeValidator {
     node: any,
     parentId: string | null,
     depth: number,
-    path: string[]
+    path: string[],
+    visited: Set<any>,
   ): void {
     if (!node) return;
+
+    // Cycle detection
+    if (visited.has(node)) {
+      return;
+    }
+    visited.add(node);
 
     const nodeId = node.id || `temp_${Math.random().toString(36).substr(2, 9)}`;
     const nodeName = node.name || node.tagName || node.type || "unnamed";
@@ -173,7 +180,7 @@ export class TreeValidator {
 
     const childIds = (node.children || []).map(
       (child: any) =>
-        child.id || `temp_${Math.random().toString(36).substr(2, 9)}`
+        child.id || `temp_${Math.random().toString(36).substr(2, 9)}`,
     );
 
     this.hierarchyMap.set(nodeId, {
@@ -189,7 +196,7 @@ export class TreeValidator {
     // Recursively process children
     if (node.children && Array.isArray(node.children)) {
       node.children.forEach((child: any) => {
-        this.buildHierarchyMap(child, nodeId, depth + 1, currentPath);
+        this.buildHierarchyMap(child, nodeId, depth + 1, currentPath, visited);
       });
     }
   }
@@ -199,9 +206,13 @@ export class TreeValidator {
     parentId: string | null,
     depth: number,
     path: string[],
-    map: Map<string, TreeNodeInfo>
+    map: Map<string, TreeNodeInfo>,
+    visited: Set<any>,
   ): void {
     if (!node) return;
+
+    if (visited.has(node)) return;
+    visited.add(node);
 
     const nodeId = node.id;
     const nodeName = node.name || node.tagName || node.type || "unnamed";
@@ -221,7 +232,14 @@ export class TreeValidator {
 
     if (node.children && Array.isArray(node.children)) {
       node.children.forEach((child: any) => {
-        this.buildSchemaMap(child, nodeId, depth + 1, currentPath, map);
+        this.buildSchemaMap(
+          child,
+          nodeId,
+          depth + 1,
+          currentPath,
+          map,
+          visited,
+        );
       });
     }
   }
@@ -231,8 +249,12 @@ export class TreeValidator {
     parentId: string | null,
     depth: number,
     path: string[],
-    map: Map<string, TreeNodeInfo>
+    map: Map<string, TreeNodeInfo>,
+    visited: Set<any>,
   ): void {
+    if (visited.has(node)) return;
+    visited.add(node);
+
     // Try to get original schema ID from plugin data
     let nodeId: string;
     try {
@@ -267,7 +289,7 @@ export class TreeValidator {
 
     if ("children" in node) {
       (node as FrameNode).children.forEach((child) => {
-        this.buildFigmaMap(child, nodeId, depth + 1, currentPath, map);
+        this.buildFigmaMap(child, nodeId, depth + 1, currentPath, map, visited);
       });
     }
   }
@@ -281,7 +303,7 @@ export class TreeValidator {
           nodeId,
           info.name,
           `Parent ID "${info.parentId}" not found in hierarchy`,
-          { expectedParentId: info.parentId }
+          { expectedParentId: info.parentId },
         );
       }
     }
@@ -301,7 +323,7 @@ export class TreeValidator {
             {
               parentId: info.parentId,
               parentChildIds: parent.childIds,
-            }
+            },
           );
         }
       }
@@ -318,7 +340,7 @@ export class TreeValidator {
             {
               childParentId: child.parentId,
               actualParentId: nodeId,
-            }
+            },
           );
         }
       }
@@ -340,7 +362,7 @@ export class TreeValidator {
           id,
           node?.name || "unknown",
           `Duplicate ID found ${count} times in tree`,
-          { occurrences: count }
+          { occurrences: count },
         );
       }
     }
@@ -359,7 +381,7 @@ export class TreeValidator {
             nodeId,
             info.name,
             "Multiple root nodes detected (expected only one root)",
-            { depth: info.depth }
+            { depth: info.depth },
           );
         }
       }
@@ -370,14 +392,14 @@ export class TreeValidator {
         "error",
         "unknown",
         "Tree",
-        "No root node found - all nodes have parents (circular reference?)"
+        "No root node found - all nodes have parents (circular reference?)",
       );
     }
   }
 
   private compareHierarchies(
     schemaMap: Map<string, TreeNodeInfo>,
-    figmaMap: Map<string, TreeNodeInfo>
+    figmaMap: Map<string, TreeNodeInfo>,
   ): void {
     // Check for missing nodes in Figma
     for (const [schemaId, schemaInfo] of schemaMap) {
@@ -391,7 +413,7 @@ export class TreeValidator {
             schemaType: schemaInfo.type,
             schemaDepth: schemaInfo.depth,
             schemaPath: schemaInfo.path.join(" > "),
-          }
+          },
         );
       } else {
         // Node exists - verify structure matches
@@ -406,7 +428,7 @@ export class TreeValidator {
             {
               schemaChildCount: schemaInfo.childIds.length,
               figmaChildCount: figmaInfo.childIds.length,
-            }
+            },
           );
         }
 
@@ -419,7 +441,7 @@ export class TreeValidator {
             {
               schemaDepth: schemaInfo.depth,
               figmaDepth: figmaInfo.depth,
-            }
+            },
           );
         }
       }
@@ -436,7 +458,7 @@ export class TreeValidator {
           {
             figmaType: figmaInfo.type,
             figmaDepth: figmaInfo.depth,
-          }
+          },
         );
       }
     }
@@ -447,7 +469,7 @@ export class TreeValidator {
     nodeId: string,
     nodeName: string,
     issue: string,
-    details?: any
+    details?: any,
   ): void {
     this.issues.push({
       severity,
@@ -461,7 +483,7 @@ export class TreeValidator {
   private generateReport(): TreeValidationReport {
     const errorCount = this.issues.filter((i) => i.severity === "error").length;
     const warningCount = this.issues.filter(
-      (i) => i.severity === "warning"
+      (i) => i.severity === "warning",
     ).length;
 
     let summary = `Tree validation complete: ${this.hierarchyMap.size} nodes, max depth ${this.maxDepth}`;
@@ -504,12 +526,12 @@ export class TreeValidator {
         console.log("  ❌ Errors:");
         errors.forEach((issue) => {
           console.log(
-            `    [${issue.nodeId}] ${issue.nodeName}: ${issue.issue}`
+            `    [${issue.nodeId}] ${issue.nodeName}: ${issue.issue}`,
           );
           if (issue.details) {
             console.log(
               "      Details:",
-              JSON.stringify(issue.details, null, 2)
+              JSON.stringify(issue.details, null, 2),
             );
           }
         });
@@ -519,12 +541,12 @@ export class TreeValidator {
         console.log("  ⚠️ Warnings:");
         warnings.forEach((issue) => {
           console.log(
-            `    [${issue.nodeId}] ${issue.nodeName}: ${issue.issue}`
+            `    [${issue.nodeId}] ${issue.nodeName}: ${issue.issue}`,
           );
           if (issue.details) {
             console.log(
               "      Details:",
-              JSON.stringify(issue.details, null, 2)
+              JSON.stringify(issue.details, null, 2),
             );
           }
         });
@@ -534,12 +556,12 @@ export class TreeValidator {
         console.log("  ℹ️ Info:");
         infos.forEach((issue) => {
           console.log(
-            `    [${issue.nodeId}] ${issue.nodeName}: ${issue.issue}`
+            `    [${issue.nodeId}] ${issue.nodeName}: ${issue.issue}`,
           );
           if (issue.details) {
             console.log(
               "      Details:",
-              JSON.stringify(issue.details, null, 2)
+              JSON.stringify(issue.details, null, 2),
             );
           }
         });

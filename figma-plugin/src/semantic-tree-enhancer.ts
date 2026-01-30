@@ -147,14 +147,14 @@ function hasFormElements(node: any): boolean {
 
 function hasGridLayout(node: any): boolean {
   return (
-    node.computedStyle?.display?.includes("grid") ||
+    (node.computedStyle && node.computedStyle.display && node.computedStyle.display.includes("grid")) ||
     (node.children?.length >= 4 && hasRegularSpacing(node.children))
   );
 }
 
 function hasStackLayout(node: any): boolean {
   return (
-    node.computedStyle?.display?.includes("flex") ||
+    (node.computedStyle && node.computedStyle.display && node.computedStyle.display.includes("flex")) ||
     (node.children?.length >= 2 && hasLinearArrangement(node.children))
   );
 }
@@ -311,7 +311,7 @@ export function detectAutoLayoutDirection(
     }
   }
 
-  if (display?.includes("grid")) {
+  if (display && display.includes("grid")) {
     // Grid can be both - check dominant direction
     const horizontalGaps = [];
     const verticalGaps = [];

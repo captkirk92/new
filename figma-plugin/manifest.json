@@ -1,15 +1,13 @@
 {
-  "name": "Web to Figma Importer",
-  "id": "web-to-figma-importer",
+  "name": "figmafi",
+  "id": "figmafi",
   "api": "1.0.0",
   "main": "dist/code.js",
   "ui": "ui/index.html",
   "editorType": ["figma"],
   "networkAccess": {
     "allowedDomains": ["*"],
-    "devAllowedDomains": [
-      "http://localhost:4411"
-    ],
+    "devAllowedDomains": ["http://localhost:4411"],
     "reasoning": "Plugin needs to fetch images from captured web pages and connect to local handoff server on port 4411"
   }
 }

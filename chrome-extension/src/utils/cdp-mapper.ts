@@ -2,63 +2,8 @@
  * Utilities for mapping CDP computed styles to Figma schema properties
  */
 
-export interface RGBA {
-  r: number;
-  g: number;
-  b: number;
-  a: number;
-}
-
-export function parseColor(colorString: string): RGBA | null {
-  if (
-    !colorString ||
-    colorString === "transparent" ||
-    colorString === "rgba(0, 0, 0, 0)"
-  ) {
-    return null;
-  }
-
-  // Handle rgb(r, g, b)
-  const rgbMatch = colorString.match(
-    /^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/
-  );
-  if (rgbMatch) {
-    return {
-      r: parseInt(rgbMatch[1], 10) / 255,
-      g: parseInt(rgbMatch[2], 10) / 255,
-      b: parseInt(rgbMatch[3], 10) / 255,
-      a: 1,
-    };
-  }
-
-  // Handle rgba(r, g, b, a)
-  const rgbaMatch = colorString.match(
-    /^rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)$/
-  );
-  if (rgbaMatch) {
-    return {
-      r: parseInt(rgbaMatch[1], 10) / 255,
-      g: parseInt(rgbaMatch[2], 10) / 255,
-      b: parseInt(rgbaMatch[3], 10) / 255,
-      a: parseFloat(rgbaMatch[4]),
-    };
-  }
-
-  // Handle hex #RRGGBB
-  const hexMatch = colorString.match(
-    /^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$/
-  );
-  if (hexMatch) {
-    return {
-      r: parseInt(hexMatch[1], 16) / 255,
-      g: parseInt(hexMatch[2], 16) / 255,
-      b: parseInt(hexMatch[3], 16) / 255,
-      a: 1,
-    };
-  }
-
-  return null;
-}
+// Re-export shared color utilities for backward compatibility
+export { parseColorToRGBA as parseColor, type RGBA } from "../../../shared/color-utils";
 
 export function parsePixelValue(value: string): number {
   if (!value) return 0;

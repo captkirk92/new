@@ -15,7 +15,10 @@
   },
   "dependencies": {
     "@types/pako": "^2.0.4",
+    "@types/three": "^0.160.0",
+    "gsap": "^3.12.5",
     "pako": "^2.1.0",
-    "svgo": "^4.0.0"
+    "svgo": "^4.0.0",
+    "three": "^0.160.0"
   }
 }

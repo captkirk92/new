@@ -3,6 +3,8 @@
  * Converts hoverStates captured by Puppeteer into Figma component variants
  */
 
+import { parseColorWithOpacity, parseBoxShadow as parseBoxShadowShared } from "../../shared/color-utils";
+
 // Helper function to safely set plugin data
 function safeSetPluginData(node: SceneNode, key: string, value: string): void {
   try {
@@ -294,66 +296,22 @@ function applyStyleProperty(
   }
 }
 
-/**
- * Parse CSS color to Figma format
- */
-function parseColor(color: string): { color: RGB; opacity: number } | null {
-  // Handle rgba
-  const rgbaMatch = color.match(
-    /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/
-  );
-  if (rgbaMatch) {
-    return {
-      color: {
-        r: parseInt(rgbaMatch[1]) / 255,
-        g: parseInt(rgbaMatch[2]) / 255,
-        b: parseInt(rgbaMatch[3]) / 255,
-      },
-      opacity: rgbaMatch[4] ? parseFloat(rgbaMatch[4]) : 1,
-    };
-  }
-
-  // Handle hex
-  const hexMatch = color.match(/^#([0-9a-f]{6})$/i);
-  if (hexMatch) {
-    const hex = hexMatch[1];
-    return {
-      color: {
-        r: parseInt(hex.slice(0, 2), 16) / 255,
-        g: parseInt(hex.slice(2, 4), 16) / 255,
-        b: parseInt(hex.slice(4, 6), 16) / 255,
-      },
-      opacity: 1,
-    };
-  }
-
-  return null;
-}
+// Use shared color utilities - parseColorWithOpacity imported at top
+const parseColor = parseColorWithOpacity;
 
 /**
- * Parse CSS box-shadow to Figma effect
+ * Parse CSS box-shadow to Figma effect (wrapper around shared implementation)
  */
 function parseBoxShadow(shadow: string): DropShadowEffect | null {
-  // Basic box-shadow parsing: offsetX offsetY blur spread color
-  const match = shadow.match(
-    /(-?\d+)px\s+(-?\d+)px\s+(\d+)px(?:\s+(\d+)px)?\s+(rgba?\([^)]+\)|#[0-9a-f]{6})/i
-  );
-  if (!match) return null;
-
-  const offsetX = parseInt(match[1]);
-  const offsetY = parseInt(match[2]);
-  const blur = parseInt(match[3]);
-  const colorStr = match[5];
-  const colorParsed = parseColor(colorStr);
-
-  if (!colorParsed) return null;
+  const parsed = parseBoxShadowShared(shadow);
+  if (!parsed) return null;
 
   return {
     type: "DROP_SHADOW",
-    color: { ...colorParsed.color, a: colorParsed.opacity },
-    offset: { x: offsetX, y: offsetY },
-    radius: blur,
-    spread: match[4] ? parseInt(match[4]) : 0,
+    color: { r: parsed.color.r, g: parsed.color.g, b: parsed.color.b, a: parsed.color.a },
+    offset: { x: parsed.offsetX, y: parsed.offsetY },
+    radius: parsed.blur,
+    spread: parsed.spread,
     visible: true,
     blendMode: "NORMAL",
   };

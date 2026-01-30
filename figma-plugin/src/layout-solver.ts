@@ -17,6 +17,7 @@ interface ElementNodeData {
   };
   children?: ElementNodeData[];
   id?: string;
+  name?: string;
   // Enhanced CSS properties for professional conversion
   layout?: {
     x?: number;
@@ -133,11 +134,11 @@ export class ProfessionalLayoutSolver {
    * MAIN API: Analyze layout intelligence for a node
    */
   public analyzeLayoutIntelligence(
-    nodeData: ElementNodeData
+    nodeData: ElementNodeData,
   ): LayoutIntelligence {
     const cssAnalysis = this.analyzeCSSLayout(nodeData);
     const childrenAnalysis = this.analyzeChildrenDistribution(
-      nodeData.children || []
+      nodeData.children || [],
     );
 
     // Create intelligent Auto Layout configuration
@@ -151,7 +152,7 @@ export class ProfessionalLayoutSolver {
       paddingLeft: cssAnalysis.padding.left,
       itemSpacing: cssAnalysis.gap,
       primaryAxisAlignItems: this.mapJustifyContentToFigma(
-        cssAnalysis.justifyContent
+        cssAnalysis.justifyContent,
       ),
       counterAxisAlignItems: this.mapAlignItemsToFigma(cssAnalysis.alignItems),
       strokesIncludedInLayout: this.shouldIncludeStrokesInLayout(nodeData),
@@ -160,12 +161,12 @@ export class ProfessionalLayoutSolver {
 
     const confidenceScore = this.calculateConfidence(
       cssAnalysis,
-      childrenAnalysis
+      childrenAnalysis,
     );
     const hybridStrategy = this.createHybridStrategy(nodeData, inferredLayout);
     const fallbackStrategy = this.createFallbackStrategy(
       nodeData,
-      confidenceScore
+      confidenceScore,
     );
 
     return {
@@ -234,7 +235,7 @@ export class ProfessionalLayoutSolver {
    * CORRECTED: Infer optimal layout mode from CSS (with GRID support)
    */
   private inferLayoutMode(
-    cssAnalysis: CSSAnalysis
+    cssAnalysis: CSSAnalysis,
   ): "NONE" | "HORIZONTAL" | "VERTICAL" | "GRID" {
     if (cssAnalysis.display === "flex") {
       return cssAnalysis.flexDirection === "column" ||
@@ -256,7 +257,7 @@ export class ProfessionalLayoutSolver {
    */
   private inferPrimaryAxisSizing(
     cssAnalysis: CSSAnalysis,
-    nodeData: ElementNodeData
+    nodeData: ElementNodeData,
   ): "FIXED" | "AUTO" {
     const layout = nodeData.layout;
     if (!layout) return "AUTO";
@@ -281,7 +282,7 @@ export class ProfessionalLayoutSolver {
    */
   private inferCounterAxisSizing(
     cssAnalysis: CSSAnalysis,
-    nodeData: ElementNodeData
+    nodeData: ElementNodeData,
   ): "FIXED" | "AUTO" {
     const layout = nodeData.layout;
     if (!layout) return "AUTO";
@@ -305,7 +306,7 @@ export class ProfessionalLayoutSolver {
    * PROFESSIONAL: Map CSS justify-content to Figma primaryAxisAlignItems
    */
   private mapJustifyContentToFigma(
-    justifyContent: string
+    justifyContent: string,
   ): "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN" {
     switch (justifyContent) {
       case "flex-start":
@@ -327,7 +328,7 @@ export class ProfessionalLayoutSolver {
    * CORRECTED: Map CSS align-items to Figma counterAxisAlignItems (with BASELINE support)
    */
   private mapAlignItemsToFigma(
-    alignItems: string
+    alignItems: string,
   ): "MIN" | "CENTER" | "MAX" | "BASELINE" | "STRETCH" {
     switch (alignItems) {
       case "flex-start":
@@ -365,7 +366,7 @@ export class ProfessionalLayoutSolver {
    */
   public createHybridStrategy(
     nodeData: ElementNodeData,
-    inferredLayout: InferredAutoLayoutResult
+    inferredLayout: InferredAutoLayoutResult,
   ): HybridLayoutPlan {
     const children = nodeData.children || [];
     const autoLayoutChildren: ElementNodeData[] = [];
@@ -375,7 +376,7 @@ export class ProfessionalLayoutSolver {
     for (const child of children) {
       const shouldUseAbsolute = this.shouldUseAbsolutePositioning(
         child,
-        nodeData
+        nodeData,
       );
 
       if (shouldUseAbsolute) {
@@ -420,7 +421,7 @@ export class ProfessionalLayoutSolver {
    */
   public calculateOptimalConstraints(
     childData: ElementNodeData,
-    parentData: ElementNodeData
+    parentData: ElementNodeData,
   ): {
     horizontal: "MIN" | "CENTER" | "MAX" | "STRETCH" | "SCALE";
     vertical: "MIN" | "CENTER" | "MAX" | "STRETCH" | "SCALE";
@@ -476,6 +477,18 @@ export class ProfessionalLayoutSolver {
       vertical = "SCALE"; // Proportional scaling
     }
 
+    // Special handling for fixed positioning (e.g. Headers)
+    if (childData.layout?.position === "fixed") {
+      // If it's near the top (header), force TOP constraint
+      if (childRect.y < 100) {
+        vertical = "MIN";
+      }
+      // If it's wide (full width), force STRETCH
+      if (childRect.width / parentRect.width > 0.8) {
+        horizontal = "STRETCH";
+      }
+    }
+
     return { horizontal, vertical };
   }
 
@@ -513,12 +526,12 @@ export class ProfessionalLayoutSolver {
 
     // Check horizontal alignment
     const horizontallyAligned = sortedByX.every(
-      (pos, i) => i === 0 || Math.abs(pos.y - sortedByX[0].y) < 20
+      (pos, i) => i === 0 || Math.abs(pos.y - sortedByX[0].y) < 20,
     );
 
     // Check vertical alignment
     const verticallyAligned = sortedByY.every(
-      (pos, i) => i === 0 || Math.abs(pos.x - sortedByY[0].x) < 20
+      (pos, i) => i === 0 || Math.abs(pos.x - sortedByY[0].x) < 20,
     );
 
     return horizontallyAligned || verticallyAligned;
@@ -571,7 +584,7 @@ export class ProfessionalLayoutSolver {
 
   private calculateConfidence(
     cssAnalysis: CSSAnalysis,
-    childrenAnalysis: any
+    childrenAnalysis: any,
   ): number {
     let score = 0.5; // Base score
 
@@ -590,7 +603,7 @@ export class ProfessionalLayoutSolver {
 
   private shouldUseAbsolutePositioning(
     child: ElementNodeData,
-    parent: ElementNodeData
+    parent: ElementNodeData,
   ): boolean {
     const childLayout = child.layout;
     if (!childLayout) return false;
@@ -612,7 +625,7 @@ export class ProfessionalLayoutSolver {
 
   private calculateLayoutAlign(
     child: ElementNodeData,
-    parent: ElementNodeData
+    parent: ElementNodeData,
   ): "INHERIT" | "STRETCH" | "MIN" | "CENTER" | "MAX" {
     const alignSelf = child.layout?.alignSelf;
 
@@ -632,7 +645,7 @@ export class ProfessionalLayoutSolver {
 
   private calculateLayoutGrow(
     child: ElementNodeData,
-    parent: ElementNodeData
+    parent: ElementNodeData,
   ): number {
     const flexGrow = child.layout?.flexGrow;
     if (typeof flexGrow === "number") return flexGrow;
@@ -641,7 +654,7 @@ export class ProfessionalLayoutSolver {
   }
 
   private buildFrameConfiguration(
-    inferredLayout: InferredAutoLayoutResult
+    inferredLayout: InferredAutoLayoutResult,
   ): FrameConfiguration {
     return {
       layoutMode: inferredLayout.layoutMode,
@@ -661,7 +674,7 @@ export class ProfessionalLayoutSolver {
 
   private createFallbackStrategy(
     nodeData: ElementNodeData,
-    confidence: number
+    confidence: number,
   ): FallbackStrategy {
     if (confidence < 0.3) {
       return {
@@ -735,20 +748,29 @@ function canUseAutoLayout(node: ElementNodeData): boolean {
       professionalLayoutSolver.analyzeLayoutIntelligence(node);
 
     // Use professional confidence scoring
+    // STRICTER THRESHOLD: Increased from 0.7 to 0.85 to prevent "messy" Auto Layouts
+    // that destroy absolute positioning in complex desktop layouts.
     const shouldUseAutoLayout =
-      layoutIntelligence.confidenceScore > 0.7 &&
+      layoutIntelligence.confidenceScore > 0.85 &&
       layoutIntelligence.inferredLayout.layoutMode !== "NONE";
 
     if (shouldUseAutoLayout) {
+      console.log(
+        `[LAYOUT] ✅ Applying Auto Layout to "${node.name}" (${node.id}) | Mode: ${layoutIntelligence.inferredLayout.layoutMode} | Score: ${layoutIntelligence.confidenceScore.toFixed(2)}`,
+      );
       // Apply professional layout configuration to the node
       applyProfessionalLayoutConfig(node, layoutIntelligence);
+    } else {
+      console.log(
+        `[LAYOUT] 🚫 Skipping Auto Layout for "${node.name}" (${node.id}) | Score: ${layoutIntelligence.confidenceScore.toFixed(2)} (Threshold: 0.85)`,
+      );
     }
 
     return shouldUseAutoLayout;
   } catch (error) {
     console.warn(
       "Professional layout analysis failed, falling back to basic analysis:",
-      error
+      error,
     );
 
     // Fallback to basic analysis
@@ -759,7 +781,8 @@ function canUseAutoLayout(node: ElementNodeData): boolean {
     }
 
     const result = analyzeLayoutCompatibility(node);
-    return result.compatibilityScore > 0.7;
+    // STRICTER THRESHOLD for fallback as well
+    return result.compatibilityScore > 0.85;
   }
 }
 
@@ -768,7 +791,7 @@ function canUseAutoLayout(node: ElementNodeData): boolean {
  */
 function applyProfessionalLayoutConfig(
   node: ElementNodeData,
-  intelligence: LayoutIntelligence
+  intelligence: LayoutIntelligence,
 ): void {
   const { inferredLayout, hybridStrategy } = intelligence;
 
@@ -797,10 +820,10 @@ function applyProfessionalLayoutConfig(
     // Update children with professional positioning
     for (const child of node.children) {
       const autoChild = hybridStrategy.autoLayoutChildren.find(
-        (c) => c === child
+        (c) => c === child,
       );
       const absoluteChild = hybridStrategy.absoluteChildren.find(
-        (c) => c === child
+        (c) => c === child,
       );
 
       if (autoChild) {
@@ -810,6 +833,8 @@ function applyProfessionalLayoutConfig(
       } else if (absoluteChild) {
         child.layoutPositioning = absoluteChild.layoutPositioning;
         child.constraints = absoluteChild.constraints;
+        // Explicitly set for resetChildOffsets check
+        (child as any).layoutPositioning = "ABSOLUTE";
       }
     }
   }
@@ -901,14 +926,14 @@ function analyzeLayoutCompatibility(node: ElementNodeData): {
     isMonotonic,
     isAligned,
     hasConsistentSpacing,
-    canMapToFigmaAutoLayout: score > 0.7,
+    canMapToFigmaAutoLayout: score > 0.85,
     conflictingNodes,
   };
 }
 
 function isMonotonic(
   positions: Array<{ index: number; x: number; y: number }>,
-  axis: "x" | "y"
+  axis: "x" | "y",
 ): boolean {
   const sorted = [...positions].sort((a, b) => a[axis] - b[axis]);
   for (let i = 0; i < positions.length; i++) {
@@ -928,12 +953,12 @@ function isMonotonic(
 
 function isAligned(
   positions: Array<{ index: number; x: number; y: number }>,
-  axis: "x" | "y"
+  axis: "x" | "y",
 ): boolean {
   if (positions.length <= 1) return true;
   const baseline = positions[0][axis];
   return positions.every(
-    (pos) => Math.abs(pos[axis] - baseline) <= POSITION_TOLERANCE
+    (pos) => Math.abs(pos[axis] - baseline) <= POSITION_TOLERANCE,
   );
 }
 
@@ -949,8 +974,19 @@ function resetChildOffsets(node: ElementNodeData): void {
       // Preserve absolute-positioned children inside Auto Layout parents.
       // Resetting these would collapse elements into a single column.
       const layoutPositioning = (child as any).layoutPositioning;
-      const isAbsoluteInAutoLayout = layoutPositioning === "ABSOLUTE";
-      if (isAbsoluteInAutoLayout) continue;
+
+      // SAFETY CHECK: Also check CSS position and layout object manually if layoutPositioning missing
+      const cssPosition = child.layout.position;
+      const isAbsoluteCSS =
+        cssPosition === "absolute" || cssPosition === "fixed";
+
+      const isAbsoluteInAutoLayout =
+        layoutPositioning === "ABSOLUTE" || isAbsoluteCSS;
+
+      if (isAbsoluteInAutoLayout) {
+        // console.log(`[LAYOUT] Preserving absolute offsets for child of ${node.id}`);
+        continue;
+      }
 
       child.layout.x = 0;
       child.layout.y = 0;
@@ -971,7 +1007,7 @@ function isMonotonicEnhanced(
     height: number;
   }>,
   axis: "x" | "y",
-  conflictingNodes: number[]
+  conflictingNodes: number[],
 ): boolean {
   if (positions.length <= 1) return true;
 
@@ -1002,7 +1038,7 @@ function isAlignedEnhanced(
     width: number;
     height: number;
   }>,
-  axis: "x" | "y"
+  axis: "x" | "y",
 ): boolean {
   if (positions.length <= 1) return true;
 
@@ -1011,7 +1047,7 @@ function isAlignedEnhanced(
   const median = axisValues[Math.floor(axisValues.length / 2)];
 
   const alignedCount = positions.filter(
-    (pos) => Math.abs(pos[axis] - median) <= ENHANCED_POSITION_TOLERANCE
+    (pos) => Math.abs(pos[axis] - median) <= ENHANCED_POSITION_TOLERANCE,
   ).length;
 
   // Require at least 70% of elements to be aligned
@@ -1025,7 +1061,7 @@ function hasConsistentVerticalSpacing(
     y: number;
     width: number;
     height: number;
-  }>
+  }>,
 ): boolean {
   if (positions.length <= 2) return true;
 
@@ -1042,7 +1078,7 @@ function hasConsistentVerticalSpacing(
   // Check if gaps are reasonably consistent
   const avgGap = gaps.reduce((sum, gap) => sum + gap, 0) / gaps.length;
   const consistentGaps = gaps.filter(
-    (gap) => Math.abs(gap - avgGap) <= ENHANCED_POSITION_TOLERANCE
+    (gap) => Math.abs(gap - avgGap) <= ENHANCED_POSITION_TOLERANCE,
   ).length;
 
   return consistentGaps / gaps.length >= 0.7;
@@ -1055,7 +1091,7 @@ function hasConsistentHorizontalSpacing(
     y: number;
     width: number;
     height: number;
-  }>
+  }>,
 ): boolean {
   if (positions.length <= 2) return true;
 
@@ -1072,7 +1108,7 @@ function hasConsistentHorizontalSpacing(
   // Check if gaps are reasonably consistent
   const avgGap = gaps.reduce((sum, gap) => sum + gap, 0) / gaps.length;
   const consistentGaps = gaps.filter(
-    (gap) => Math.abs(gap - avgGap) <= ENHANCED_POSITION_TOLERANCE
+    (gap) => Math.abs(gap - avgGap) <= ENHANCED_POSITION_TOLERANCE,
   ).length;
 
   return consistentGaps / gaps.length >= 0.7;

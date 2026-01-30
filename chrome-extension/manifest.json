@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Web to Figma Capture",
+  "name": "figmafi",
   "version": "1.0.0",
   "description": "Capture web pages and send to Figma",
   "permissions": [
@@ -10,14 +10,13 @@
     "downloads",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "webNavigation"
   ],
-  "host_permissions": [
-    "<all_urls>"
-  ],
+  "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "Web to Figma Capture",
+    "default_title": "figmafi",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",

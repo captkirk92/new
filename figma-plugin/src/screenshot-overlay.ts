@@ -197,7 +197,8 @@ export class ScreenshotOverlay {
     line.x = from.x;
     line.y = from.y;
     line.resize(Math.abs(to.x - from.x), 0);
-    line.rotation = Math.atan2(to.y - from.y, to.x - from.x);
+    const rotationRadians = Math.atan2(to.y - from.y, to.x - from.x);
+    line.rotation = (rotationRadians * 180) / Math.PI;
     line.strokes = [{ 
       type: 'SOLID', 
       color: { r: 1, g: 0, b: 0 } 
