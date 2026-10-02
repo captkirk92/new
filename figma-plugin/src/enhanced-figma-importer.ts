@@ -1599,9 +1599,6 @@ ${
 
     console.log(`✅ Pre-loaded ${fontMap.size}/${fontsToLoad.length} fonts`);
 
-    // Always ensure fallback font is loaded
-    await this.ensureFallbackFont();
-
     return fontMap;
   }
 
@@ -1622,8 +1619,6 @@ ${
       `✅ Font loading complete: ${successful} succeeded, ${failed} failed`,
     );
 
-    // Always ensure fallback font is loaded
-    await this.ensureFallbackFont();
   }
 
   private async loadFontWithValidation(fontName: FontName): Promise<void> {
