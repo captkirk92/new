@@ -319,7 +319,7 @@ async function handleImport(
     };
 
     const importer = new EnhancedFigmaImporter(
-      data,
+      schema,
       importOptions,
       fontManager,
     );
@@ -349,7 +349,7 @@ async function handleImport(
 
     const stats = {
       nodes: report.totalElements || 0,
-      styles: data?.styles ? Object.keys(data.styles || {}).length : 0,
+      styles: schema?.styles ? Object.keys(schema.styles || {}).length : 0,
       components: report.totalElements || 0,
     };
 
