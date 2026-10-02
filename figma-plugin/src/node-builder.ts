@@ -1647,26 +1647,9 @@ export class NodeBuilder {
     // CRITICAL: Extract and normalize text content FIRST
     let characters = data.characters || data.textContent || "";
 
-    // Normalize whitespace: preserve line breaks but normalize spaces
-    // Replace multiple spaces with single space (except in pre-formatted text)
-    if (
-      data.textStyle?.whiteSpace !== "pre" &&
-      data.textStyle?.whiteSpace !== "pre-wrap"
-    ) {
-      // Normalize spaces but preserve line breaks
-      characters = characters
-        .replace(/[ \t]+/g, " ")
-        .replace(/\n\s+/g, "\n")
-        .replace(/\s+\n/g, "\n");
-    }
-
-    // Remove leading/trailing whitespace unless it's pre-formatted
-    if (
-      data.textStyle?.whiteSpace !== "pre" &&
-      data.textStyle?.whiteSpace !== "pre-wrap"
-    ) {
-      characters = characters.trim();
-    }
+    // Preserve browser text content exactly. CSS whitespace handling is a
+    // rendering concern, not a license to mutate DOM text before measurement.
+    // The extractor's captured characters are the canonical source for Figma.
 
     // CRITICAL: Set characters IMMEDIATELY after creation so Figma can calculate proper bounds
     // This must happen BEFORE any sizing operations
@@ -1952,7 +1935,9 @@ export class NodeBuilder {
       fontFamily = fontLoadResult.family;
       finalFontStyle = fontLoadResult.style;
 
-      // ENHANCED: Improved font metrics compensation using Canvas TextMetrics
+      // Never alter font size to compensate for a font mismatch. A different
+      // font is a different rendering system and changing size compounds the error.
+      // Exact-font availability is diagnosed explicitly below.
       let fontMetricsRatio = 1.0;
       if (fontFamily !== originalFontFamily) {
         // Use Canvas TextMetrics if available for more accurate compensation
@@ -2140,24 +2125,21 @@ export class NodeBuilder {
         }
       }
 
-      // CRITICAL FIX: Ensure textAutoResize is never NONE unless explicitly needed
-      // NONE can cause text to collapse and appear hidden, especially for small text
-      // Only use NONE if text has explicit truncation (ellipsis) AND fixed width
-      if (!text.textAutoResize || text.textAutoResize === "NONE") {
-        const hasTruncation =
-          data.textStyle?.textOverflow === "ellipsis" ||
-          data.textStyle?.textOverflow === "ending";
-        const hasFixedWidth = data.layout?.width && data.layout.width > 0;
-
-        // Only use NONE if we have both truncation AND fixed width
-        if (hasTruncation && hasFixedWidth) {
+      // Use the captured sizing contract exactly. If the extractor supplied no
+      // mode, derive the least-assumptive Figma mode from CSS semantics.
+      if (!text.textAutoResize) {
+        const hasFixedWidth = Number.isFinite(data.layout?.width) && data.layout.width > 0;
+        const whiteSpace = data.textStyle.whiteSpace;
+        const overflow = data.textStyle.textOverflow;
+        if (overflow === "ellipsis" || overflow === "ending") {
+          if (!hasFixedWidth) {
+            throw new Error(`Text truncation requires captured fixed width: ${data.id || data.name}`);
+          }
           text.textAutoResize = "NONE";
+        } else if (whiteSpace === "nowrap") {
+          text.textAutoResize = "WIDTH_AND_HEIGHT";
         } else {
-          // Default to HEIGHT for most text to prevent collapse
-          text.textAutoResize = "HEIGHT";
-          console.log(
-            `📝 [TEXT] ${data.name}: Changed textAutoResize from NONE to HEIGHT to prevent collapse`,
-          );
+          text.textAutoResize = hasFixedWidth ? "HEIGHT" : "WIDTH_AND_HEIGHT";
         }
       }
       if (data.textStyle.wordWrap) {
