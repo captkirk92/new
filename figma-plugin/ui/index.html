@@ -1141,6 +1141,11 @@ Initializing...
           break;
         
         case 'complete':
+          if (activeJobId) {
+            fetch(`http://localhost:4411/api/jobs/${activeJobId}/complete`, { method: 'POST' })
+              .then(() => { activeJobId = null; })
+              .catch(e => console.error('Failed to acknowledge completed job', e));
+          }
           setStatusLight('figma-import-light', 'green');
           showStatus('success', `Successfully imported ${msg.stats.elements} elements!`);
           showStats(msg.stats);
@@ -1157,6 +1162,15 @@ Initializing...
           break;
         
         case 'error':
+          if (activeJobId) {
+            const failedJobId = activeJobId;
+            activeJobId = null;
+            fetch(`http://localhost:4411/api/jobs/${failedJobId}/fail`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ error: msg.message || 'Import failed' })
+            }).catch(e => console.error('Failed to requeue failed job', e));
+          }
           setStatusLight('figma-import-light', 'red');
           showError(msg.message);
           
@@ -1297,6 +1311,7 @@ Initializing...
       let currentApiUrl = HANDOFF_CANDIDATES[0];
       let isPolling = true;
       let consecutiveErrors = 0;
+      let activeJobId = null;
 
       async function pollHandoffServer() {
       if (!isPolling) return;
