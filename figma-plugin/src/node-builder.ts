@@ -1977,10 +1977,11 @@ export class NodeBuilder {
       text.fontName = { family: fontFamily, style: finalFontStyle };
 
       // CRITICAL FIX: Validate fontSize to prevent NaN/Infinity/zero errors
-      const rawFontSize = data.textStyle.fontSize * fontMetricsRatio;
-      const adjustedFontSize =
-        Number.isFinite(rawFontSize) && rawFontSize > 0 ? rawFontSize : 12;
-      text.fontSize = Math.max(1, adjustedFontSize);
+      const capturedFontSize = data.textStyle.fontSize;
+      if (!Number.isFinite(capturedFontSize) || capturedFontSize <= 0) {
+        throw new Error(`Invalid captured font size for text node ${data.id || data.name}`);
+      }
+      text.fontSize = capturedFontSize;
       // ENHANCED: Improved text alignment handling
       // Map CSS text-align to Figma textAlignHorizontal
       const textAlign = data.textStyle.textAlignHorizontal || "LEFT";
@@ -2003,15 +2004,14 @@ export class NodeBuilder {
             ? "BOTTOM"
             : "TOP";
 
-      const spacingScale =
-        fontFamily !== originalFontFamily ? fontMetricsRatio : 1.0;
+      const spacingScale = 1.0;
 
       // ENHANCED: Improved line height calculation using Canvas TextMetrics
       if (data.renderedMetrics?.lineHeightPx) {
         // Use measured line height from browser
         text.lineHeight = {
           unit: "PIXELS",
-          value: data.renderedMetrics.lineHeightPx * spacingScale,
+          value: data.renderedMetrics.lineHeightPx,
         };
       } else if (
         data.renderedMetrics?.actualBoundingBoxAscent &&
@@ -2023,12 +2023,12 @@ export class NodeBuilder {
           data.renderedMetrics.actualBoundingBoxDescent;
         text.lineHeight = {
           unit: "PIXELS",
-          value: measuredLineHeight * spacingScale,
+          value: measuredLineHeight,
         };
       } else if (data.textStyle.lineHeight?.unit === "PIXELS") {
         text.lineHeight = {
           unit: "PIXELS",
-          value: data.textStyle.lineHeight.value * spacingScale,
+          value: data.textStyle.lineHeight.value,
         };
       } else if (data.textStyle.lineHeight?.unit === "PERCENT") {
         text.lineHeight = {
@@ -2037,7 +2037,7 @@ export class NodeBuilder {
         };
       } else {
         // ENHANCED: Use font size * 1.2 as default line height (standard typography)
-        const defaultLineHeight = adjustedFontSize * 1.2;
+        const defaultLineHeight = capturedFontSize * 1.2;
         text.lineHeight = {
           unit: "PIXELS",
           value: defaultLineHeight,
