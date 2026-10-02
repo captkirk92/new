@@ -31,6 +31,7 @@ app.use((req, res, next) => {
 const jobs = [];
 const jobsFile = path.join(__dirname, "handoff-jobs.json");
 const artifactsDir = path.join(__dirname, "artifacts", "handoff");
+const HANDOFF_LEASE_MS = 120000;
 
 // Ensure artifacts directory exists
 if (!fs.existsSync(artifactsDir)) {
@@ -77,6 +78,7 @@ function saveJobs() {
         queuedAt: j.queuedAt,
         deliveredAt: j.deliveredAt,
         completedAt: j.completedAt,
+        leaseExpiresAt: j.leaseExpiresAt || null,
         hasPayload: !!j.payload,
         payloadSize: j.payload ? JSON.stringify(j.payload).length : 0,
         hasFigmaScreenshot: !!j.figmaScreenshot,
@@ -84,7 +86,7 @@ function saveJobs() {
       })),
       telemetry: {
         ...telemetry,
-        queueLength: jobs.filter((j) => !j.deliveredAt).length,
+        queueLength: jobs.filter(isJobAvailable).length,
       },
       lastDeliveredJob: jobs.find((j) => j.id === telemetry.lastDeliveredJobId)
         ? {
@@ -100,6 +102,11 @@ function saveJobs() {
   } catch (error) {
     console.error("⚠️ Failed to save jobs:", error.message);
   }
+}
+
+function isJobAvailable(job) {
+  if (job.status === "queued" || !job.status) return true;
+  return job.status === "processing" && job.leaseExpiresAt && job.leaseExpiresAt <= Date.now();
 }
 
 // Initialize
@@ -123,7 +130,7 @@ app.post("/api/jobs", (req, res) => {
   jobs.push(job);
   telemetry.lastExtensionTransferAt = Date.now();
   telemetry.lastQueuedJobId = jobId;
-  telemetry.queueLength = jobs.filter((j) => !j.deliveredAt).length;
+  telemetry.queueLength = jobs.filter(isJobAvailable).length;
 
   saveJobs();
 
@@ -167,10 +174,12 @@ app.post("/api/jobs", (req, res) => {
 app.get("/api/jobs/next", (req, res) => {
   telemetry.lastPluginPollAt = Date.now();
 
-  const nextJob = jobs.find((j) => !j.deliveredAt);
+  const nextJob = jobs.find(isJobAvailable);
 
   if (nextJob) {
-    nextJob.deliveredAt = Date.now();
+    const now = Date.now();
+    nextJob.deliveredAt = nextJob.deliveredAt || now;
+    nextJob.leaseExpiresAt = now + HANDOFF_LEASE_MS;
     nextJob.status = "processing";
     telemetry.lastPluginDeliveryAt = nextJob.deliveredAt;
     telemetry.lastDeliveredJobId = nextJob.id;
@@ -200,6 +209,26 @@ app.get("/api/jobs/next", (req, res) => {
       },
     });
   }
+});
+
+/**
+/**
+ * POST /api/jobs/:jobId/fail - Return an unsuccessfully imported job to the queue
+ */
+app.post("/api/jobs/:jobId/fail", (req, res) => {
+  const { jobId } = req.params;
+  const job = jobs.find((j) => j.id === jobId);
+
+  if (!job) return res.status(404).json({ error: "Job not found" });
+
+  job.status = "queued";
+  job.leaseExpiresAt = null;
+  job.lastError = typeof req.body?.error === "string" ? req.body.error : "Import failed";
+  telemetry.queueLength = jobs.filter(isJobAvailable).length;
+  saveJobs();
+
+  console.warn(`↩️ Re-queued failed job: ${jobId}`);
+  res.json({ success: true, status: job.status });
 });
 
 /**
@@ -262,6 +291,7 @@ app.post(
     }
 
     job.completedAt = Date.now();
+    job.leaseExpiresAt = null;
     job.status = "completed";
 
     saveJobs();
@@ -296,6 +326,7 @@ app.post("/api/jobs/:jobId/screenshot", (req, res) => {
     fs.writeFileSync(screenshotPath, Buffer.from(imageData, "base64"));
     job.figmaScreenshot = screenshotPath;
     job.status = "completed";
+    job.leaseExpiresAt = null;
     job.completedAt = Date.now();
 
     saveJobs();
