@@ -45,7 +45,7 @@ import { BuildPlan } from "./diagnostics-protocol";
 const FRAME_PADDING = 80;
 const FRAME_GAP = 200;
 const FRAME_NAME_PREFIX = "Capture";
-const PLUGIN_BUILD_ID = "20260118_CLEAN_V1";
+const PLUGIN_BUILD_ID = "20261002_DETERMINISTIC_HANDOFF_V1";
 
 // ============================================================================
 // STATE & DIAGNOSTICS
