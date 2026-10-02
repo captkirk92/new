@@ -498,27 +498,10 @@ export class NodeBuilder {
     const childZ = this.getZIndex(child);
     let insertIndex = list.length; // Default to top
 
-    // HEURISTIC: Check if this child is a "Background Layer" that should be forced to the back
-    // This fixes issues where large container divs (with Z-Index 0) cover their own content
-    const isBackground = this.isLikelyBackgroundLayer(child, parent as any);
-
-    if (isBackground && childZ <= 0) {
-      // Force to bottom
-      insertIndex = 0;
-    } else {
-      // Standard Z-Index sorting using Shadow List (Fast JS access)
-      for (let i = 0; i < list.length; i++) {
-        const existingItem = list[i];
-        const existingZ = existingItem.zIndex;
-
-        // childZ < existingZ -> Insert before
-        if (childZ < existingZ) {
-          insertIndex = i;
-          break;
-        }
-      }
-    }
-
+    // Preserve captured DOM order for equal z-index values. Do not infer visual
+    // background status from geometry: CSS permits full-size positioned elements
+    // above or below content, and geometry alone cannot determine stacking context.
+    //
     // Update Shadow Tree
     list.splice(insertIndex, 0, { node: child, zIndex: childZ });
 
@@ -530,57 +513,6 @@ export class NodeBuilder {
     }
   }
 
-  /**
-   * HEURISTIC: Determine if a node is likely a background layer that should be behind everything else.
-   * Criteria:
-   * 1. It is a FRAME or RECTANGLE.
-   * 2. It matches the parent's size (or very close).
-   * 3. It is positioned at/near (0,0).
-   * 4. It has fills (visual background).
-   * 5. (Optional) It has few or no children (not a layout wrapper, just a visual plane).
-   */
-  private isLikelyBackgroundLayer(
-    child: SceneNode,
-    parent: BaseNode & ChildrenMixin & LayoutMixin,
-  ): boolean {
-    // Only apply to Frame/Rectangle children of Frames
-    if (
-      (child.type !== "FRAME" && child.type !== "RECTANGLE") ||
-      parent.type !== "FRAME"
-    ) {
-      return false;
-    }
-
-    const parentWidth = parent.width;
-    const parentHeight = parent.height;
-
-    // Safety check for unsized parents
-    if (parentWidth === 0 || parentHeight === 0) return false;
-
-    // 1. Size Check (Approx > 95% match)
-    const sizeMatch =
-      child.width >= parentWidth * 0.95 && child.height >= parentHeight * 0.95;
-
-    // 2. Position Check (Near top-left)
-    const positionMatch = Math.abs(child.x) < 20 && Math.abs(child.y) < 20;
-
-    if (sizeMatch && positionMatch) {
-      // If it's a Frame, ensure it doesn't have many children (if it has children, it might be a wrapper, not just a bg)
-      if (child.type === "FRAME") {
-        // If it has many children, it's likely a content wrapper, NOT a background plane.
-        // Background planes usually have 0 children (just fill) or maybe 1 (overlay).
-        if (child.children.length > 2) return false;
-      }
-
-      // Ensure it actually has a visible fill to be a "covering" problem
-      if ("fills" in child && Array.isArray(child.fills)) {
-        const visibleFills = child.fills.filter((f) => f.visible !== false);
-        if (visibleFills.length > 0) return true;
-      }
-    }
-
-    return false;
-  }
 
   /**
    * CRITICAL: Validate and sanitize node data to ensure Figma API compliance
