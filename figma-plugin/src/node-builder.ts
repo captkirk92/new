@@ -1481,11 +1481,11 @@ export class NodeBuilder {
         `❌ [NODE_BUILDER] createNode failed for ${nodeData.type} ${nodeData.id}:`,
         e instanceof Error ? e.message : JSON.stringify(e, null, 2),
       );
-      // FAILURE RECOVERY: Return a red fallback frame so the user sees *something*
-      console.warn(`⚠️ [RECOVERY] Creating fallback node for ${nodeData.id}`);
-      return this.createFallbackNode(
-        nodeData,
-        e instanceof Error ? e.message : String(e),
+      // Deterministic import: a node creation failure is a hard import failure.
+      // Creating a synthetic Figma node changes the document and hides the root cause.
+      const message = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `NODE_CREATION_FAILED id=${nodeData.id} type=${nodeData.type}: ${message}`,
       );
     }
   }
