@@ -57,7 +57,13 @@ function loadJobs() {
     if (fs.existsSync(jobsFile)) {
       const data = JSON.parse(fs.readFileSync(jobsFile, "utf8"));
       if (data.jobs && Array.isArray(data.jobs)) {
-        jobs.push(...data.jobs);
+        for (const job of data.jobs) {
+          if (job.status === "processing" && !job.leaseExpiresAt) {
+            job.status = "queued";
+            job.deliveredAt = null;
+          }
+          jobs.push(job);
+        }
         console.log(`📂 Loaded ${jobs.length} existing jobs from disk`);
       }
       if (data.telemetry) {
@@ -79,10 +85,12 @@ function saveJobs() {
         deliveredAt: j.deliveredAt,
         completedAt: j.completedAt,
         leaseExpiresAt: j.leaseExpiresAt || null,
+        payload: j.payload,
         hasPayload: !!j.payload,
         payloadSize: j.payload ? JSON.stringify(j.payload).length : 0,
         hasFigmaScreenshot: !!j.figmaScreenshot,
         status: j.status || "pending",
+        lastError: j.lastError || null,
       })),
       telemetry: {
         ...telemetry,
@@ -164,7 +172,7 @@ app.post("/api/jobs", (req, res) => {
   res.json({
     success: true,
     id: jobId,
-    queuePosition: jobs.filter((j) => !j.deliveredAt).length,
+    queuePosition: jobs.filter(isJobAvailable).length,
   });
 });
 
@@ -183,7 +191,7 @@ app.get("/api/jobs/next", (req, res) => {
     nextJob.status = "processing";
     telemetry.lastPluginDeliveryAt = nextJob.deliveredAt;
     telemetry.lastDeliveredJobId = nextJob.id;
-    telemetry.queueLength = jobs.filter((j) => !j.deliveredAt).length;
+    telemetry.queueLength = jobs.filter(isJobAvailable).length;
 
     saveJobs();
 
@@ -211,7 +219,6 @@ app.get("/api/jobs/next", (req, res) => {
   }
 });
 
-/**
 /**
  * POST /api/jobs/:jobId/fail - Return an unsuccessfully imported job to the queue
  */
@@ -260,7 +267,7 @@ app.get("/api/jobs/recent", (req, res) => {
   res.json({
     jobs: recentJobs,
     total: jobs.length,
-    pending: jobs.filter((j) => !j.deliveredAt).length,
+    pending: jobs.filter(isJobAvailable).length,
   });
 });
 
