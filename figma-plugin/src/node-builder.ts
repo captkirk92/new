@@ -3975,36 +3975,10 @@ export class NodeBuilder {
           );
         }
 
-        // PHASE 3: Apply pixel-perfect transform matrix if available (from absoluteTransform field)
-        let appliedPixelPerfectMatrix = false;
-
-        // Only attempt other transform paths if we did NOT already apply the absoluteTransform matrix.
-        if (!appliedPixelPerfectMatrix) {
-          try {
-            const appliedMatrix = this.tryApplyCssMatrixTransform(
-              node,
-              data,
-              { left: x, top: y },
-              untransformedWidth,
-              untransformedHeight,
-            );
-            if (appliedMatrix) {
-              // Matrix already encodes translation; avoid double positioning/resizing.
-              return;
-            }
-          } catch (matrixErr) {
-            console.error(
-              `❌ [applyPositioning] tryApplyCssMatrixTransform failed for ${data.name}`,
-              matrixErr,
-            );
-          }
-        }
-
-        // PROFESSIONAL: Apply positioning with transform precision
+        // Canonical geometry path: captured local coordinates are applied once.
+        // CSS matrices are handled by tryApplyCssMatrixTransform above.
         this.applyProfessionalTransform(node, data, x, y);
 
-        // CRITICAL FIX: Always apply positioning if we have valid coordinates
-        // BUT skip if professional transform handled it (as it includes positioning)
         const professionalTransformApplied =
           node.getPluginData("professionalTransformApplied") === "true";
 
@@ -4012,43 +3986,22 @@ export class NodeBuilder {
           !professionalTransformApplied &&
           typeof x === "number" &&
           typeof y === "number" &&
-          isFinite(x) &&
-          isFinite(y)
+          Number.isFinite(x) &&
+          Number.isFinite(y)
         ) {
           node.x = x;
           node.y = y;
         }
 
-        // CRITICAL FIX: Apply CSS transforms
-        this.applyCssTransforms(node, data, width, height);
-
-        // After transforms are applied, resize to final dimensions
-        if (typeof width === "number" && typeof height === "number") {
-          if ("resize" in node) {
-            const currentWidth = (node as LayoutMixin).width;
-            const currentHeight = (node as LayoutMixin).height;
-
-            // Only resize if dimensions haven't been modified by transform scale
-            const scaleX = parseFloat(node.getPluginData("cssScaleX") || "1");
-            const scaleY = parseFloat(node.getPluginData("cssScaleY") || "1");
-
-            if (Math.abs(scaleX - 1) < 0.001 && Math.abs(scaleY - 1) < 0.001) {
-              // No scale applied, use original dimensions
-              (node as LayoutMixin).resize(
-                Math.max(width, 1),
-                Math.max(height, 1),
-              );
-            } else {
-              // Scale was applied, dimensions should already be correct
-              // But ensure minimum size
-              if (currentWidth < 1 || currentHeight < 1) {
-                (node as LayoutMixin).resize(
-                  Math.max(currentWidth, 1),
-                  Math.max(currentHeight, 1),
-                );
-              }
-            }
-          }
+        if (
+          typeof width === "number" &&
+          typeof height === "number" &&
+          "resize" in node &&
+          !data.transform &&
+          !data.layoutContext?.transform &&
+          !data.style?.transform
+        ) {
+          (node as LayoutMixin).resize(Math.max(width, 1), Math.max(height, 1));
         }
       }
 
