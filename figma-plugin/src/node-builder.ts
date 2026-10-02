@@ -3574,18 +3574,33 @@ export class NodeBuilder {
       this.applyStackingContext(node, data);
 
       if (data.layout) {
-        // ROOT CAUSE FIX: Do NOT modify data.layout in-place.
-        // Use local variables to calculate relative offsets.
-        let relX = data.layout.x ?? 0;
-        let relY = data.layout.y ?? 0;
+        // Canonical coordinate contract:
+        // layout.pageX/pageY are document-space CSS pixels and are authoritative.
+        // layout.x/y are legacy precomputed-relative values and must not be
+        // re-subtracted from parent bounds.
+        const hasPageCoordinates =
+          Number.isFinite(data.layout.pageX) &&
+          Number.isFinite(data.layout.pageY);
 
-        if (
-          parentAbsoluteBounds &&
-          typeof parentAbsoluteBounds.x === "number" &&
-          typeof parentAbsoluteBounds.y === "number"
-        ) {
-          relX = relX - parentAbsoluteBounds.x;
-          relY = relY - parentAbsoluteBounds.y;
+        let relX: number;
+        let relY: number;
+
+        if (hasPageCoordinates) {
+          relX = data.layout.pageX;
+          relY = data.layout.pageY;
+
+          if (
+            parentAbsoluteBounds &&
+            Number.isFinite(parentAbsoluteBounds.x) &&
+            Number.isFinite(parentAbsoluteBounds.y)
+          ) {
+            relX -= parentAbsoluteBounds.x;
+            relY -= parentAbsoluteBounds.y;
+          }
+        } else {
+          // Legacy captures without pageX/pageY already contain relative x/y.
+          relX = Number.isFinite(data.layout.x) ? data.layout.x : 0;
+          relY = Number.isFinite(data.layout.y) ? data.layout.y : 0;
         }
 
         // PROFESSIONAL: Analyze layout intelligence for optimal positioning strategy
