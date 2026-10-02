@@ -630,8 +630,16 @@ export class NodeBuilder {
 
       // Calculate deltas
       validation.deltas = {
-        positionDx: actualBounds.x - validation.dom.layout.x,
-        positionDy: actualBounds.y - validation.dom.layout.y,
+        positionDx:
+          actualBounds.x -
+          (Number.isFinite(validation.dom.layout.pageX)
+            ? validation.dom.layout.pageX
+            : validation.dom.layout.x),
+        positionDy:
+          actualBounds.y -
+          (Number.isFinite(validation.dom.layout.pageY)
+            ? validation.dom.layout.pageY
+            : validation.dom.layout.y),
         widthDw: actualBounds.width - validation.dom.layout.width,
         heightDh: actualBounds.height - validation.dom.layout.height,
         rotationDdeg: 0, // TODO: Extract rotation from transform
