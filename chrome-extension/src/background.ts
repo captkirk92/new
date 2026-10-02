@@ -2,7 +2,7 @@ import { CaptureErrorCode } from "./types/capture-result";
 import pako from "pako";
 import { normalizeAndPreflight } from "./utils/schema-preflight";
 
-const PREFLIGHT_BLOCKING_MODE = false;
+const PREFLIGHT_BLOCKING_MODE = true;
 
 /**
  * Download text content reliably from MV3 service worker.
