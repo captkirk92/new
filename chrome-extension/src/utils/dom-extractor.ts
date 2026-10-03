@@ -6459,6 +6459,27 @@ export class DOMExtractor {
   // TYPOGRAPHY EXTRACTION WITH CANVAS TEXTMETRICS
   // ============================================================================
 
+  private parseFontVariationSettings(
+    value: unknown,
+  ): Record<string, number> | undefined {
+    if (typeof value !== "string" || value.trim() === "" || value.trim() === "normal") {
+      return undefined;
+    }
+
+    const settings: Record<string, number> = {};
+    const pattern = /["']([A-Za-z0-9]{4})["']\s*(-?(?:\d+(?:\.\d+)?|\.\d+))/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(value)) !== null) {
+      const axis = match[1];
+      const numericValue = Number(match[2]);
+      if (Number.isFinite(numericValue)) {
+        settings[axis] = numericValue;
+      }
+    }
+
+    return Object.keys(settings).length > 0 ? settings : undefined;
+  }
+
   private async extractTypographySafe(
     computed: CSSStyleDeclaration,
     element: Element,
@@ -6575,10 +6596,19 @@ export class DOMExtractor {
         // Canvas TextMetrics failed - continue without it
       }
 
+      // Capture CSS OpenType variation settings verbatim when present.
+      // This is required to reproduce variable-font instances in Figma.
+      const fontVariationSettings = this.parseFontVariationSettings(
+        (computed as any).fontVariationSettings,
+      );
+
       // Build text style object
       node.fontName = {
         family: fontFamily,
         style: computed.fontStyle === "italic" ? "Italic" : "Regular",
+        ...(fontVariationSettings
+          ? { variationSettings: fontVariationSettings }
+          : {}),
       };
       node.fontSize = fontSize;
       node.lineHeight = {
@@ -6610,6 +6640,12 @@ export class DOMExtractor {
         wordWrap: computed.overflowWrap || computed.wordBreak,
         wordBreak: computed.wordBreak || computed.overflowWrap,
         textOverflow: computed.textOverflow,
+        textWrapStyle:
+          (computed as any).textWrapStyle === "balance" ||
+          (computed as any).textWrapStyle === "pretty"
+            ? String((computed as any).textWrapStyle).toUpperCase()
+            : "AUTO",
+        fontVariationSettings,
         effects: [],
       };
 
