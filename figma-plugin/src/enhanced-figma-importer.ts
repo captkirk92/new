@@ -200,6 +200,8 @@ interface LayoutData {
   top?: number;
   right?: number;
   bottom?: number;
+  pageX?: number;
+  pageY?: number;
   relativeX?: number;
   relativeY?: number;
   boxSizing?: "border-box" | "content-box";
@@ -2366,89 +2368,37 @@ ${
   private findMinimumBounds(node: any): { x: number; y: number } {
     let minX = Infinity;
     let minY = Infinity;
-    let maxY = -Infinity;
-    let sampleNodes: Array<{ name: string; x: number; y: number }> = [];
-    let negativeNodes: Array<{ name: string; x: number; y: number }> = [];
 
-    const traverse = (n: any, depth: number = 0) => {
+    const traverse = (n: any) => {
       if (!n) return;
 
-      // Check this node's layout
-      if (n.layout) {
-        const x = typeof n.layout.x === "number" ? n.layout.x : Infinity;
-        const y = typeof n.layout.y === "number" ? n.layout.y : Infinity;
+      const pageX = n?.layout?.pageX;
+      const pageY = n?.layout?.pageY;
 
+      if (
+        ValidationUtils.isValidNumber(pageX) &&
+        ValidationUtils.isValidNumber(pageY)
+      ) {
+        minX = Math.min(minX, pageX);
+        minY = Math.min(minY, pageY);
+      } else if (n?.absoluteLayout) {
+        const x = ValidationUtils.safeParseFloat(n.absoluteLayout.left, NaN);
+        const y = ValidationUtils.safeParseFloat(n.absoluteLayout.top, NaN);
         if (Number.isFinite(x) && Number.isFinite(y)) {
-          // FIX: Only consider elements with non-negative coordinates for minBounds
-          // Elements with negative Y are typically off-screen overlays, transforms,
-          // or pseudo-elements that shouldn't shift the entire page layout
-          if (y >= 0 && x >= -50) {
-            // Allow small negative X (for shadows/transforms) but not large negative
-            if (x < minX) minX = x;
-            if (y < minY) minY = y;
-          } else {
-            // Track excluded nodes for diagnostics
-            if (negativeNodes.length < 5) {
-              negativeNodes.push({
-                name: n.name || n.htmlTag || n.type || "unknown",
-                x,
-                y,
-              });
-            }
-          }
-
-          if (y > maxY) maxY = y;
-
-          // Collect first 10 valid nodes for diagnostic
-          if (sampleNodes.length < 10 && y >= 0) {
-            sampleNodes.push({
-              name: n.name || n.htmlTag || n.type || "unknown",
-              x,
-              y,
-            });
-          }
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
         }
       }
 
-      // Recurse through children
-      if (n.children && Array.isArray(n.children)) {
-        for (const child of n.children) {
-          traverse(child, depth + 1);
-        }
+      if (Array.isArray(n.children)) {
+        for (const child of n.children) traverse(child);
       }
     };
 
     traverse(node);
 
-    // If no valid bounds found, default to 0
     if (!Number.isFinite(minX)) minX = 0;
     if (!Number.isFinite(minY)) minY = 0;
-    if (!Number.isFinite(maxY)) maxY = 0;
-
-    // Clamp minX to 0 to avoid shifting content left
-    if (minX < 0) {
-      console.log(`⚠️ [BOUNDS] Clamping minX from ${minX} to 0`);
-      minX = 0;
-    }
-
-    // DIAGNOSTIC: Log findings
-    console.log("🔍 [BOUNDS-DIAGNOSTIC] Sample node coordinates (y >= 0):");
-    sampleNodes.forEach((n, i) => {
-      console.log(`   ${i}: "${n.name}" at (${n.x}, ${n.y})`);
-    });
-    console.log(`🔍 [BOUNDS-DIAGNOSTIC] Y range: min=${minY}, max=${maxY}`);
-
-    // Log excluded negative coordinate nodes
-    if (negativeNodes.length > 0) {
-      console.log(
-        `⚠️ [BOUNDS-DIAGNOSTIC] Excluded ${negativeNodes.length} nodes with negative coords:`,
-      );
-      negativeNodes.forEach((n) => {
-        console.log(
-          `   ❌ "${n.name}" at (${n.x}, ${n.y}) - excluded from offset calc`,
-        );
-      });
-    }
 
     return { x: minX, y: minY };
   }
@@ -3628,20 +3578,32 @@ ${
     // PIXEL-PERFECT POSITION CALCULATION v2.0
     // Fixes coordinate system mismatches and Auto Layout positioning issues
 
-    // 1. Extract absolute position with priority order (most accurate first)
+    // 1. Extract the canonical page coordinate first.
+    // The extractor stores PAGE_ABSOLUTE_CSS_PX in layout.pageX/pageY.
+    // layout.x/y and relativeX/relativeY are parent-relative compatibility fields
+    // and must not override the canonical page coordinate.
     let absX = 0;
     let absY = 0;
 
-    if (nodeData.boundingBox) {
-      // boundingBox is most accurate (includes transforms)
-      absX = ValidationUtils.safeParseFloat(nodeData.boundingBox.x, 0);
-      absY = ValidationUtils.safeParseFloat(nodeData.boundingBox.y, 0);
+    const hasPageCoordinates =
+      nodeData.layout &&
+      ValidationUtils.isValidNumber(nodeData.layout.pageX) &&
+      ValidationUtils.isValidNumber(nodeData.layout.pageY);
+
+    if (hasPageCoordinates) {
+      absX = nodeData.layout!.pageX!;
+      absY = nodeData.layout!.pageY!;
     } else if (nodeData.absoluteLayout) {
-      // absoluteLayout for fixed/absolute positioned elements
+      // Legacy schema: absoluteLayout is page/document-relative geometry.
       absX = ValidationUtils.safeParseFloat(nodeData.absoluteLayout.left, 0);
       absY = ValidationUtils.safeParseFloat(nodeData.absoluteLayout.top, 0);
+    } else if (nodeData.boundingBox) {
+      // Legacy schema fallback. boundingBox.x/y are only used when no
+      // canonical page coordinates were captured.
+      absX = ValidationUtils.safeParseFloat(nodeData.boundingBox.x, 0);
+      absY = ValidationUtils.safeParseFloat(nodeData.boundingBox.y, 0);
     } else if (nodeData.layout) {
-      // Fallback to basic layout
+      // Last-resort legacy fallback.
       absX = ValidationUtils.safeParseFloat(nodeData.layout.x, 0);
       absY = ValidationUtils.safeParseFloat(nodeData.layout.y, 0);
     }
@@ -3738,64 +3700,18 @@ ${
           `🔄 [AUTO LAYOUT] Child "${nodeData.name}" in Auto Layout parent - position managed by layout`,
         );
       }
-    } else if (
-      nodeData.layout?.relativeX !== undefined &&
-      nodeData.layout?.relativeY !== undefined
-    ) {
-      // Use pre-calculated relative positions, but validate against absolute coordinates
-      const preCalcRelX = ValidationUtils.safeParseFloat(
-        nodeData.layout.relativeX,
-        0,
+    } else {
+      // Derive the Figma parent-relative position directly from the canonical
+      // page coordinate. Never substitute the extractor's deprecated relativeX/Y
+      // because those values are already parent-relative and can belong to a
+      // different coordinate context after normalization.
+      relativeX = absX - parentAbsX;
+      relativeY = absY - parentAbsY;
+
+      console.log(
+        `🧮 [CANONICAL] Position for "${nodeData.name}": page(${absX}, ${absY}) - parent(${parentAbsX}, ${parentAbsY}) = rel(${relativeX}, ${relativeY})`,
       );
-      // FIX 4: Text Baseline Fix [REFINED]
-      // Prevent SMALL negative Y offsets (-2px to 0) which are usually baseline noise.
-      // Larger negatives are preserved as they likely indicate upstream coordinate bugs.
-      let preCalcRelY = ValidationUtils.safeParseFloat(
-        nodeData.layout.relativeY,
-        0,
-      );
-
-      if (nodeData.type === "TEXT" && preCalcRelY < 0) {
-        if (preCalcRelY > -2) {
-          // Epsilon clamp for micro-jitter
-          console.log(
-            `📏 [BASELINE_CLAMP] Clamping micro-negative Y for text ${nodeData.name}: ${preCalcRelY} -> 0`,
-          );
-          preCalcRelY = 0;
-        } else {
-          // Log but DO NOT CLAMP larger negatives - these are real bugs
-          console.warn(
-            `⚠️ [TEXT_BASELINE_ISSUE] Significant negative Y for text ${nodeData.name}: ${preCalcRelY} (preserved)`,
-          );
-        }
-      }
-
-      // Validate pre-calculated relative position against absolute coordinates
-      const calculatedRelX = absX - parentAbsX;
-      const calculatedRelY = absY - parentAbsY;
-
-      // Check if pre-calculated position significantly differs from calculated position
-      const xDiff = Math.abs(preCalcRelX - calculatedRelX);
-      const yDiff = Math.abs(preCalcRelY - calculatedRelY);
-      const tolerance = 50; // 50px tolerance for differences
-
-      if (xDiff > tolerance || yDiff > tolerance) {
-        // Pre-calculated position is inconsistent, use calculated position
-        relativeX = calculatedRelX;
-        relativeY = calculatedRelY;
-
-        console.log(
-          `⚠️ [POSITION FIX] "${nodeData.name}": Pre-calc rel(${preCalcRelX}, ${preCalcRelY}) differs from calc rel(${calculatedRelX}, ${calculatedRelY}) by (${xDiff}, ${yDiff})px. Using calculated position.`,
-        );
-      } else {
-        // Pre-calculated position is reasonable, use it
-        relativeX = preCalcRelX;
-        relativeY = preCalcRelY;
-
-        console.log(
-          `📐 [RELATIVE] Pre-calc position for "${nodeData.name}": (${relativeX}, ${relativeY})`,
-        );
-      }
+    }
     } else {
       // Calculate relative position from absolute coordinates
       // CRITICAL FIX: Account for coordinate system and parent context
