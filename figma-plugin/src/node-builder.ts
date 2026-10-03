@@ -1688,15 +1688,26 @@ export class NodeBuilder {
         : baseStyle;
 
       const originalFontFamily = fontFamily;
-      const strictCloneMode = this.options?.strictCloneMode ?? true; // FIDELITY FIX: Default to true
+      const strictCloneMode = this.options?.strictCloneMode ?? true;
+      const variationSettings =
+        data.textStyle.fontVariationSettings ||
+        data.textStyle.variationSettings ||
+        undefined;
 
       let fontLoadResult: { family: string; style: string } | null = null;
       if (strictCloneMode) {
         // Strict clone: only accept the exact requested font (no family fallback).
 
         try {
-          if (this.fontManager) {
-            // [NEW] Use FontManager to find best match (fuzzy + weight mapping)
+          // Variable-font captures are applied directly. Do not pass them
+          // through family/style heuristics because that can discard CSS axes.
+          if (variationSettings) {
+            await figma.loadFontAsync({
+              family: fontFamily,
+              variationSettings,
+            });
+            fontLoadResult = { family: fontFamily, style: finalFontStyle };
+          } else if (this.fontManager) {
             const weightNumeric =
               typeof data.textStyle.fontWeight === "number"
                 ? data.textStyle.fontWeight
@@ -1712,7 +1723,6 @@ export class NodeBuilder {
               await figma.loadFontAsync(bestFont);
               fontLoadResult = bestFont;
             } else {
-              // Try legacy exact load if manager found nothing
               await figma.loadFontAsync({
                 family: fontFamily,
                 style: finalFontStyle,
@@ -1720,7 +1730,6 @@ export class NodeBuilder {
               fontLoadResult = { family: fontFamily, style: finalFontStyle };
             }
           } else {
-            // Legacy path (no manager)
             await figma.loadFontAsync({
               family: fontFamily,
               style: finalFontStyle,
@@ -1823,7 +1832,11 @@ export class NodeBuilder {
         }
       }
 
-      text.fontName = { family: fontFamily, style: finalFontStyle };
+      text.fontName = {
+        family: fontFamily,
+        style: finalFontStyle,
+        ...(variationSettings ? { variationSettings } : {}),
+      };
 
       // CRITICAL FIX: Validate fontSize to prevent NaN/Infinity/zero errors
       const capturedFontSize = data.textStyle.fontSize;
@@ -1919,6 +1932,17 @@ export class NodeBuilder {
         // removed agent log block
       } else {
         // removed agent log block
+      }
+
+      if (data.textStyle.textWrapStyle) {
+        const wrapStyle = data.textStyle.textWrapStyle;
+        if (wrapStyle === "AUTO" || wrapStyle === "BALANCE" || wrapStyle === "PRETTY") {
+          text.textWrapStyle = wrapStyle;
+        } else {
+          throw new Error(
+            `Unsupported captured textWrapStyle for ${data.id || data.name}: ${wrapStyle}`,
+          );
+        }
       }
 
       if (data.textStyle.textDecoration) {
@@ -2159,24 +2183,6 @@ export class NodeBuilder {
 
     const finalWidth = Math.max(targetWidth, 1);
     const finalHeight = Math.max(targetHeight, 1);
-
-    // CRITICAL FIX: Prevent vertical text wrapping for suspiciously narrow widths
-    // If the width is very small (< font size) but text is long, it's likely a capture error.
-    // Force WIDTH_AND_HEIGHT to let Figma calculate the natural width.
-    // Also handling cases where width is effectively 0 or 1 from capture defaults
-    if (
-      text.textAutoResize === "HEIGHT" &&
-      (finalWidth < (text.fontSize as number) || finalWidth < 5) &&
-      characters.length > 1
-    ) {
-      console.warn(
-        `⚠️ [TEXT] Detected potential vertical wrapping for "${characters.substring(
-          0,
-          10,
-        )}..." (width: ${finalWidth}, fontSize: ${text.fontSize}). Forcing WIDTH_AND_HEIGHT.`,
-      );
-      text.textAutoResize = "WIDTH_AND_HEIGHT";
-    }
 
     // CRITICAL: Apply sizing based on textAutoResize mode
     if (text.textAutoResize === "NONE") {
