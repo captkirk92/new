@@ -3712,44 +3712,6 @@ ${
         `🧮 [CANONICAL] Position for "${nodeData.name}": page(${absX}, ${absY}) - parent(${parentAbsX}, ${parentAbsY}) = rel(${relativeX}, ${relativeY})`,
       );
     }
-    } else {
-      // Calculate relative position from absolute coordinates
-      // CRITICAL FIX: Account for coordinate system and parent context
-
-      // Basic relative calculation (REMOVED INCORRECT scaleFactor multiplication)
-      relativeX = absX - parentAbsX;
-      relativeY = absY - parentAbsY;
-
-      // Apply coordinate system corrections
-      const isTopLevelElement = parentAbsX === 0 && parentAbsY === 0;
-
-      // Account for scroll offset if this is a top-level element
-      if (isTopLevelElement) {
-        const scrollOffset = this.data.metadata?.scrollOffset || {
-          top: 0,
-          left: 0,
-        };
-
-        // If element appears too high due to scroll offset being subtracted, correct it
-        if (absY < scrollOffset.top && relativeY < 0) {
-          relativeY = absY; // Use absolute position instead (REMOVED incorrect scaleFactor)
-          console.log(
-            `📜 [SCROLL FIX] Top-level element "${nodeData.name}" scroll correction: ${absY} → ${relativeY}`,
-          );
-        }
-        if (absX < scrollOffset.left && relativeX < 0) {
-          relativeX = absX; // Use absolute position instead (REMOVED incorrect scaleFactor)
-          console.log(
-            `📜 [SCROLL FIX] Top-level element "${nodeData.name}" scroll correction: ${absX} → ${relativeX}`,
-          );
-        }
-      }
-
-      console.log(
-        `🧮 [CALC] Position for "${nodeData.name}": abs(${absX}, ${absY}) - parent(${parentAbsX}, ${parentAbsY}) = rel(${relativeX}, ${relativeY})`,
-      );
-    }
-
     // 6. Validate and sanitize final positions
     relativeX = ValidationUtils.safeParseFloat(relativeX, 0);
     relativeY = ValidationUtils.safeParseFloat(relativeY, 0);
@@ -3858,9 +3820,23 @@ ${
     node: SceneNode,
     nodeData: ValidatedNodeData,
   ): void {
-    // Store absolute coordinates
-    const absX = nodeData.absoluteLayout?.left ?? nodeData.layout?.x ?? 0;
-    const absY = nodeData.absoluteLayout?.top ?? nodeData.layout?.y ?? 0;
+    // Store the canonical captured page coordinates. These are the same
+    // coordinates used by calculateNodePosition(), including normalization.
+    const rawX =
+      nodeData.layout?.pageX ??
+      nodeData.absoluteLayout?.left ??
+      nodeData.boundingBox?.x ??
+      nodeData.layout?.x ??
+      0;
+    const rawY =
+      nodeData.layout?.pageY ??
+      nodeData.absoluteLayout?.top ??
+      nodeData.boundingBox?.y ??
+      nodeData.layout?.y ??
+      0;
+
+    const absX = ValidationUtils.safeParseFloat(rawX, 0) + this.coordinateOffset.x;
+    const absY = ValidationUtils.safeParseFloat(rawY, 0) + this.coordinateOffset.y;
 
     this.safeSetPluginData(node, "absoluteX", String(absX));
     this.safeSetPluginData(node, "absoluteY", String(absY));
