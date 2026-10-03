@@ -10,7 +10,7 @@
     "@babel/cli": "^7.28.6",
     "@babel/core": "^7.28.6",
     "@babel/preset-env": "^7.28.6",
-    "@figma/plugin-typings": "^1.90.0",
+    "@figma/plugin-typings": "1.140.0",
     "@types/node": "^20.0.0",
     "@types/pako": "^2.0.4",
     "concurrently": "^8.2.0",
