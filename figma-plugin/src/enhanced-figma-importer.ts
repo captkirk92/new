@@ -3599,34 +3599,20 @@ ${
   }
 
   /**
-   * COORDINATE FIX: Compute global coordinate offset to normalize page-absolute coordinates
-   *
-   * Captured coordinates are PAGE_ABSOLUTE_CSS_PX (document origin + scroll position).
-   * For example, an element 2000px down a scrolled page has y=2000.
-   * Figma frames start at (0,0), so we need to subtract the minimum bounds to normalize.
-   *
-   * OLD LOGIC (BROKEN): Only handled negative coords from transforms/pseudo-elements
-   * NEW LOGIC: Finds true minimum x/y across ALL nodes, normalizes to (0,0)
+   * Preserve the captured page coordinate origin during import.
+   * Positive page coordinates are meaningful and must not be normalized away.
+   * Only genuinely negative content is translated onto the Figma canvas.
    */
   private computeCoordinateOffsetFromSchema(rootNode: any): {
     x: number;
     y: number;
   } {
-    // Find minimum x/y coordinates across entire tree
     const minBounds = this.findMinimumBounds(rootNode);
+    const offsetX = minBounds.x < 0 ? -minBounds.x : 0;
+    const offsetY = minBounds.y < 0 ? -minBounds.y : 0;
 
     console.log(
-      `🔧 [COORD-FIX] Page minimum bounds: x=${minBounds.x}, y=${minBounds.y}`,
-    );
-
-    // Calculate offset to shift everything so minimum becomes (0,0)
-    // Example: if minX=100, offsetX=-100, so all coords get shifted left by 100
-    const offsetX = -minBounds.x;
-    const offsetY = -minBounds.y;
-
-    console.log(`🔧 [COORD-FIX] Computed offset: x=${offsetX}, y=${offsetY}`);
-    console.log(
-      `🔧 [COORD-FIX] This will normalize all coordinates to start at (0,0) in Figma frame`,
+      `🔧 [COORD-FIX] Minimum bounds: x=${minBounds.x}, y=${minBounds.y}; translation: x=${offsetX}, y=${offsetY}`,
     );
 
     return {
